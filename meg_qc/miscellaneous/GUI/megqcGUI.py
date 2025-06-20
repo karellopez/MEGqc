@@ -689,6 +689,26 @@ class MainWindow(QMainWindow):
         pl.addWidget(btn_pbrowse)
         plot_form.addRow("Data directory:", prow)
 
+        self.plot_jobs = QSpinBox()
+        self.plot_jobs.setRange(-1, os.cpu_count() or 1)
+        self.plot_jobs.setValue(-1)
+        btn_pinfo = QPushButton("Info")
+        btn_pinfo.setToolTip("Parallel jobs info")
+
+        def show_pjobs_info():
+            info = """Number of parallel jobs to use during plotting.\n"""
+            info += "Default is 1. Use -1 to utilize all available CPU cores."
+            QMessageBox.information(self, 'Jobs Recommendation', info)
+
+        btn_pinfo.clicked.connect(show_pjobs_info)
+
+        prow_jobs = QWidget()
+        pl_jobs = QHBoxLayout(prow_jobs)
+        pl_jobs.setContentsMargins(0, 0, 0, 0)
+        pl_jobs.addWidget(self.plot_jobs)
+        pl_jobs.addWidget(btn_pinfo)
+        plot_form.addRow("Jobs:", prow_jobs)
+
         btn_prun = QPushButton("Run Plotting")
         btn_prun.clicked.connect(self.start_plot)
         btn_pstop = QPushButton("Stop Plotting")
@@ -807,9 +827,10 @@ class MainWindow(QMainWindow):
         """
         # 1) Gather inputs
         data_dir = self.plot_data.text().strip()
+        n_jobs = self.plot_jobs.value()
 
-        # 2) Our plotting function only needs (data_dir,)
-        args = (data_dir,)
+        # 2) Build args tuple for make_plots_meg_qc
+        args = (data_dir, n_jobs)
 
         # 3) Create Worker and wire signals
         worker = Worker(make_plots_meg_qc, *args)
