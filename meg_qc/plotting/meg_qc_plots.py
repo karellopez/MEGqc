@@ -531,7 +531,76 @@ class Deriv_to_plot:
         self.raw_entity_name = re.sub(r'_desc-.*', '', self.deriv_entity_obj['name'])
 
 
-def make_plots_meg_qc(dataset_path: str):
+from joblib import Parallel, delayed
+
+
+def process_subject(
+        sub: str,
+        dataset,
+        derivs_to_plot: list,
+        chosen_entities: dict,
+        plot_settings: dict,
+):
+    """Plot all metrics for a single subject."""
+
+    derivative = dataset.create_derivative(name="Meg_QC")
+    derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
+    reports_folder = derivative.create_folder(name='reports')
+    subject_folder = reports_folder.create_folder(name='sub-' + sub)
+
+    existing_raws_per_sub = list(set(
+        d.raw_entity_name for d in derivs_to_plot if d.subject == sub
+    ))
+
+    for raw_entity_name in existing_raws_per_sub:
+        derivs_for_this_raw = [
+            d for d in derivs_to_plot if d.raw_entity_name == raw_entity_name
+        ]
+
+        raw_info_path = None
+        report_str_path = None
+        for d in derivs_for_this_raw:
+            if d.metric == 'RawInfo':
+                raw_info_path = d.path
+            elif d.metric == 'ReportStrings':
+                report_str_path = d.path
+
+        metrics_to_plot = [
+            m for m in chosen_entities['METRIC']
+            if m not in ['RawInfo', 'ReportStrings']
+        ]
+
+        for metric in metrics_to_plot:
+            tsv_paths = [d.path for d in derivs_for_this_raw if d.metric == metric]
+            if not tsv_paths:
+                print(f'___MEGqc___: No tsvs found for {metric} / subject {sub}')
+                continue
+
+            tsvs_for_this_raw = [d for d in derivs_for_this_raw if d.metric == metric]
+            raw_entities_to_write = tsvs_for_this_raw[0].deriv_entity_obj
+
+            html_report = csv_to_html_report(
+                raw_info_path,
+                metric,
+                tsv_paths,
+                report_str_path,
+                plot_settings,
+            )
+
+            meg_artifact = subject_folder.create_artifact(raw=raw_entities_to_write)
+            meg_artifact.add_entity('desc', metric)
+            meg_artifact.suffix = 'meg'
+            meg_artifact.extension = '.html'
+
+            meg_artifact.content = lambda file_path, rep=html_report: rep.save(
+                file_path, overwrite=True, open_browser=False
+            )
+
+    ancpbids.write_derivative(dataset, derivative)
+    return
+
+
+def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
     """
     Create plots for the MEG QC pipeline, but WITHOUT the interactive selector.
     Instead, we assume 'all' for every entity (subject, task, session, run, metric).
@@ -540,7 +609,7 @@ def make_plots_meg_qc(dataset_path: str):
     try:
         dataset = ancpbids.load_dataset(dataset_path)
         schema = dataset.get_schema()
-    except:
+    except Exception:
         print('___MEGqc___: ',
               'No data found in the given directory path! \nCheck directory path in config file and presence of data.')
         return
@@ -647,56 +716,18 @@ def make_plots_meg_qc(dataset_path: str):
             deriv.find_raw_entity_name()
             derivs_to_plot.append(deriv)
 
-    # 3. Create derivative folder for reports
-    derivative = dataset.create_derivative(name="Meg_QC")
-    derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
-    reports_folder = derivative.create_folder(name='reports')
+    # Parallel execution per subject
+    Parallel(n_jobs=n_jobs)(
+        delayed(process_subject)(
+            sub=sub,
+            dataset=dataset,
+            derivs_to_plot=derivs_to_plot,
+            chosen_entities=chosen_entities,
+            plot_settings=plot_settings,
+        )
+        for sub in chosen_entities['subject']
+    )
 
-    # For each subject, gather raw_entity_name(s) and build HTML
-    for sub in chosen_entities['subject']:
-        subject_folder = reports_folder.create_folder(name='sub-' + sub)
-
-        existing_raws_per_sub = list(set(
-            d.raw_entity_name for d in derivs_to_plot if d.subject == sub
-        ))
-
-        for raw_entity_name in existing_raws_per_sub:
-            derivs_for_this_raw = [d for d in derivs_to_plot if d.raw_entity_name == raw_entity_name]
-
-            raw_info_path = None
-            report_str_path = None
-            for d in derivs_for_this_raw:
-                if d.metric == 'RawInfo':
-                    raw_info_path = d.path
-                elif d.metric == 'ReportStrings':
-                    report_str_path = d.path
-
-            # Now create separate reports for each METRIC
-            metrics_to_plot = [m for m in chosen_entities['METRIC'] if m not in ['RawInfo', 'ReportStrings']]
-
-            for metric in metrics_to_plot:
-                tsv_paths = [d.path for d in derivs_for_this_raw if d.metric == metric]
-                if not tsv_paths:
-                    print(f'___MEGqc___: No tsvs found for {metric} / subject {sub}')
-                    continue
-
-                tsvs_for_this_raw = [d for d in derivs_for_this_raw if d.metric == metric]
-                raw_entities_to_write = tsvs_for_this_raw[0].deriv_entity_obj
-
-                meg_artifact = subject_folder.create_artifact(raw=raw_entities_to_write)
-                meg_artifact.add_entity('desc', metric)
-                meg_artifact.suffix = 'meg'
-                meg_artifact.extension = '.html'
-
-                # Build the HTML
-                html_report = csv_to_html_report(raw_info_path, metric, tsv_paths, report_str_path, plot_settings)
-
-                # define how to write
-                meg_artifact.content = lambda file_path, rep=html_report: rep.save(
-                    file_path, overwrite=True, open_browser=False
-                )
-
-    ancpbids.write_derivative(dataset, derivative)
     return
 
 
