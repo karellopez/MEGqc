@@ -1,5 +1,5 @@
 alabaster==0.7.13
-git+https://github.com/karellopez/ancp-bids.git
+ancpbids @ git+https://github.com/karellopez/ancp-bids.git
 anyio==3.7.0
 appdirs==1.4.4
 appnope==0.1.3
