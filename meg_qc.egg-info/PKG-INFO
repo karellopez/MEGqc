@@ -23,7 +23,7 @@ Classifier: Topic :: Scientific/Engineering
 Requires-Python: >=3.6
 Description-Content-Type: text/markdown
 License-File: LICENSE
-Requires-Dist: git+https://github.com/karellopez/ancp-bids.git
+Requires-Dist: ancpbids @ git+https://github.com/karellopez/ancp-bids.git
 Requires-Dist: prompt_toolkit==3.0.48
 Requires-Dist: mne~=1.6.0
 Requires-Dist: pandas>=2.0.3

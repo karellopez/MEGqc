@@ -1,4 +1,4 @@
-git+https://github.com/karellopez/ancp-bids.git
+ancpbids @ git+https://github.com/karellopez/ancp-bids.git
 prompt_toolkit==3.0.48
 mne~=1.6.0
 pandas>=2.0.3
