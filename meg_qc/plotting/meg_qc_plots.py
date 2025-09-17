@@ -545,12 +545,10 @@ class Deriv_to_plot:
         self.deriv_entity_obj = deriv_entity_obj
         self.raw_entity_name = raw_entity_name
 
-        # Find the subject ID using regex
-        match = re.search(r'sub-\d+_', self.deriv_entity_obj['name'])
-        if match:
-            self.subject = match.group(0).replace('sub-', '').rstrip('_')
-        else:
-            self.subject = None  # or handle the case where the subject ID is not found
+        # Extract subject ID using a BIDS-compliant regex (alphanumeric labels)
+        name = deriv_entity_obj.get('name', '') or ''
+        match = re.search(r'sub-([A-Za-z0-9]+)_', name)
+        self.subject = match.group(1) if match else None
 
     def __repr__(self):
 

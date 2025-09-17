@@ -10,6 +10,7 @@ requires-python = ">=3.8,<3.12"
 license = {text = "MIT"}
 authors = [
     {name = "Karel Lopez Vilaret", email = "karel.mauricio.lopez.vilaret@uni-oldenburg.de"},
+    {name = "Karel Lopez Vilaret"},
     {name = "Evgeniia Gapontseva"},
     {name = "Aaron Reer"},
     {name = "Jorge Bosch"},
