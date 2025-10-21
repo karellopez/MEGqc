@@ -759,6 +759,24 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
     # --------------------------------------------------------------------------------
 
     # 2. Collect TSVs for each sub + metric
+    def _query_with_optional_filters(base_args, optional_keys=('run', 'task', 'session')):
+        """Query ``dataset`` relaxing optional entities until matches are found."""
+
+        args = base_args.copy()
+        dropped = []
+        optional = [key for key in optional_keys if args.get(key)]
+
+        # Try progressively removing optional filters until we get a hit or run out
+        while True:
+            results = list(dataset.query(**args))
+            if results or not optional:
+                return results, args, dropped
+
+            # Remove the next optional filter and retry
+            key = optional.pop(0)
+            dropped.append(key)
+            args.pop(key, None)
+
     tsvs_to_plot_by_metric = {}
     tsv_entities_by_metric = {}
 
@@ -791,12 +809,19 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
         if chosen_entities['run']:
             query_args['run'] = chosen_entities['run']
 
-        tsv_paths = list(dataset.query(**query_args))
+        tsv_paths, used_args, dropped_filters = _query_with_optional_filters(query_args)
+        if dropped_filters:
+            print(
+                '___MEGqc___:',
+                f"No files found for metric '{metric}' with filters {dropped_filters} – reran without them.",
+            )
+
         tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
 
-        # Now query object form for ancpbids entities
-        query_args['return_type'] = 'object'
-        entities_obj = sorted(list(dataset.query(**query_args)), key=lambda k: k['name'])
+        # Now query object form for ancpbids entities using the same relaxed filters
+        obj_args = used_args.copy()
+        obj_args['return_type'] = 'object'
+        entities_obj = sorted(list(dataset.query(**obj_args)), key=lambda k: k['name'])
         tsv_entities_by_metric[metric] = entities_obj
 
     # Convert them into a list of Deriv_to_plot objects
