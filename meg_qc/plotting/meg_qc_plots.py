@@ -23,6 +23,32 @@ sys.path.append(gradparent_dir)
 
 from meg_qc.calculation.objects import QC_derivative
 
+
+# Mapping from derivative ``desc`` values to canonical metric names used throughout
+# the plotting code.  The keys are stored in lowercase to simplify comparisons.
+_METRIC_ALIASES = {
+    'std': 'STDs',
+    'stds': 'STDs',
+    'psd': 'PSDs',
+    'psds': 'PSDs',
+    'psdnoisemag': 'PSDs',
+    'psdnoisegrad': 'PSDs',
+    'psdwavesmag': 'PSDs',
+    'psdwavesgrad': 'PSDs',
+    'ptpsmanual': 'PtPsManual',
+    'ptpsauto': 'PtPsAuto',
+    'ecgs': 'ECGs',
+    'ecgchannel': 'ECGs',
+    'eogs': 'EOGs',
+    'eogchannel': 'EOGs',
+    'head': 'Head',
+    'muscle': 'Muscle',
+    'rawinfo': 'RawInfo',
+    'reportstrings': 'ReportStrings',
+    'simplemetrics': 'SimpleMetrics',
+    'stimulus': 'stimulus',
+}
+
 # Plotting backends (``universal_plots`` vs ``universal_plots_lite``) and the
 # accompanying report helpers need to be available not only in the main process
 # but also in the worker processes spawned by joblib.  Configure them at module
@@ -509,6 +535,95 @@ def sort_tsvs_by_raw(tsvs_by_metric: dict):
 
     return sorted_tsvs_by_metric_by_raw
 
+
+def _normalise_metric(desc_value: str) -> str:
+    """Return the canonical metric name for a derivative description."""
+
+    if not desc_value:
+        return None
+
+    return _METRIC_ALIASES.get(desc_value.lower())
+
+
+def _artifact_entities(artifact) -> dict:
+    """Convert the ANCPBIDS artifact entities into a dictionary."""
+
+    if hasattr(artifact, 'entities'):
+        return {entry['key']: entry['value'] for entry in artifact.entities}
+
+    # ``dataset.query`` may also return dictionaries in older ANCPBIDS versions.
+    entities = artifact.get('entities') if isinstance(artifact, dict) else None
+    if entities is None:
+        return {}
+
+    return {entry['key']: entry['value'] for entry in entities}
+
+
+def _matches_selection(entities: dict, chosen_entities: dict) -> bool:
+    """Return ``True`` if the artifact entities satisfy the chosen selection."""
+
+    def _matches(key: str, selections: list) -> bool:
+        if not selections:
+            return True
+        value = entities.get(key)
+        return value in selections
+
+    return (
+        _matches('sub', chosen_entities.get('subject', []))
+        and _matches('task', chosen_entities.get('task', []))
+        and _matches('ses', chosen_entities.get('session', []))
+        and _matches('run', chosen_entities.get('run', []))
+    )
+
+
+def _collect_derivatives(
+        dataset,
+        scope: str,
+        chosen_entities: dict,
+):
+    """Gather derivatives grouped by metric for the selected entities."""
+
+    query_args = {
+        'scope': scope,
+        'suffix': 'meg',
+        'extension': ['.tsv', '.json', '.fif'],
+        'return_type': 'object',
+    }
+
+    artifacts = list(dataset.query(**query_args))
+    grouped = defaultdict(list)
+
+    for artifact in artifacts:
+        entities = _artifact_entities(artifact)
+        if not _matches_selection(entities, chosen_entities):
+            continue
+
+        metric = _normalise_metric(entities.get('desc'))
+        if not metric:
+            continue
+
+        try:
+            path = artifact.get_absolute_path()
+        except AttributeError:
+            # ``artifact`` can also be a plain dict in older ANCPBIDS versions.
+            path = artifact.get('absolute_path') or artifact.get('path')
+        if not path:
+            continue
+
+        grouped[metric].append((artifact, path))
+
+    for metric in grouped:
+        grouped[metric].sort(key=lambda item: item[0]['name'])
+
+    derivs_to_plot = []
+    for metric in chosen_entities['METRIC']:
+        for artifact, path in grouped.get(metric, []):
+            deriv = Deriv_to_plot(path=path, metric=metric, deriv_entity_obj=artifact)
+            deriv.find_raw_entity_name()
+            derivs_to_plot.append(deriv)
+
+    return derivs_to_plot
+
 class Deriv_to_plot:
 
     """
@@ -758,68 +873,11 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
     print('___MEGqc___: CHOSEN settings:', plot_settings)
     # --------------------------------------------------------------------------------
 
-    # 2. Collect TSVs for each sub + metric
-    tsvs_to_plot_by_metric = {}
-    tsv_entities_by_metric = {}
-
-    for metric in chosen_entities['METRIC']:
-        query_args = {
-            'subj': chosen_entities['subject'],
-            'task': chosen_entities['task'],
-            'suffix': 'meg',
-            'extension': ['tsv', 'json', 'fif'],
-            'return_type': 'filename',
-            'desc': '',
-            'scope': calculated_derivs_folder,
-        }
-
-        # If the user (now "all") had multiple possible descs for PSDs, ECGs, etc.
-        if metric == 'PSDs':
-            # Include all PSD derivatives (noise and waves) so the PSD report is
-            # generated correctly.
-            query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDwavesMag', 'PSDwavesGrad']
-        elif metric == 'ECGs':
-            query_args['desc'] = ['ECGchannel', 'ECGs']
-        elif metric == 'EOGs':
-            query_args['desc'] = ['EOGchannel', 'EOGs']
-        else:
-            query_args['desc'] = [metric]
-
-        # Optional session/run
-        if chosen_entities['session']:
-            query_args['session'] = chosen_entities['session']
-        if chosen_entities['run']:
-            query_args['run'] = chosen_entities['run']
-
-        tsv_paths = list(dataset.query(**query_args))
-        tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
-
-        # Now query object form for ancpbids entities
-        query_args['return_type'] = 'object'
-        entities_obj = sorted(list(dataset.query(**query_args)), key=lambda k: k['name'])
-        tsv_entities_by_metric[metric] = entities_obj
-
-    # Convert them into a list of Deriv_to_plot objects
-    derivs_to_plot = []
-    for (tsv_metric, tsv_paths), (entity_metric, entity_vals) in zip(
-        tsvs_to_plot_by_metric.items(),
-        tsv_entities_by_metric.items()
-    ):
-        if tsv_metric != entity_metric:
-            raise ValueError('Different metrics in tsvs_to_plot_by_metric and entities_per_file')
-        if len(tsv_paths) != len(entity_vals):
-            raise ValueError(f'Different number of tsvs and entities for metric: {tsv_metric}')
-
-        for tsv_path, deriv_entities in zip(tsv_paths, entity_vals):
-            file_name_in_path = os.path.basename(tsv_path).split('_meg.')[0]
-            file_name_in_obj = deriv_entities['name'].split('_meg.')[0]
-
-            if file_name_in_obj not in file_name_in_path:
-                raise ValueError('Different names in tsvs_to_plot_by_metric and entities_per_file')
-
-            deriv = Deriv_to_plot(path=tsv_path, metric=tsv_metric, deriv_entity_obj=deriv_entities)
-            deriv.find_raw_entity_name()
-            derivs_to_plot.append(deriv)
+    derivs_to_plot = _collect_derivatives(
+        dataset=dataset,
+        scope=calculated_derivs_folder,
+        chosen_entities=chosen_entities,
+    )
 
     # Parallel execution per subject
     Parallel(n_jobs=n_jobs)(
