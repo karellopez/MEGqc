@@ -12,6 +12,7 @@ import gc
 from ancpbids import DatasetOptions
 import configparser
 from pathlib import Path
+import time
 
 # Get the absolute path of the parent directory of the current script
 parent_dir = os.path.dirname(os.getcwd())
@@ -676,6 +677,9 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
     # Ensure plotting backend and report helpers are available
     _load_plotting_backend()
 
+    start_time = time.time()
+
+
     try:
         dataset = ancpbids.load_dataset(dataset_path, DatasetOptions(lazy_loading=True))
         schema = dataset.get_schema()
@@ -833,6 +837,13 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
         for sub in chosen_entities['subject']
     )
 
+    end_time = time.time()
+    elapsed_seconds = end_time - start_time
+    print("---------------------------------------------------------------")
+    print("---------------------------------------------------------------")
+    print("---------------------------------------------------------------")
+    print("---------------------------------------------------------------")
+    print(f"PLOTTING MODULE FINISHED. Elapsed time: {elapsed_seconds:.2f} seconds.")
     return
 
 
