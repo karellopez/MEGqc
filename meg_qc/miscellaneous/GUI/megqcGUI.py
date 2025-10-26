@@ -135,28 +135,59 @@ class Worker(QThread):
             return
 
         pid = self.process.pid
+        terminated = False
+
         # --- Unix: kill entire process group at once ---
         try:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
-            return
+            terminated = True
         except (AttributeError, PermissionError):
             # Windows (no killpg) or lack of permission → fall through
             pass
 
-        # --- Windows or fallback: terminate main + children via psutil ---
+        if not terminated:
+            # --- Windows or fallback: terminate main + children via psutil ---
+            try:
+                parent = psutil.Process(pid)
+                # Recursively find all children, kill them first
+                children = parent.children(recursive=True)
+                for child in children:
+                    child.terminate()
+                # Wait briefly for children to exit
+                psutil.wait_procs(children, timeout=3)
+                # Finally kill the parent
+                parent.terminate()
+                terminated = True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                # If psutil can’t find or can’t kill, fall back to brute-force
+                self.process.terminate()
+
+        # --- Ensure the worker process actually goes away -----------------
+        # Calling join() with a timeout allows the OS to reap the process and
+        # gives joblib’s resource tracker a chance to clean up its temporary
+        # folders.  Without this, the Python interpreter may emit warnings
+        # about leaked resources and the GUI keeps the Start button disabled
+        # while it waits for the lingering process to exit.
         try:
-            parent = psutil.Process(pid)
-            # Recursively find all children, kill them first
-            children = parent.children(recursive=True)
-            for child in children:
-                child.terminate()
-            # Wait briefly for children to exit
-            psutil.wait_procs(children, timeout=3)
-            # Finally kill the parent
-            parent.terminate()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            # If psutil can’t find or can’t kill, fall back to brute-force
+            self.process.join(timeout=5)
+        except (AssertionError, OSError):
+            # Process already joined or in a bad state—ignore.
+            pass
+
+        if self.process.is_alive():
+            # As a last resort, force-terminate and wait again so the object
+            # reaches a fully stopped state.
             self.process.terminate()
+            self.process.join(timeout=1)
+
+        # Close OS-level resources (pipes, file descriptors) associated with
+        # the multiprocessing.Process object when available (Python 3.7+).
+        close = getattr(self.process, "close", None)
+        if close:
+            try:
+                close()
+            except OSError:
+                pass
 
 
 class SettingsEditor(QWidget):
