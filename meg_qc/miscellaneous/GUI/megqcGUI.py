@@ -11,11 +11,10 @@
 import sys
 import os
 import signal
+import json
 import configparser
-import multiprocessing
-import traceback
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 # Attempt to import psutil for accurate RAM info; if unavailable, fallback later
 try:
@@ -31,7 +30,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QSpinBox, QTabWidget, QScrollArea, QFrame, QMessageBox,
     QMenu               #  ← add this entry
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QCoreApplication
+from PyQt6.QtCore import QObject, QProcess, pyqtSignal, Qt, QCoreApplication
 from PyQt6.QtGui import QPixmap, QIcon, QPalette, QColor  # for loading images, setting icon, and theme toggling
 
 # Core MEG QC pipeline functions
@@ -60,134 +59,197 @@ ICON_PATH = LOGO_PATH
 # megqcGUI.py
 
 # -----------------------------------------------------------------------------
-# This global function is our child‐process entry point. Because it's defined
-# at module level, it's picklable under Windows's 'spawn' start method.
-# On Unix, we call setsid() to create a new process session so that killpg()
-# can later cleanly terminate the entire group (parent + any joblib children).
-# On Windows, setsid() doesn't exist—so we catch AttributeError and continue.
+# Helper that mirrors the robust shutdown logic used in BIDS-Manager.
+# Given a PID, we terminate the full process tree so that joblib/loky
+# workers disappear alongside the main task.  We try ``killpg`` first to
+# cover POSIX platforms, then fall back to psutil (when available) or a
+# plain SIGTERM as a last resort.  The GUI process itself is never targeted.
 # -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# Child‐process entry point must live at module level so Windows can pickle it.
-# On Unix, we call os.setsid() to create a new session (so killpg() kills
-# the entire group). On Windows setsid() doesn’t exist—so we catch it.
-# -----------------------------------------------------------------------------
-def _worker_target(func, args):
+def _terminate_process_tree(pid: int) -> None:
+    if pid <= 0:
+        return
+
+    # Avoid killing our own process group, which would close the GUI.
     try:
-        os.setsid()
-    except AttributeError:
-        # Windows: skip session setup
+        pgid = os.getpgid(pid)
+        if pgid != os.getpgid(0):
+            os.killpg(pgid, signal.SIGTERM)
+            return
+    except Exception:
+        # killpg not available (e.g. Windows) or call failed → fall through
         pass
 
+    if has_psutil:
+        try:
+            parent = psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            return
+
+        children = parent.children(recursive=True)
+        for child in children:
+            try:
+                child.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        psutil.wait_procs(children, timeout=3)
+        try:
+            parent.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        return
+
+    # Fallback when psutil is not present: send SIGTERM to the PID.
     try:
-        func(*args)
+        os.kill(pid, signal.SIGTERM)
     except Exception:
-        traceback.print_exc()
-        # Non-zero exit signals error
-        sys.exit(1)
+        pass
 
 
-class Worker(QThread):
+class Worker(QObject):
+    """Run MEG-QC tasks in a detached Python process managed via ``QProcess``.
+
+    The design closely follows the strategy used in the external BIDS-Manager
+    project: each task runs in its own interpreter so the GUI remains
+    responsive, and we keep the process ID handy so we can terminate the
+    entire joblib tree if the user clicks “Stop”.  Signals mirror the previous
+    ``QThread`` API so the rest of the GUI code does not need to change.
     """
-    Runs a blocking function in a separate OS process group.
-    QThread is used only to integrate with Qt’s signal/slot system.
-    """
-    started  = pyqtSignal()
-    finished = pyqtSignal()  # emitted when the subprocess exits cleanly
-    error    = pyqtSignal(str)    # error message
+
+    started = pyqtSignal()
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
 
     def __init__(self, func, *args):
         super().__init__()
-        self.func    = func
-        self.args    = args
-        self.process = None  # the multiprocessing.Process
+        self.func = func
+        self.args = args
+        self.process: Optional[QProcess] = None
+        self._stopped_by_user = False
+        self._had_error = False
 
-    def run(self):
-        # 1) notify GUI
-        self.started.emit()
-        # 2) spawn the subprocess
-        self.process = multiprocessing.Process(
-            target=_worker_target,
-            args=(self.func, self.args),
-        )
-        self.process.start()
-        self.process.join()  # blocks until the child exits
+    # ------------------------------------------------------------------
+    # Process lifecycle helpers
+    # ------------------------------------------------------------------
+    def _build_payload(self) -> str:
+        """JSON-encode ``self.args`` converting Paths to strings recursively."""
 
-        # 3) interpret exit code
-        if self.process.exitcode == -signal.SIGTERM:
-            # user-requested cancellation; no signal emitted
-            return
+        def convert(value):
+            if isinstance(value, Path):
+                return str(value)
+            if isinstance(value, (list, tuple)):
+                return [convert(item) for item in value]
+            if isinstance(value, dict):
+                return {str(key): convert(val) for key, val in value.items()}
+            return value
 
-        if self.process.exitcode != 0:
-            # anything else is an error
-            self.error.emit(f"Process exited with code {self.process.exitcode}")
-            return
+        normalized = [convert(arg) for arg in self.args]
+        return json.dumps(normalized, ensure_ascii=False)
 
-        # 4) success
-        self.finished.emit()
+    def _cleanup(self) -> None:
+        """Release the ``QProcess`` instance and reset transient flags."""
 
-    def stop(self):
-        """
-        Stop the worker and all its children:
-          • Unix/Linux: send SIGTERM to the entire process group.
-          • Windows: walk the process tree with psutil and terminate each.
-        """
-        if not self.process or not self.process.is_alive():
-            return
-
-        pid = self.process.pid
-        terminated = False
-
-        # --- Unix: kill entire process group at once ---
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-            terminated = True
-        except (AttributeError, PermissionError):
-            # Windows (no killpg) or lack of permission → fall through
-            pass
-
-        if not terminated:
-            # --- Windows or fallback: terminate main + children via psutil ---
+        if self.process is not None:
             try:
-                parent = psutil.Process(pid)
-                # Recursively find all children, kill them first
-                children = parent.children(recursive=True)
-                for child in children:
-                    child.terminate()
-                # Wait briefly for children to exit
-                psutil.wait_procs(children, timeout=3)
-                # Finally kill the parent
-                parent.terminate()
-                terminated = True
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                # If psutil can’t find or can’t kill, fall back to brute-force
-                self.process.terminate()
-
-        # --- Ensure the worker process actually goes away -----------------
-        # Calling join() with a timeout allows the OS to reap the process and
-        # gives joblib’s resource tracker a chance to clean up its temporary
-        # folders.  Without this, the Python interpreter may emit warnings
-        # about leaked resources and the GUI keeps the Start button disabled
-        # while it waits for the lingering process to exit.
-        try:
-            self.process.join(timeout=5)
-        except (AssertionError, OSError):
-            # Process already joined or in a bad state—ignore.
-            pass
-
-        if self.process.is_alive():
-            # As a last resort, force-terminate and wait again so the object
-            # reaches a fully stopped state.
-            self.process.terminate()
-            self.process.join(timeout=1)
-
-        # Close OS-level resources (pipes, file descriptors) associated with
-        # the multiprocessing.Process object when available (Python 3.7+).
-        close = getattr(self.process, "close", None)
-        if close:
-            try:
-                close()
-            except OSError:
+                self.process.finished.disconnect(self._on_finished)
+            except Exception:
                 pass
+            try:
+                self.process.errorOccurred.disconnect(self._on_error)
+            except Exception:
+                pass
+            try:
+                self.process.started.disconnect(self._on_started)
+            except Exception:
+                pass
+            self.process.deleteLater()
+        self.process = None
+        self._stopped_by_user = False
+        self._had_error = False
+
+    # ------------------------------------------------------------------
+    # Slots connected to QProcess signals
+    # ------------------------------------------------------------------
+    def _on_started(self) -> None:
+        self.started.emit()
+
+    def _on_error(self, error: QProcess.ProcessError) -> None:
+        if self._stopped_by_user:
+            return
+
+        self._had_error = True
+        if error == QProcess.ProcessError.FailedToStart:
+            message = "Failed to start background process"
+        elif error == QProcess.ProcessError.Crashed:
+            message = "Background process crashed"
+        else:
+            message = "Background process encountered an unknown error"
+        self.error.emit(message)
+        self._cleanup()
+
+    def _on_finished(self, exit_code: int, status: QProcess.ExitStatus) -> None:
+        if self._stopped_by_user or self._had_error:
+            self._cleanup()
+            return
+
+        if status != QProcess.ExitStatus.NormalExit:
+            self.error.emit("Background process exited unexpectedly")
+            self._cleanup()
+            return
+
+        if exit_code == 0:
+            self.finished.emit()
+        else:
+            self.error.emit(f"Process exited with code {exit_code}")
+        self._cleanup()
+
+    # ------------------------------------------------------------------
+    # Public API used by the GUI
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        """Launch the worker process using ``python -m ...worker_entry``."""
+
+        if self.process is not None:
+            raise RuntimeError("Worker is already running")
+
+        entry_module = "meg_qc.miscellaneous.GUI.worker_entry"
+        func_path = f"{self.func.__module__}:{self.func.__name__}"
+        payload = self._build_payload()
+
+        process = QProcess(self)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.ForwardedChannels)
+        process.finished.connect(self._on_finished)
+        process.errorOccurred.connect(self._on_error)
+        process.started.connect(self._on_started)
+        process.setProgram(sys.executable)
+        process.setArguments(["-m", entry_module, "--func", func_path, "--args", payload])
+        self.process = process
+        process.start()
+
+        if process.error() == QProcess.ProcessError.FailedToStart:
+            # ``start()`` is asynchronous, but ``error()`` already knows if
+            # the executable could not be launched.  Trigger the handler
+            # manually so callers receive the signal immediately.
+            self._on_error(QProcess.ProcessError.FailedToStart)
+
+    def stop(self) -> None:
+        """Terminate the running process and its children, mirroring BIDS-Manager."""
+
+        if self.process is None:
+            return
+
+        if self.process.state() == QProcess.ProcessState.NotRunning:
+            self._cleanup()
+            return
+
+        self._stopped_by_user = True
+        pid = int(self.process.processId())
+        if pid > 0:
+            _terminate_process_tree(pid)
+
+        # ``kill`` complements the explicit tree teardown above.  When the
+        # child already exited this is a no-op, otherwise it ensures the GUI
+        # regains control even if the task ignores SIGTERM.
+        self.process.kill()
 
 
 class SettingsEditor(QWidget):
