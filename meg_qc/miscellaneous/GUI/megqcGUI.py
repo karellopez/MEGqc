@@ -9,7 +9,6 @@
 # - The "Info" button next to the jobs spinbox shows detailed recommendations for n_jobs.
 
 import sys
-import time
 import os
 import signal
 import configparser
@@ -93,7 +92,7 @@ class Worker(QThread):
     QThread is used only to integrate with Qt’s signal/slot system.
     """
     started  = pyqtSignal()
-    finished = pyqtSignal(float)  # elapsed time in seconds
+    finished = pyqtSignal()  # emitted when the subprocess exits cleanly
     error    = pyqtSignal(str)    # error message
 
     def __init__(self, func, *args):
@@ -105,8 +104,6 @@ class Worker(QThread):
     def run(self):
         # 1) notify GUI
         self.started.emit()
-        start_time = time.time()
-
         # 2) spawn the subprocess
         self.process = multiprocessing.Process(
             target=_worker_target,
@@ -126,8 +123,7 @@ class Worker(QThread):
             return
 
         # 4) success
-        elapsed = time.time() - start_time
-        self.finished.emit(elapsed)
+        self.finished.emit()
 
     def stop(self):
         """
@@ -671,26 +667,26 @@ class MainWindow(QMainWindow):
         self.calc_subs.setPlaceholderText("all or IDs, e.g. 009,012")
         calc_form.addRow("Subjects:", self.calc_subs)
 
-        btn_run = QPushButton("Run Calculation")
-        btn_run.clicked.connect(self.start_calc)
-        btn_stop = QPushButton("Stop Calculation")
-        btn_stop.clicked.connect(self.stop_calc)
+        self.btn_calc_run = QPushButton("Run Calculation")
+        self.btn_calc_run.clicked.connect(self.start_calc)
+        self.btn_calc_stop = QPushButton("Stop Calculation")
+        self.btn_calc_stop.clicked.connect(self.stop_calc)
         row_btns = QWidget()
         btns_lay = QHBoxLayout(row_btns)
         btns_lay.setContentsMargins(0, 0, 0, 0)
-        btns_lay.addWidget(btn_run)
-        btns_lay.addWidget(btn_stop)
+        btns_lay.addWidget(self.btn_calc_run)
+        btns_lay.addWidget(self.btn_calc_stop)
         calc_form.addRow("", row_btns)
 
-        btn_gqi = QPushButton("Run GQI")
-        btn_gqi.clicked.connect(self.start_gqi)
-        btn_gqi_stop = QPushButton("Stop GQI")
-        btn_gqi_stop.clicked.connect(self.stop_gqi)
+        self.btn_gqi_run = QPushButton("Run GQI")
+        self.btn_gqi_run.clicked.connect(self.start_gqi)
+        self.btn_gqi_stop = QPushButton("Stop GQI")
+        self.btn_gqi_stop.clicked.connect(self.stop_gqi)
         row_gqi = QWidget()
         gqi_lay = QHBoxLayout(row_gqi)
         gqi_lay.setContentsMargins(0, 0, 0, 0)
-        gqi_lay.addWidget(btn_gqi)
-        gqi_lay.addWidget(btn_gqi_stop)
+        gqi_lay.addWidget(self.btn_gqi_run)
+        gqi_lay.addWidget(self.btn_gqi_stop)
         calc_form.addRow("", row_gqi)
 
         lay.addWidget(calc_box)
@@ -699,15 +695,15 @@ class MainWindow(QMainWindow):
         plot_box = QGroupBox("Plotting")
         plot_form = QFormLayout(plot_box)
 
-        btn_prun = QPushButton("Run Plotting")
-        btn_prun.clicked.connect(self.start_plot)
-        btn_pstop = QPushButton("Stop Plotting")
-        btn_pstop.clicked.connect(self.stop_plot)
+        self.btn_plot_run = QPushButton("Run Plotting")
+        self.btn_plot_run.clicked.connect(self.start_plot)
+        self.btn_plot_stop = QPushButton("Stop Plotting")
+        self.btn_plot_stop.clicked.connect(self.stop_plot)
         prow2 = QWidget()
         pl2 = QHBoxLayout(prow2)
         pl2.setContentsMargins(0, 0, 0, 0)
-        pl2.addWidget(btn_prun)
-        pl2.addWidget(btn_pstop)
+        pl2.addWidget(self.btn_plot_run)
+        pl2.addWidget(self.btn_plot_stop)
         plot_form.addRow("", prow2)
 
         lay.addWidget(plot_box)
@@ -781,17 +777,38 @@ class MainWindow(QMainWindow):
 
         # 3) Create the Worker, hook up signals → log
         worker = Worker(make_derivative_meg_qc, *args)
-        worker.started.connect(lambda: self.log.appendPlainText("Calculation started"))
-        worker.finished.connect(
-            lambda elapsed: self.log.appendPlainText(f"Calculation finished in {elapsed:.2f}s")
-        )
-        worker.error.connect(
-            lambda err: self.log.appendPlainText(f"Calculation error: {err}")
-        )
+        # Prevent launching the same task multiple times while it is already running.
+        self.btn_calc_run.setEnabled(False)
 
-        # 4) Launch and save
-        worker.start()
+        def on_started():
+            self.log.appendPlainText("Calculation started")
+
+        def on_finished():
+            # Successful completion: log and re-enable button for future runs.
+            self.log.appendPlainText("Calculation finished")
+            self.btn_calc_run.setEnabled(True)
+            self.workers.pop("calc", None)
+
+        def on_error(err: str):
+            # Error path: report and allow the user to retry.
+            self.log.appendPlainText(f"Calculation error: {err}")
+            self.btn_calc_run.setEnabled(True)
+            self.workers.pop("calc", None)
+
+        worker.started.connect(on_started)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+
+        # 4) Launch and save. Store the worker before starting to avoid race conditions
+        # where the thread finishes extremely quickly.
         self.workers["calc"] = worker
+        try:
+            worker.start()
+        except Exception as exc:
+            # Starting the worker can fail if the OS denies process creation.
+            self.log.appendPlainText(f"Calculation error: {exc}")
+            self.btn_calc_run.setEnabled(True)
+            self.workers.pop("calc", None)
 
 
     def stop_calc(self):
@@ -804,6 +821,8 @@ class MainWindow(QMainWindow):
         if worker:
             worker.stop()
             self.log.appendPlainText("Calculation stopped")
+            self.btn_calc_run.setEnabled(True)
+            self.workers.pop("calc", None)
 
 
     def start_plot(self):
@@ -827,17 +846,34 @@ class MainWindow(QMainWindow):
 
         # 3) Create Worker and wire signals
         worker = Worker(make_plots_meg_qc, *args)
-        worker.started.connect(lambda: self.log.appendPlainText("Plotting started"))
-        worker.finished.connect(
-            lambda elapsed: self.log.appendPlainText(f"Plotting finished in {elapsed:.2f}s")
-        )
-        worker.error.connect(
-            lambda err: self.log.appendPlainText(f"Plotting error: {err}")
-        )
+        # Prevent duplicate plotting runs until the active one ends.
+        self.btn_plot_run.setEnabled(False)
+
+        def on_started():
+            self.log.appendPlainText("Plotting started")
+
+        def on_finished():
+            self.log.appendPlainText("Plotting finished")
+            self.btn_plot_run.setEnabled(True)
+            self.workers.pop("plot", None)
+
+        def on_error(err: str):
+            self.log.appendPlainText(f"Plotting error: {err}")
+            self.btn_plot_run.setEnabled(True)
+            self.workers.pop("plot", None)
+
+        worker.started.connect(on_started)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
 
         # 4) Launch and save
-        worker.start()
         self.workers["plot"] = worker
+        try:
+            worker.start()
+        except Exception as exc:
+            self.log.appendPlainText(f"Plotting error: {exc}")
+            self.btn_plot_run.setEnabled(True)
+            self.workers.pop("plot", None)
 
 
     def stop_plot(self):
@@ -850,23 +886,48 @@ class MainWindow(QMainWindow):
         if worker:
             worker.stop()
             self.log.appendPlainText("Plotting stopped")
+            self.btn_plot_run.setEnabled(True)
+            self.workers.pop("plot", None)
 
     def start_gqi(self):
         """Run Global Quality Index calculation only."""
         data_dir = self.data_dir.text().strip()
         args = (data_dir, str(SETTINGS_PATH))
         worker = Worker(generate_gqi_summary, *args)
-        worker.started.connect(lambda: self.log.appendPlainText("GQI started"))
-        worker.finished.connect(lambda e: self.log.appendPlainText(f"GQI finished in {e:.2f}s"))
-        worker.error.connect(lambda err: self.log.appendPlainText(f"GQI error: {err}"))
-        worker.start()
+        # Prevent concurrent GQI runs; enable again once finished or stopped.
+        self.btn_gqi_run.setEnabled(False)
+
+        def on_started():
+            self.log.appendPlainText("GQI started")
+
+        def on_finished():
+            self.log.appendPlainText("GQI finished")
+            self.btn_gqi_run.setEnabled(True)
+            self.workers.pop("gqi", None)
+
+        def on_error(err: str):
+            self.log.appendPlainText(f"GQI error: {err}")
+            self.btn_gqi_run.setEnabled(True)
+            self.workers.pop("gqi", None)
+
+        worker.started.connect(on_started)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
         self.workers["gqi"] = worker
+        try:
+            worker.start()
+        except Exception as exc:
+            self.log.appendPlainText(f"GQI error: {exc}")
+            self.btn_gqi_run.setEnabled(True)
+            self.workers.pop("gqi", None)
 
     def stop_gqi(self):
         worker = self.workers.get("gqi")
         if worker:
             worker.stop()
             self.log.appendPlainText("GQI stopped")
+            self.btn_gqi_run.setEnabled(True)
+            self.workers.pop("gqi", None)
 
 
     # ──────────────────────────────── #
@@ -876,7 +937,7 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(f"Starting {key} …")
         worker = Worker(func, *args)
         worker.finished.connect(
-            lambda t, k=key: self.log.appendPlainText(f"{k.capitalize()} finished in {t:.2f}s")
+            lambda k=key: self.log.appendPlainText(f"{k.capitalize()} finished")
         )
         worker.error.connect(
             lambda e, k=key: self.log.appendPlainText(f"{k.capitalize()} error: {e}")
