@@ -49,16 +49,6 @@ GUI_DIR = Path(__file__).parent
 # PKG_ROOT apunta a la raíz del paquete meg_qc (dos niveles arriba)
 PKG_ROOT = GUI_DIR.parent.parent
 
-# ``multiprocessing.Process`` uses the platform default start method.  On Unix
-# this is ``fork``, but the MEGqc computation functions internally rely on
-# joblib's ``loky`` executor which expects ``spawn`` semantics.  Mixing the two
-# leads to ``resource_tracker`` warnings about leaked temporary folders and the
-# worker process lingering for a couple of seconds after the actual work
-# finished.  Creating subprocesses from an explicit ``spawn`` context keeps the
-# GUI responsive and eliminates the warning without globally changing the start
-# method for third-party code.
-_MP_CONTEXT = multiprocessing.get_context("spawn")
-
 # Rutas a los ficheros
 SETTINGS_PATH = PKG_ROOT / "settings" / "settings.ini"
 INTERNAL_PATH = PKG_ROOT / "settings" / "settings_internal.ini"
@@ -115,17 +105,12 @@ class Worker(QThread):
         # 1) notify GUI
         self.started.emit()
         # 2) spawn the subprocess
-        self.process = _MP_CONTEXT.Process(
+        self.process = multiprocessing.Process(
             target=_worker_target,
             args=(self.func, self.args),
         )
         self.process.start()
-        try:
-            self.process.join()  # blocks until the child exits
-        finally:
-            close = getattr(self.process, "close", None)
-            if close is not None:
-                close()
+        self.process.join()  # blocks until the child exits
 
         # 3) interpret exit code
         if self.process.exitcode == -signal.SIGTERM:
