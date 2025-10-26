@@ -101,18 +101,6 @@ class Worker(QThread):
         self.func    = func
         self.args    = args
         self.process = None  # the multiprocessing.Process
-        # ``multiprocessing.Process`` defaults to the ``fork`` start method on
-        # Unix which clashes with joblib's own process-pool management used in
-        # the plotting pipeline.  Explicitly request the "spawn" context so that
-        # the worker enters a fresh Python interpreter instead of inheriting the
-        # already-forked state from Qt's helper thread.  This prevents the nested
-        # multiprocessing deadlocks that dropped HTML outputs in the GUI.
-        try:
-            self._mp_ctx = multiprocessing.get_context("spawn")
-        except ValueError:
-            # Platforms that do not expose "spawn" (very old Python builds)
-            # still return the default context so the worker keeps functioning.
-            self._mp_ctx = multiprocessing.get_context()
 
     def run(self):
         # 1) notify GUI
@@ -120,7 +108,7 @@ class Worker(QThread):
         start_time = time.time()
 
         # 2) spawn the subprocess
-        self.process = self._mp_ctx.Process(
+        self.process = multiprocessing.Process(
             target=_worker_target,
             args=(self.func, self.args),
         )
