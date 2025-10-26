@@ -737,7 +737,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
     }
     all_metrics = [valid_metrics[m] for m in all_metrics if m in valid_metrics]
     # Preserve order while removing duplicates
-    all_metrics = list(dict.fromkeys(all_metrics))
+    #all_metrics = list(dict.fromkeys(all_metrics))
 
     # Now store it in chosen_entities as a list
     chosen_entities = {
