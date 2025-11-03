@@ -41,9 +41,15 @@ class TestMegPipeline(unittest.TestCase):
             self.repo_root / "meg_qc" / "settings" / "settings_internal.ini"
         )
 
+        # Work in an isolated temp copy of the dataset
         self.temp_dir = Path(tempfile.mkdtemp()).resolve()
         self.data_directory = (self.temp_dir / "ds_meg1").resolve()
         shutil.copytree(self.template_dataset, self.data_directory)
+
+        # --- WINDOWS FIX ---
+        # Ensure 'derivatives/' exists before any ancpbids query(scope='derivatives')
+        # Some ancpbids versions return None if this folder is missing.
+        (self.data_directory / "derivatives").mkdir(exist_ok=True)
 
     def tearDown(self) -> None:
         if hasattr(self, "temp_dir") and self.temp_dir.exists():
@@ -83,11 +89,6 @@ class TestMegPipeline(unittest.TestCase):
     @staticmethod
     def _handle_remove_readonly(func, path, exc_info):
         """Ensure read-only files can be removed during cleanup on Windows."""
-
-        # ``stat.S_IWRITE`` enables write access on Windows, while on POSIX
-        # systems it simply keeps the permission unchanged. ``os.chmod`` is a
-        # no-op for directories that already allow writes, so the helper is
-        # safe to call on every platform.
         del exc_info  # unused but part of the interface
         os.chmod(path, stat.S_IWRITE)
         func(path)
