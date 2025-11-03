@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,13 +41,13 @@ class TestMegPipeline(unittest.TestCase):
             self.repo_root / "meg_qc" / "settings" / "settings_internal.ini"
         )
 
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.data_directory = Path(self.temp_dir.name) / "ds_meg1"
+        self.temp_dir = Path(tempfile.mkdtemp()).resolve()
+        self.data_directory = (self.temp_dir / "ds_meg1").resolve()
         shutil.copytree(self.template_dataset, self.data_directory)
 
     def tearDown(self) -> None:
-        if hasattr(self, "temp_dir"):
-            self.temp_dir.cleanup()
+        if hasattr(self, "temp_dir") and self.temp_dir.exists():
+            shutil.rmtree(self.temp_dir, onerror=self._handle_remove_readonly)
 
     def test_meg_pipeline_calculation_and_plotting(self) -> None:
         """The calculation stage feeds into the plotting stage successfully."""
@@ -77,6 +79,18 @@ class TestMegPipeline(unittest.TestCase):
             any(subject_reports.rglob("*.html")),
             "Expected HTML reports were not generated",
         )
+
+    @staticmethod
+    def _handle_remove_readonly(func, path, exc_info):
+        """Ensure read-only files can be removed during cleanup on Windows."""
+
+        # ``stat.S_IWRITE`` enables write access on Windows, while on POSIX
+        # systems it simply keeps the permission unchanged. ``os.chmod`` is a
+        # no-op for directories that already allow writes, so the helper is
+        # safe to call on every platform.
+        del exc_info  # unused but part of the interface
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
 
 
 if __name__ == "__main__":
