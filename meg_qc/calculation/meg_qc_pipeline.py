@@ -414,7 +414,17 @@ def check_config_saved_ask_user(dataset):
     #     print('___MEGqc___: ', 'There is already a config file used for this data set. Do you want to use it again?')
     #     #ask user if he wants to use the same config file again
 
-    entities = query_entities(dataset, scope='derivatives')
+    try:
+        entities = query_entities(dataset, scope='derivatives')
+    except TypeError:
+        # ``ancpbids.query.query_entities`` relies on ``query`` returning an iterable.
+        # On Windows, ``query`` can return ``None`` when the derivatives folder does not
+        # exist yet, raising a ``TypeError`` when ``query_entities`` tries to iterate over
+        # the result.  In that situation there are no previous config files to reuse, so
+        # we can safely treat the entity mapping as empty.
+        entities = {}
+    else:
+        entities = entities or {}
 
     # print('___MEGqc___: ', 'entities', entities)
 
