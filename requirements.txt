@@ -4,7 +4,7 @@ mne~=1.6.0
 pandas>=2.0.3
 plotly==5.24.1
 joblib==1.4.2
-pyqt6-tools==6.4.2.3.3
+pyqt6
 numba==0.58.1
 psutil==5.9.8
 matplotlib==3.8.4
