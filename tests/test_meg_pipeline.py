@@ -29,16 +29,17 @@ class TestMegPipeline(unittest.TestCase):
         if ancpbids is None or make_derivative_meg_qc is None:
             self.skipTest("ancpbids is required to run the MEG-QC pipeline")
 
-        self.test_dir = Path(__file__).resolve().parent
-        self.template_dataset = self.test_dir / "data" / "meg_datasets" / "ds_meg1"
+        self.repo_root = Path(__file__).resolve().parents[1]
+        self.template_dataset = (
+            self.repo_root / "tests" / "data" / "meg_datasets" / "ds_meg1"
+        )
         if not self.template_dataset.exists():
             self.fail(f"Template dataset not found: {self.template_dataset}")
 
-        import meg_qc
-
-        meg_qc_root = Path(meg_qc.__file__).resolve().parent
-        self.config_file_path = meg_qc_root / "settings" / "settings.ini"
-        self.internal_config_file_path = meg_qc_root / "settings" / "settings_internal.ini"
+        self.config_file_path = self.repo_root / "meg_qc" / "settings" / "settings.ini"
+        self.internal_config_file_path = (
+            self.repo_root / "meg_qc" / "settings" / "settings_internal.ini"
+        )
 
         # Work in an isolated temp copy of the dataset
         self.temp_dir = Path(tempfile.mkdtemp()).resolve()
