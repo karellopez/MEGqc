@@ -6,8 +6,6 @@ from meg_qc.calculation.meg_qc_pipeline import make_derivative_meg_qc
 # ------------------------------------------------------------------
 # Path to the root of your BIDS MEG dataset.
 data_directory = '/home/karelo/Desktop/Development/MEGQC_workshop/datasets/ds003483/'
-# Optional path to store the derivatives folder outside the dataset root.
-derivatives_output = None
 # Path to a INI config file with user-defined parameters.
 config_file_path = '/home/karelo/PycharmProjects/megqc_update/.venv/lib/python3.10/site-packages/meg_qc/settings/settings.ini'
 # Path to a INI config file of internal parameters.
@@ -49,8 +47,7 @@ make_derivative_meg_qc(
     internal_config_file_path,
     data_directory,
     sub_list,
-    n_jobs=n_jobs_to_use,
-    derivatives_path=derivatives_output
+    n_jobs=n_jobs_to_use
 )
 
 end_time = time.time()
