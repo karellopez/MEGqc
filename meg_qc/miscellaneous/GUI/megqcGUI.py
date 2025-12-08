@@ -714,16 +714,6 @@ class MainWindow(QMainWindow):
         row_lay.addWidget(btn_browse)
         shared.addRow("Data directory:", row)
 
-        self.derivatives_dir = QLineEdit()
-        btn_browse_deriv = QPushButton("Browse")
-        btn_browse_deriv.clicked.connect(lambda: self._browse(self.derivatives_dir))
-        row_deriv = QWidget()
-        row_deriv_lay = QHBoxLayout(row_deriv)
-        row_deriv_lay.setContentsMargins(0, 0, 0, 0)
-        row_deriv_lay.addWidget(self.derivatives_dir)
-        row_deriv_lay.addWidget(btn_browse_deriv)
-        shared.addRow("Derivatives output (optional):", row_deriv)
-
         self.jobs = QSpinBox()
         self.jobs.setRange(-1, os.cpu_count() or 1)
         self.jobs.setValue(-1)
@@ -860,7 +850,6 @@ class MainWindow(QMainWindow):
         # 1) Gather inputs
         data_dir  = self.data_dir.text().strip()
         subs_raw  = self.calc_subs.text().strip()
-        derivatives_dir = self.derivatives_dir.text().strip()
         # If user typed “all” (case-insensitive) or left blank, use the string "all";
         # otherwise split by commas into a list of IDs.
         subs = (
@@ -877,7 +866,6 @@ class MainWindow(QMainWindow):
             data_dir,
             subs,
             n_jobs,
-            derivatives_dir if derivatives_dir else None,
         )
 
         # 3) Create the Worker, hook up signals → log
@@ -942,13 +930,12 @@ class MainWindow(QMainWindow):
         # 1) Gather inputs
         data_dir = self.data_dir.text().strip()
         n_jobs = self.jobs.value()
-        derivatives_dir = self.derivatives_dir.text().strip()
 
         # 2) Build args tuple for make_plots_meg_qc
         # The plotting backend (full or lite) is selected inside
         # ``make_plots_meg_qc`` based on the 'full_html_reports' option in
         # settings.ini.
-        args = (data_dir, n_jobs, derivatives_dir if derivatives_dir else None)
+        args = (data_dir, n_jobs)
 
         # 3) Create Worker and wire signals
         worker = Worker(make_plots_meg_qc, *args)
@@ -998,8 +985,7 @@ class MainWindow(QMainWindow):
     def start_gqi(self):
         """Run Global Quality Index calculation only."""
         data_dir = self.data_dir.text().strip()
-        derivatives_dir = self.derivatives_dir.text().strip()
-        args = (data_dir, str(SETTINGS_PATH), derivatives_dir if derivatives_dir else None)
+        args = (data_dir, str(SETTINGS_PATH))
         worker = Worker(generate_gqi_summary, *args)
         # Prevent concurrent GQI runs; enable again once finished or stopped.
         self.btn_gqi_run.setEnabled(False)

@@ -102,18 +102,6 @@ def run_megqc():
         )
     )
 
-    dataset_path_parser.add_argument(
-        "--derivatives_path",
-        type=str,
-        required=False,
-        help=(
-            "Optional output root for derivatives.\n"
-            "By default derivatives are written inside the BIDS dataset under\n"
-            "<dataset>/derivatives. Provide a writable alternative directory\n"
-            "to store the 'derivatives' folder elsewhere."
-        )
-    )
-
     # Parse arguments
     args = dataset_path_parser.parse_args()
 
@@ -141,10 +129,6 @@ def run_megqc():
 
     data_directory = args.inputdata
     print("Data directory:", data_directory)
-
-    derivatives_destination = args.derivatives_path
-    if derivatives_destination:
-        print("Derivatives output directory:", os.path.abspath(derivatives_destination))
 
     # Check if --subs was provided
     if args.subs is None:
@@ -198,16 +182,14 @@ def run_megqc():
         internal_config_file_path=internal_config_file_path,
         ds_paths=data_directory,
         sub_list=sub_list,
-        n_jobs=n_jobs_used,
-        derivatives_path=derivatives_destination
+        n_jobs=n_jobs_used
     )
 
     end_time = time.time()
     elapsed_seconds = end_time - start_time
     print(f"MEGqc has completed the calculation of metrics in {elapsed_seconds:.2f} seconds.")
-    deriv_base_print = os.path.abspath(derivatives_destination) if derivatives_destination else data_directory
     print(
-        f"Results can be found in {deriv_base_print}/derivatives/Meg_QC/calculation"
+        f"Results can be found in {data_directory}/derivatives/Meg_QC/calculation"
     )
 
     # ----------------------------------------------------------------
@@ -216,7 +198,7 @@ def run_megqc():
     user_input = input('Do you want to run the MEGqc plotting module on the MEGqc results? (y/n): ').lower().strip() == 'y'
     if user_input:
         from meg_qc.plotting.meg_qc_plots import make_plots_meg_qc
-        make_plots_meg_qc(data_directory, derivatives_path=derivatives_destination)
+        make_plots_meg_qc(data_directory)
         return
     else:
         return
@@ -271,16 +253,10 @@ def get_plots():
         required=True,
         help="Path to the root of your BIDS MEG dataset"
     )
-    dataset_path_parser.add_argument(
-        "--derivatives_path",
-        type=str,
-        required=False,
-        help="Optional output root for derivatives."
-    )
     args = dataset_path_parser.parse_args()
     data_directory = args.inputdata
 
-    make_plots_meg_qc(data_directory, derivatives_path=args.derivatives_path)
+    make_plots_meg_qc(data_directory)
     return
 
 
@@ -303,17 +279,11 @@ def run_gqi():
         required=False,
         help="Path to a config file with GQI parameters",
     )
-    parser.add_argument(
-        "--derivatives_path",
-        type=str,
-        required=False,
-        help="Optional output root for derivatives.",
-    )
     args = parser.parse_args()
 
     install_path = os.path.abspath(os.path.join(os.path.abspath(__file__), os.pardir))
     default_config = os.path.join(install_path, "settings", "settings.ini")
     cfg_path = args.config if args.config else default_config
 
-    generate_gqi_summary(args.inputdata, cfg_path, args.derivatives_path)
+    generate_gqi_summary(args.inputdata, cfg_path)
     return
