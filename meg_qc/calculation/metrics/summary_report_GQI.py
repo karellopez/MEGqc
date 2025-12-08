@@ -596,7 +596,7 @@ def create_group_metrics_figure(tsv_path: Union[str, os.PathLike], output_png: U
 
 
 
-def generate_gqi_summary(dataset_path: str, derivatives_root: str, config_file: str) -> None:
+def generate_gqi_summary(dataset_path: str, config_file: str) -> None:
     """Generate Global Quality Index summaries from existing metrics."""
     # Load user configuration to retrieve GQI settings
     qc_params = get_all_config_params(config_file)
@@ -604,8 +604,8 @@ def generate_gqi_summary(dataset_path: str, derivatives_root: str, config_file: 
         return
     gqi_params = qc_params.get("GlobalQualityIndex")
 
-    calc_dir = os.path.join(derivatives_root, "Meg_QC", "calculation")
-    reports_root = os.path.join(derivatives_root, "Meg_QC", "summary_reports")
+    calc_dir = os.path.join(dataset_path, "derivatives", "Meg_QC", "calculation")
+    reports_root = os.path.join(dataset_path, "derivatives", "Meg_QC", "summary_reports")
     os.makedirs(reports_root, exist_ok=True)
 
     # Create a new attempt folder using incremental numbering
