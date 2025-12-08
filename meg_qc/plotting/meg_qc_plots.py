@@ -6,7 +6,7 @@ from prompt_toolkit.shortcuts import checkboxlist_dialog
 from prompt_toolkit.styles import Style
 from collections import defaultdict
 import re
-from typing import List
+from typing import List, Optional
 from pprint import pprint
 import gc
 from ancpbids import DatasetOptions
@@ -668,7 +668,7 @@ def process_subject(
     return
 
 
-def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
+def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_path: Optional[str] = None):
     """
     Create plots for the MEG QC pipeline, but WITHOUT the interactive selector.
     Instead, we assume 'all' for every entity (subject, task, session, run, metric).
@@ -680,8 +680,10 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
     start_time = time.time()
 
 
+    derivatives_base = os.path.abspath(derivatives_path) if derivatives_path else dataset_path
+
     try:
-        dataset = ancpbids.load_dataset(dataset_path, DatasetOptions(lazy_loading=True))
+        dataset = ancpbids.load_dataset(derivatives_base, DatasetOptions(lazy_loading=True))
         schema = dataset.get_schema()
     except Exception:
         print('___MEGqc___: ',
@@ -689,7 +691,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
         return
 
     # Make sure the derivatives folder exists:
-    derivatives_path = os.path.join(dataset_path, 'derivatives')
+    derivatives_path = os.path.join(derivatives_base, 'derivatives')
     if not os.path.isdir(derivatives_path):
         os.mkdir(derivatives_path)
         print('___MEGqc___: Derivs folder was not found! Created new.')

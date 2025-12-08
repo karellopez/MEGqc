@@ -3,6 +3,7 @@ import gc
 import ancpbids
 from ancpbids.query import query_entities
 from ancpbids import DatasetOptions
+from ancpbids import save_dataset
 import time
 import json
 import sys
@@ -157,6 +158,52 @@ def get_files_list(sid: str, dataset_path: str, dataset):
     # we can also check that final file of path in list of files is same as name in jsons
 
     return list_of_files, entities_per_file
+
+
+def get_derivatives_base_path(dataset_path: str, override_path: Optional[str]) -> str:
+    """
+    Resolve where derivatives should be written.
+
+    Parameters
+    ----------
+    dataset_path : str
+        Path to the source BIDS dataset.
+    override_path : str or None
+        Optional user-provided location for derivatives output.
+
+    Returns
+    -------
+    str
+        Absolute path to the base directory for derivatives.
+    """
+
+    if override_path:
+        derivatives_base = os.path.abspath(override_path)
+    else:
+        derivatives_base = dataset_path
+
+    os.makedirs(derivatives_base, exist_ok=True)
+
+    # Copy dataset_description.json to support downstream tools that load
+    # derivatives from the alternate location without needing write access to
+    # the original dataset directory.
+    src_description = os.path.join(dataset_path, 'dataset_description.json')
+    dst_description = os.path.join(derivatives_base, 'dataset_description.json')
+    if os.path.isfile(src_description) and not os.path.isfile(dst_description):
+        shutil.copy(src_description, dst_description)
+
+    return derivatives_base
+
+
+def write_derivative(dataset, derivative, derivatives_base: str) -> None:
+    """Persist a derivative to ``derivatives_base`` using ancpbids.
+
+    Using :func:`ancpbids.save_dataset` lets us redirect derivative output to a
+    user-writable directory while keeping the dataset graph intact.
+    """
+
+    print('___MEGqc___: ', f'Writing derivatives to: {derivatives_base}')
+    save_dataset(dataset, target_dir=derivatives_base, context_folder=derivative)
 
 
 def create_config_artifact(derivative, config_file_path: str, f_name_to_save: str, all_taken_raw_files: List[str]):
@@ -516,7 +563,8 @@ def process_one_subject(
         dataset,
         dataset_path: str,
         all_qc_params: dict,
-        internal_qc_params: dict
+        internal_qc_params: dict,
+        derivatives_base: str
 ):
     """
     This function processes a single subject. It contains all the code that was
@@ -896,7 +944,7 @@ def process_one_subject(
             print('REMOVING TRASH: FAILED')
 
     # WRITE DERIVATIVE
-    ancpbids.write_derivative(dataset, derivative)
+    write_derivative(dataset, derivative, derivatives_base)
 
 
 
@@ -921,7 +969,8 @@ def process_one_subject_safe(
         dataset,
         dataset_path: str,
         all_qc_params: dict,
-        internal_qc_params: dict):
+        internal_qc_params: dict,
+        derivatives_base: str):
     """Wrapper around :func:`process_one_subject` that catches errors.
 
     Parameters are identical to :func:`process_one_subject`.
@@ -935,6 +984,7 @@ def process_one_subject_safe(
             dataset_path=dataset_path,
             all_qc_params=all_qc_params,
             internal_qc_params=internal_qc_params,
+            derivatives_base=derivatives_base,
         )
         return sub, result
     except Exception as e:  # Catch any error so the parallel job continues
@@ -1052,7 +1102,8 @@ def make_derivative_meg_qc(
         internal_config_file_path: str,
         ds_paths: Union[List[str], str],
         sub_list: Union[List[str], str] = 'all',
-        n_jobs: int = 5  # Number of parallel jobs
+        n_jobs: int = 5,  # Number of parallel jobs
+        derivatives_path: Optional[str] = None
 ):
     start_time = time.time()
 
@@ -1064,9 +1115,8 @@ def make_derivative_meg_qc(
         dataset = ancpbids.load_dataset(dataset_path, DatasetOptions(lazy_loading=True))
         schema = dataset.get_schema()
 
-        derivatives_path = os.path.join(dataset_path, 'derivatives')
-        if not os.path.isdir(derivatives_path):
-            os.mkdir(derivatives_path)
+        derivatives_base = get_derivatives_base_path(dataset_path, derivatives_path)
+        os.makedirs(os.path.join(derivatives_base, 'derivatives'), exist_ok=True)
 
         reuse_config_file_path = check_config_saved_ask_user(dataset)
         if reuse_config_file_path:
@@ -1093,7 +1143,8 @@ def make_derivative_meg_qc(
                 dataset=dataset,
                 dataset_path=dataset_path,
                 all_qc_params=all_qc_params,
-                internal_qc_params=internal_qc_params
+                internal_qc_params=internal_qc_params,
+                derivatives_base=derivatives_base
             )
             for sub in sub_list
         )
@@ -1140,11 +1191,11 @@ def make_derivative_meg_qc(
             add_raw_to_config_json(derivative, reuse_config_file_path, all_subs_raw_files)
 
         # Write the pipeline-level derivative to disk
-        ancpbids.write_derivative(dataset, derivative)
+        write_derivative(dataset, derivative, derivatives_base)
 
         # Save list of excluded subjects
         if excluded_subjects:
-            excl_path = os.path.join(dataset_path, 'derivatives', 'Meg_QC', 'excluded_subjects')
+            excl_path = os.path.join(derivatives_base, 'derivatives', 'Meg_QC', 'excluded_subjects')
             os.makedirs(os.path.dirname(excl_path), exist_ok=True)
             with open(excl_path, 'w', encoding='utf-8') as f:
                 for sub in excluded_subjects:
@@ -1152,7 +1203,7 @@ def make_derivative_meg_qc(
 
         # Generate Global Quality Index reports and group table
         try:
-            generate_gqi_summary(dataset_path, config_file_path)
+            generate_gqi_summary(dataset_path, config_file_path, derivatives_base)
         except Exception as e:
             print("___MEGqc___: Failed to create global quality reports", e)
 
