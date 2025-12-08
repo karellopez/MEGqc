@@ -279,23 +279,11 @@ def run_gqi():
         required=False,
         help="Path to a config file with GQI parameters",
     )
-    parser.add_argument(
-        "--derivatives_output",
-        type=str,
-        required=False,
-        help="Optional folder to store derivatives outside the BIDS dataset",
-    )
     args = parser.parse_args()
 
     install_path = os.path.abspath(os.path.join(os.path.abspath(__file__), os.pardir))
     default_config = os.path.join(install_path, "settings", "settings.ini")
     cfg_path = args.config if args.config else default_config
 
-    derivatives_root = args.derivatives_output
-    if derivatives_root:
-        derivatives_root = os.path.join(derivatives_root, os.path.basename(os.path.normpath(args.inputdata)), 'derivatives')
-    else:
-        derivatives_root = os.path.join(args.inputdata, 'derivatives')
-
-    generate_gqi_summary(args.inputdata, derivatives_root, cfg_path)
+    generate_gqi_summary(args.inputdata, cfg_path)
     return
