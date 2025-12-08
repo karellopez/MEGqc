@@ -44,9 +44,53 @@ from meg_qc.calculation.metrics.muscle_meg_qc import MUSCLE_meg_qc
 import os
 import json
 import pandas as pd
-from typing import Union, Optional, Dict
+from typing import Union, Optional, Dict, Tuple
+from contextlib import contextmanager
 
 from meg_qc.calculation.metrics.summary_report_GQI import generate_gqi_summary
+
+
+def resolve_output_roots(dataset_path: str, external_derivatives_root: Optional[str]) -> Tuple[str, str]:
+    """Return the dataset output root and derivatives folder respecting overrides.
+
+    Parameters
+    ----------
+    dataset_path : str
+        Path to the original BIDS dataset.
+    external_derivatives_root : Optional[str]
+        User-provided folder in which a dataset-named directory will be created
+        to host derivatives. If ``None`` the derivatives live inside the
+        original dataset.
+
+    Returns
+    -------
+    tuple
+        ``(output_root, derivatives_root)`` where ``output_root`` is the base
+        dataset directory used when writing derivatives and ``derivatives_root``
+        points to the "derivatives" folder inside ``output_root``.
+    """
+
+    ds_name = os.path.basename(os.path.normpath(dataset_path))
+    output_root = dataset_path if external_derivatives_root is None else os.path.join(external_derivatives_root, ds_name)
+    derivatives_root = os.path.join(output_root, 'derivatives')
+    os.makedirs(derivatives_root, exist_ok=True)
+    return output_root, derivatives_root
+
+
+@contextmanager
+def temporary_dataset_base(dataset, base_dir: str):
+    """Temporarily point an ANCPBIDS dataset to a different base directory.
+
+    This is used to redirect derivative writing without interfering with how
+    raw files are located inside the original BIDS dataset.
+    """
+
+    original_base = getattr(dataset, 'base_dir_', None)
+    dataset.base_dir_ = base_dir
+    try:
+        yield
+    finally:
+        dataset.base_dir_ = original_base
 
 def ctf_workaround(dataset, sid):
     artifacts = dataset.query(suffix="meg", return_type="object", subj=sid, scope='raw')
@@ -516,7 +560,9 @@ def process_one_subject(
         dataset,
         dataset_path: str,
         all_qc_params: dict,
-        internal_qc_params: dict
+        internal_qc_params: dict,
+        derivatives_root: str,
+        output_root: str
 ):
     """
     This function processes a single subject. It contains all the code that was
@@ -534,6 +580,11 @@ def process_one_subject(
         QC parameters from user config file.
     internal_qc_params : dict
         Internal QC parameters that users do not change.
+    derivatives_root : str
+        Path to the derivatives directory where outputs should be written.
+    output_root : str
+        Base directory used when persisting derivatives (parent of the
+        derivatives folder), allowing redirection outside the BIDS dataset.
     """
 
     # We replicate everything that was inside the loop.
@@ -608,7 +659,7 @@ def process_one_subject(
             filtering_settings=all_qc_params['Filtering'],
             epoching_params=all_qc_params['Epoching'],
             file_path=data_file,
-            dataset_path=dataset_path
+            derivatives_root=derivatives_root
         )
 
         print('___MEGqc___: ',
@@ -896,7 +947,8 @@ def process_one_subject(
             print('REMOVING TRASH: FAILED')
 
     # WRITE DERIVATIVE
-    ancpbids.write_derivative(dataset, derivative)
+    with temporary_dataset_base(dataset, output_root):
+        ancpbids.write_derivative(dataset, derivative)
 
 
 
@@ -921,7 +973,9 @@ def process_one_subject_safe(
         dataset,
         dataset_path: str,
         all_qc_params: dict,
-        internal_qc_params: dict):
+        internal_qc_params: dict,
+        derivatives_root: str,
+        output_root: str):
     """Wrapper around :func:`process_one_subject` that catches errors.
 
     Parameters are identical to :func:`process_one_subject`.
@@ -935,6 +989,8 @@ def process_one_subject_safe(
             dataset_path=dataset_path,
             all_qc_params=all_qc_params,
             internal_qc_params=internal_qc_params,
+            derivatives_root=derivatives_root,
+            output_root=output_root,
         )
         return sub, result
     except Exception as e:  # Catch any error so the parallel job continues
@@ -1052,7 +1108,8 @@ def make_derivative_meg_qc(
         internal_config_file_path: str,
         ds_paths: Union[List[str], str],
         sub_list: Union[List[str], str] = 'all',
-        n_jobs: int = 5  # Number of parallel jobs
+        n_jobs: int = 5,  # Number of parallel jobs
+        derivatives_base: Optional[str] = None
 ):
     start_time = time.time()
 
@@ -1064,11 +1121,10 @@ def make_derivative_meg_qc(
         dataset = ancpbids.load_dataset(dataset_path, DatasetOptions(lazy_loading=True))
         schema = dataset.get_schema()
 
-        derivatives_path = os.path.join(dataset_path, 'derivatives')
-        if not os.path.isdir(derivatives_path):
-            os.mkdir(derivatives_path)
+        output_root, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
 
-        reuse_config_file_path = check_config_saved_ask_user(dataset)
+        with temporary_dataset_base(dataset, output_root):
+            reuse_config_file_path = check_config_saved_ask_user(dataset)
         if reuse_config_file_path:
             config_file_path = reuse_config_file_path
         else:
@@ -1093,7 +1149,9 @@ def make_derivative_meg_qc(
                 dataset=dataset,
                 dataset_path=dataset_path,
                 all_qc_params=all_qc_params,
-                internal_qc_params=internal_qc_params
+                internal_qc_params=internal_qc_params,
+                derivatives_root=derivatives_root,
+                output_root=output_root
             )
             for sub in sub_list
         )
@@ -1121,7 +1179,7 @@ def make_derivative_meg_qc(
         excluded_subjects = [sub for sub, files in results if files is None]
 
         # Remove temporary folder of intermediate files
-        delete_temp_folder(dataset_path)
+        delete_temp_folder(derivatives_root)
 
         # Save config file used for this run as a derivative:
         all_subs_raw_files = []
@@ -1140,11 +1198,12 @@ def make_derivative_meg_qc(
             add_raw_to_config_json(derivative, reuse_config_file_path, all_subs_raw_files)
 
         # Write the pipeline-level derivative to disk
-        ancpbids.write_derivative(dataset, derivative)
+        with temporary_dataset_base(dataset, output_root):
+            ancpbids.write_derivative(dataset, derivative)
 
         # Save list of excluded subjects
         if excluded_subjects:
-            excl_path = os.path.join(dataset_path, 'derivatives', 'Meg_QC', 'excluded_subjects')
+            excl_path = os.path.join(derivatives_root, 'Meg_QC', 'excluded_subjects')
             os.makedirs(os.path.dirname(excl_path), exist_ok=True)
             with open(excl_path, 'w', encoding='utf-8') as f:
                 for sub in excluded_subjects:
@@ -1152,7 +1211,7 @@ def make_derivative_meg_qc(
 
         # Generate Global Quality Index reports and group table
         try:
-            generate_gqi_summary(dataset_path, config_file_path)
+            generate_gqi_summary(dataset_path, derivatives_root, config_file_path)
         except Exception as e:
             print("___MEGqc___: Failed to create global quality reports", e)
 

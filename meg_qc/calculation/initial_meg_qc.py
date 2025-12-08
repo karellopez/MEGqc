@@ -899,85 +899,38 @@ def sort_channels_by_lobe(channels_objs: dict):
     return chs_by_lobe
 
 
-def save_meg_with_suffix(file_path: str, dataset_path: str, raw, final_suffix: str = "FILTERED") -> str:
+
+
+def save_meg_with_suffix(
+    file_path: str,
+    derivatives_root: str,
+    raw,
+    final_suffix: str = "FILTERED",
+) -> str:
     """
-    Given the original file_path (MEG data) and an MNE raw object,
-    this function creates an output directory based on the file_path
-    and saves the raw data in FIF format with the user-provided suffix.
+    Save an MNE raw object alongside the derivatives with a custom suffix.
 
-    The output directory is constructed as:
-        <base_dir>/derivatives/temp/<subject>
-    where:
-        - base_dir is the portion of file_path up to ds_name
-        - subject is the folder immediately after ds_name
-          (plus a small offset if 'temp' is in the path)
-        - ds_name is extracted from dataset_path (e.g., the basename "ds_orig").
-
-    Logic for Windows:
-     - If the path starts with "K:" or "C:" but not "K:\", we add a backslash
-       so Windows recognizes it as an absolute drive path.
-
-    Logic for Linux:
-     - If the first component is "", it means an absolute path like "/home/..."
-       so we strip that "" and eventually re-add the leading slash when building base_dir.
-
-    Everything else remains as in your original code.
+    The output directory is constructed as ``<derivatives_root>/temp/<subject>``
+    where ``subject`` is inferred from the first path component starting with
+    ``sub-`` in ``file_path``. Using ``derivatives_root`` allows callers to place
+    temporary files outside the read-only BIDS directory if needed.
     """
 
-    # 1) Normalize and split
     norm_path = os.path.normpath(file_path)
     components = norm_path.split(os.sep)
 
-    # 2) Minimal fix for Windows drive letter "K:", "C:", etc.
-    #    If the first component is just <Letter>:, add a backslash to make it absolute.
-    if components and re.match(r'^[A-Za-z]:$', components[0]):
-        # e.g. components[0] == "K:"
-        components[0] += "\\"  # becomes "K:\"
-        use_windows_join = True
+    subject = next((part for part in components if part.startswith('sub-')), None)
+    if subject is None:
+        raise ValueError("Unable to determine subject from file path for temporary output")
 
-    # 3) Linux absolute path => first component might be "", remove it as you did originally.
-    elif components and components[0] == '':
-        # It's an absolute path on Linux, e.g. "/home/..."
-        components = components[1:]
-        use_windows_join = False
-
-    else:
-        # Possibly a relative path or something else => treat like Linux
-        use_windows_join = False
-
-    # 4) ds_name from dataset_path
-    ds_name = os.path.basename(os.path.normpath(dataset_path))
-    print("ds_name:", ds_name)
-
-    # 5) Find ds_name in components
-    idx = components.index(ds_name)
-
-    # 6) Determine subject after ds_name (plus small offset if 'temp' is in the path)
-    if 'temp' in components:
-        subject = components[idx + 3]
-    else:
-        subject = components[idx + 1]
-
-    # 7) Build base_dir from everything up to ds_name
-    #    If Windows drive letter is in [0], we skip adding os.sep at the front.
-    if use_windows_join:
-        # e.g. "K:\ds_orig" => we join normally
-        base_dir = os.path.join(*components[:idx + 1])
-    else:
-        # Linux or relative => replicate your old logic: leading slash
-        base_dir = os.path.join(os.sep, *components[:idx + 1])
-
-    # 8) Construct the output directory
-    output_dir = os.path.join(base_dir, 'derivatives', 'temp', subject)
+    output_dir = os.path.join(derivatives_root, 'temp', subject)
     output_dir = os.path.abspath(output_dir)
     print("Output directory:", output_dir)
 
-    # 9) Create if doesn't exist
+    # Create the target folder if it does not exist already
     os.makedirs(output_dir, exist_ok=True)
     print("Directory created (or already exists):", output_dir)
 
-    # 10) Build new filename with suffix.
-    #    If the data is CTF, it will replace .ds with .fif
     filename = os.path.basename(file_path)
     name, ext = os.path.splitext(filename)
 
@@ -988,38 +941,32 @@ def save_meg_with_suffix(file_path: str, dataset_path: str, raw, final_suffix: s
     new_file_path = os.path.join(output_dir, new_filename)
     print("New file path:", new_file_path)
 
-    # 11) Save
     raw.save(new_file_path, overwrite=True, verbose='ERROR')
 
     return new_file_path
 
 
-def delete_temp_folder(dataset_path: str) -> str:
+def delete_temp_folder(derivatives_root: str) -> str:
     """
-    Given the original dataset_path, this function re-creates the temporary written files
-    directory and then delete it.
-
-    The output directory is constructed as:
-         <base_dir>/derivatives/temp/<subject>
-    where:
-         - base_dir is the portion of file_path up to and including 'ds_orig'
-         - subject is the folder immediately after 'ds_orig'
+    Remove the temporary working directory used during preprocessing.
 
     Parameters
     ----------
-    dataset_path : str
-         Absolute path to the dataset folder.
+    derivatives_root : str
+         Absolute path to the dataset's derivatives directory (either inside
+         the BIDS dataset or in an external location).
     """
-    temp_dir = os.path.join(dataset_path, 'derivatives', 'temp')
+    temp_dir = os.path.join(derivatives_root, 'temp')
     temp_dir = os.path.abspath(temp_dir)
-    shutil.rmtree(temp_dir)
-    print("Removing directory:", temp_dir)
+    if os.path.isdir(temp_dir):
+        shutil.rmtree(temp_dir)
+        print("Removing directory:", temp_dir)
 
     return
 
 
 def initial_processing(default_settings: dict, filtering_settings: dict, epoching_params: dict, file_path: str,
-                       dataset_path: str):
+                       derivatives_root: str):
     """
     Here all the initial actions needed to analyse MEG data are done:
 
@@ -1121,7 +1068,7 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
     if filtering_settings['apply_filtering'] is True:
         raw_cropped.load_data()  # Data has to be loaded into mememory before filetering:
         # Save raw_cropped
-        raw_cropped_path = save_meg_with_suffix(file_path, dataset_path, raw_cropped, final_suffix="CROPPED")
+        raw_cropped_path = save_meg_with_suffix(file_path, derivatives_root, raw_cropped, final_suffix="CROPPED")
 
         raw_cropped_filtered = raw_cropped
 
@@ -1138,7 +1085,7 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
               'Hz.')
 
         # Save filtered signal
-        raw_cropped_filtered_path = save_meg_with_suffix(file_path, dataset_path, raw_cropped_filtered,
+        raw_cropped_filtered_path = save_meg_with_suffix(file_path, derivatives_root, raw_cropped_filtered,
                                                          final_suffix="FILTERED")
 
         if filtering_settings['downsample_to_hz'] is False:
@@ -1148,14 +1095,14 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
             print('___MEGqc___: ', resample_str)
         elif filtering_settings['downsample_to_hz'] >= filtering_settings['h_freq'] * 5:
             raw_cropped_filtered_resampled = raw_cropped_filtered.resample(sfreq=filtering_settings['downsample_to_hz'])
-            raw_cropped_filtered_resampled_path = save_meg_with_suffix(file_path, dataset_path,
+            raw_cropped_filtered_resampled_path = save_meg_with_suffix(file_path, derivatives_root,
                                                                        raw_cropped_filtered_resampled,
                                                                        final_suffix="FILTERED_RESAMPLED")
             resample_str = 'Data resampled to ' + str(filtering_settings['downsample_to_hz']) + ' Hz. '
             print('___MEGqc___: ', resample_str)
         else:
             raw_cropped_filtered_resampled = raw_cropped_filtered.resample(sfreq=filtering_settings['h_freq'] * 5)
-            raw_cropped_filtered_resampled_path = save_meg_with_suffix(file_path, dataset_path,
+            raw_cropped_filtered_resampled_path = save_meg_with_suffix(file_path, derivatives_root,
                                                                        raw_cropped_filtered_resampled,
                                                                        final_suffix="FILTERED_RESAMPLED")
             # frequency to resample is 5 times higher than the maximum chosen frequency of the function
@@ -1169,7 +1116,7 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
         # And downsample:
         if filtering_settings['downsample_to_hz'] is not False:
             raw_cropped_filtered_resampled = raw_cropped_filtered.resample(sfreq=filtering_settings['downsample_to_hz'])
-            raw_cropped_filtered_resampled_path = save_meg_with_suffix(file_path, dataset_path,
+            raw_cropped_filtered_resampled_path = save_meg_with_suffix(file_path, derivatives_root,
                                                                        raw_cropped_filtered_resampled,
                                                                        final_suffix="FILTERED_RESAMPLED")
             if filtering_settings['downsample_to_hz'] < 500:
@@ -1181,7 +1128,7 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
                 print('___MEGqc___: ', resample_str)
         else:
             raw_cropped_filtered_resampled = raw_cropped_filtered
-            raw_cropped_filtered_resampled_path = save_meg_with_suffix(file_path, dataset_path,
+            raw_cropped_filtered_resampled_path = save_meg_with_suffix(file_path, derivatives_root,
                                                                        raw_cropped_filtered_resampled,
                                                                        final_suffix="FILTERED_RESAMPLED")
             resample_str = 'Data not resampled. '
