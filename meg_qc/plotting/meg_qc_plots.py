@@ -13,6 +13,8 @@ from ancpbids import DatasetOptions
 import configparser
 from pathlib import Path
 import time
+from typing import Tuple, Optional
+from contextlib import contextmanager
 
 # Get the absolute path of the parent directory of the current script
 parent_dir = os.path.dirname(os.getcwd())
@@ -74,6 +76,28 @@ def _load_plotting_backend():
 
 
 _load_plotting_backend()
+
+
+def resolve_output_roots(dataset_path: str, external_derivatives_root: Optional[str]) -> Tuple[str, str]:
+    """Return dataset output root and derivatives folder respecting overrides."""
+
+    ds_name = os.path.basename(os.path.normpath(dataset_path))
+    output_root = dataset_path if external_derivatives_root is None else os.path.join(external_derivatives_root, ds_name)
+    derivatives_root = os.path.join(output_root, 'derivatives')
+    os.makedirs(derivatives_root, exist_ok=True)
+    return output_root, derivatives_root
+
+
+@contextmanager
+def temporary_dataset_base(dataset, base_dir: str):
+    """Temporarily repoint the ANCPBIDS dataset to a new base directory."""
+
+    original_base = getattr(dataset, 'base_dir_', None)
+    dataset.base_dir_ = base_dir
+    try:
+        yield
+    finally:
+        dataset.base_dir_ = original_base
 
 # IMPORTANT: keep this order of imports, first need to add parent dir to sys.path, then import from it.
 
@@ -664,11 +688,12 @@ def process_subject(
                 lambda file_path, cont=summary_html: open(file_path, "w", encoding="utf-8").write(cont)
             )
 
-    ancpbids.write_derivative(dataset, derivative)
+    with temporary_dataset_base(dataset, output_root):
+        ancpbids.write_derivative(dataset, derivative)
     return
 
 
-def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
+def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Optional[str] = None):
     """
     Create plots for the MEG QC pipeline, but WITHOUT the interactive selector.
     Instead, we assume 'all' for every entity (subject, task, session, run, metric).
@@ -688,11 +713,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
               'No data found in the given directory path! \nCheck directory path in config file and presence of data.')
         return
 
-    # Make sure the derivatives folder exists:
-    derivatives_path = os.path.join(dataset_path, 'derivatives')
-    if not os.path.isdir(derivatives_path):
-        os.mkdir(derivatives_path)
-        print('___MEGqc___: Derivs folder was not found! Created new.')
+    output_root, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
 
     calculated_derivs_folder = os.path.join('derivatives', 'Meg_QC', 'calculation')
 
@@ -700,7 +721,8 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
     # REPLACE THE SELECTOR WITH A HARDCODED "ALL" CHOICE
     # --------------------------------------------------------------------------------
     # 1) Get all discovered entities from the derivatives scope
-    entities_found = get_ds_entities(dataset, calculated_derivs_folder)
+    with temporary_dataset_base(dataset, output_root):
+        entities_found = get_ds_entities(dataset, calculated_derivs_folder)
 
     # Suppose 'description' is the metric list
     all_metrics = entities_found.get('description', [])
