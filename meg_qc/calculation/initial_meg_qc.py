@@ -584,12 +584,20 @@ def load_data(file_path):
                 print(f"___MEGqc___: Using split FIF part: {resolved_path}")
 
             raw = mne.io.read_raw_fif(resolved_path, on_split_missing='ignore', verbose='ERROR')
+            splits_detected = len(raw._raw_extras)
+            if splits_detected > 1:
+                print(f"___MEGqc___: Split FIF detected with {splits_detected} parts; MNE has merged the splits.")
+                print(raw.times[-1] / 60, "min")
         except:
             resolved_path = _resolve_split_fif_path(file_path)
             if resolved_path != file_path:
                 print(f"___MEGqc___: Using split FIF part: {resolved_path}")
 
             raw = mne.io.read_raw_fif(resolved_path, allow_maxshield=True, on_split_missing='ignore', verbose='ERROR')
+            splits_detected = len(raw._raw_extras)
+            if splits_detected > 1:
+                print(f"___MEGqc___: Split FIF detected with {splits_detected} parts; MNE has merged the splits.")
+                print(raw.times[-1] / 60, "min")
             shielding_str = ''' <p>This fif file contains Internal Active Shielding data. Quality measurements calculated on this data should not be compared to the measuremnts calculated on the data without active shileding, since in the current case environmental noise reduction was already partially performed by shileding, which normally should not be done before assesing the quality.</p>'''
 
     else:
