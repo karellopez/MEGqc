@@ -5,7 +5,12 @@
 import gc
 import os
 import time
-from meg_qc.calculation.initial_meg_qc import (chs_dict_to_csv,load_data,save_meg_with_suffix)
+from meg_qc.calculation.initial_meg_qc import (
+    chs_dict_to_csv,
+    load_data,
+    remove_fif_and_splits,
+    save_meg_with_suffix,
+)
 import numpy as np
 from scipy.ndimage import distance_transform_edt, label
 from scipy.signal import find_peaks
@@ -181,7 +186,7 @@ def annotate_muscle_zscore(
     del raw
     del raw_copy
     gc.collect()
-    os.remove(raw_annotated_muscle_path)
+    remove_fif_and_splits(raw_annotated_muscle_path)
 
     return annot, scores_muscle
 

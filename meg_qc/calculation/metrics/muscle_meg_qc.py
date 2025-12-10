@@ -31,7 +31,11 @@ import numpy as np
 from meg_qc.miscellaneous.optimizations.artifact_detection_ancp import annotate_muscle_zscore
 from typing import List
 from meg_qc.plotting.universal_plots import QC_derivative
-from meg_qc.calculation.initial_meg_qc import (load_data, save_meg_with_suffix)
+from meg_qc.calculation.initial_meg_qc import (
+    load_data,
+    remove_fif_and_splits,
+    save_meg_with_suffix,
+)
 
 def find_powerline_noise_short(raw, psd_params, psd_params_internal, m_or_g_chosen, channels):
 
@@ -502,5 +506,5 @@ def MUSCLE_meg_qc(
         derivatives_root,
     )
 
-    os.remove(raw_muscle_path)
+    remove_fif_and_splits(raw_muscle_path)
     return df_deriv, simple_metric, muscle_str_joined, scores_muscle
