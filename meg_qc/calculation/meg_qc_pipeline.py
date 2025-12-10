@@ -27,8 +27,13 @@ sys.path.append(os.path.join('..', '..', 'meg_qc', 'calculation'))
 sys.path.append(os.path.join('..', '..', '..', 'meg_qc', 'calculation'))
 sys.path.append(os.path.join('..', '..', '..', '..', 'meg_qc', 'calculation'))
 
-from meg_qc.calculation.initial_meg_qc import get_all_config_params, initial_processing, get_internal_config_params, \
-    delete_temp_folder
+from meg_qc.calculation.initial_meg_qc import (
+    delete_temp_folder,
+    get_all_config_params,
+    get_internal_config_params,
+    initial_processing,
+    remove_fif_and_splits,
+)
 # from meg_qc.plotting.universal_html_report import make_joined_report, make_joined_report_mne
 from meg_qc.plotting.universal_plots import QC_derivative
 
@@ -932,9 +937,9 @@ def process_one_subject(
 
         # CLEAN UP TEMP FILES
         try:
-            os.remove(raw_cropped)
-            os.remove(raw_cropped_filtered)
-            os.remove(raw_cropped_filtered_resampled)
+            remove_fif_and_splits(raw_cropped)
+            remove_fif_and_splits(raw_cropped_filtered)
+            remove_fif_and_splits(raw_cropped_filtered_resampled)
 
             del (meg_system, dict_epochs_mg, chs_by_lobe, channels,
                  raw_cropped_filtered, raw_cropped_filtered_resampled,
@@ -943,7 +948,7 @@ def process_one_subject(
                  lobes_color_coding_str, resample_str)
             gc.collect()
             print('REMOVING TRASH: SUCCEEDED')
-        except:
+        except Exception:
             print('REMOVING TRASH: FAILED')
 
     # WRITE DERIVATIVE

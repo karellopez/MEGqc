@@ -1029,6 +1029,37 @@ def save_meg_with_suffix(
     return resolved_save_path
 
 
+def remove_fif_and_splits(path: str) -> None:
+    """Remove a FIF file and any split parts created by MNE.
+
+    MNE may split large FIF saves into multiple pieces using either
+    ``split-XX`` or ``-1.fif`` style numbering. This function removes the
+    specified file path as well as any adjacent split parts that share the
+    same base name.
+    """
+
+    base_dir = os.path.dirname(path) or "."
+    root, ext = os.path.splitext(os.path.basename(path))
+
+    if ext.lower() != ".fif":
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        return
+
+    # Normalize the root to the original requested name (without split tags)
+    normalized_root = re.sub(r"(?:_split-\d+|-\d+)$", "", root)
+    patterns = [f"{normalized_root}*.fif"]
+
+    for pattern in patterns:
+        for candidate in glob.glob(os.path.join(base_dir, pattern)):
+            try:
+                os.remove(candidate)
+            except FileNotFoundError:
+                continue
+
+
 def delete_temp_folder(derivatives_root: str) -> str:
     """
     Remove the temporary working directory used during preprocessing.
