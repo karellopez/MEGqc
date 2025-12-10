@@ -1,5 +1,6 @@
 import os
 import re
+import glob
 import shutil
 import gc
 import mne
@@ -528,22 +529,68 @@ def load_data(file_path):
 
     meg_system = None
 
+    def _resolve_split_fif_path(path: str) -> str:
+        """Return the first available FIF split created by MNE.
+
+        Large FIF files may be written in numbered chunks ("-1.fif", "-2.fif",
+        etc.) or with BIDS-style split labels ("split-01"). When the requested
+        path points to the unsuffixed name (or to a missing chunk), try to find
+        the lowest-index split part so reading succeeds without manual cleanup.
+        """
+
+        if os.path.isfile(path):
+            return path
+
+        base_dir = os.path.dirname(path) or '.'
+        filename = os.path.basename(path)
+        name, ext = os.path.splitext(filename)
+
+        if ext.lower() != '.fif':
+            return path
+
+        candidates = glob.glob(os.path.join(base_dir, f"{name}*{ext}"))
+
+        split_candidates = []
+        for candidate in candidates:
+            cand_base = os.path.basename(candidate)
+            split_match = re.search(r'split-(\d+)', cand_base)
+            numbered_match = re.search(r'-(\d+)\.fif$', cand_base)
+
+            if split_match:
+                split_candidates.append((int(split_match.group(1)), candidate))
+            elif numbered_match:
+                split_candidates.append((int(numbered_match.group(1)), candidate))
+
+        if split_candidates:
+            split_candidates.sort(key=lambda x: x[0])
+            return split_candidates[0][1]
+
+        return path
+
     if os.path.isdir(file_path) and file_path.endswith('.ds'):
         # It's a CTF data directory
         print("___MEGqc___: ", "Loading CTF data...")
         raw = mne.io.read_raw_ctf(file_path, preload=True, verbose='ERROR')
         meg_system = 'CTF'
 
-    elif os.path.isfile(file_path) and file_path.endswith('.fif'):
+    elif file_path.endswith('.fif'):
         # It's a FIF file
         meg_system = 'Triux'
 
         print("___MEGqc___: ", "Loading FIF data...")
         try:
-            raw = mne.io.read_raw_fif(file_path, on_split_missing='ignore', verbose='ERROR')
+            resolved_path = _resolve_split_fif_path(file_path)
+            if resolved_path != file_path:
+                print(f"___MEGqc___: Using split FIF part: {resolved_path}")
+
+            raw = mne.io.read_raw_fif(resolved_path, on_split_missing='ignore', verbose='ERROR')
         except:
-            raw = mne.io.read_raw_fif(file_path, allow_maxshield=True, on_split_missing='ignore', verbose='ERROR')
-            shielding_str = ''' <p>This fif file contains Internal Active Shielding data. Quality measurements calculated on this data should not be compared to the measuremnts calculated on the data without active shileding, since in the current case invironmental noise reduction was already partially performed by shileding, which normally should not be done before assesing the quality.</p>'''
+            resolved_path = _resolve_split_fif_path(file_path)
+            if resolved_path != file_path:
+                print(f"___MEGqc___: Using split FIF part: {resolved_path}")
+
+            raw = mne.io.read_raw_fif(resolved_path, allow_maxshield=True, on_split_missing='ignore', verbose='ERROR')
+            shielding_str = ''' <p>This fif file contains Internal Active Shielding data. Quality measurements calculated on this data should not be compared to the measuremnts calculated on the data without active shileding, since in the current case environmental noise reduction was already partially performed by shileding, which normally should not be done before assesing the quality.</p>'''
 
     else:
         raise ValueError(
@@ -941,9 +988,45 @@ def save_meg_with_suffix(
     new_file_path = os.path.join(output_dir, new_filename)
     print("New file path:", new_file_path)
 
+    def _resolve_saved_split_path(path: str) -> str:
+        """Return the first split chunk saved by MNE when splitting occurs."""
+
+        if os.path.isfile(path):
+            return path
+
+        base_dir = os.path.dirname(path) or '.'
+        filename = os.path.basename(path)
+        name, ext = os.path.splitext(filename)
+
+        if ext.lower() != '.fif':
+            return path
+
+        candidates = glob.glob(os.path.join(base_dir, f"{name}*{ext}"))
+
+        split_candidates = []
+        for candidate in candidates:
+            cand_base = os.path.basename(candidate)
+            split_match = re.search(r'split-(\d+)', cand_base)
+            numbered_match = re.search(r'-(\d+)\.fif$', cand_base)
+
+            if split_match:
+                split_candidates.append((int(split_match.group(1)), candidate))
+            elif numbered_match:
+                split_candidates.append((int(numbered_match.group(1)), candidate))
+
+        if split_candidates:
+            split_candidates.sort(key=lambda x: x[0])
+            return split_candidates[0][1]
+
+        return path
+
     raw.save(new_file_path, overwrite=True, verbose='ERROR')
 
-    return new_file_path
+    resolved_save_path = _resolve_saved_split_path(new_file_path)
+    if resolved_save_path != new_file_path:
+        print(f"___MEGqc___: Split FIF saved, first part: {resolved_save_path}")
+
+    return resolved_save_path
 
 
 def delete_temp_folder(derivatives_root: str) -> str:
