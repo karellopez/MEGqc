@@ -572,6 +572,7 @@ def load_data(file_path):
         print("___MEGqc___: ", "Loading CTF data...")
         raw = mne.io.read_raw_ctf(file_path, preload=True, verbose='ERROR')
         meg_system = 'CTF'
+        print(f"___MEGqc___: Recording duration: {raw.times[-1] / 60:.2f} min")
 
     elif file_path.endswith('.fif'):
         # It's a FIF file
@@ -585,9 +586,12 @@ def load_data(file_path):
 
             raw = mne.io.read_raw_fif(resolved_path, on_split_missing='ignore', verbose='ERROR')
             splits_detected = len(raw._raw_extras)
+            recording_duration_min = raw.times[-1] / 60
             if splits_detected > 1:
                 print(f"___MEGqc___: Split FIF detected with {splits_detected} parts; MNE has merged the splits.")
-                print(raw.times[-1] / 60, "min")
+                print(f"___MEGqc___: Recording duration: {recording_duration_min:.2f} min")
+            else:
+                print(f"___MEGqc___: Recording duration: {recording_duration_min:.2f} min")
         except:
             resolved_path = _resolve_split_fif_path(file_path)
             if resolved_path != file_path:
@@ -595,9 +599,12 @@ def load_data(file_path):
 
             raw = mne.io.read_raw_fif(resolved_path, allow_maxshield=True, on_split_missing='ignore', verbose='ERROR')
             splits_detected = len(raw._raw_extras)
+            recording_duration_min = raw.times[-1] / 60
             if splits_detected > 1:
                 print(f"___MEGqc___: Split FIF detected with {splits_detected} parts; MNE has merged the splits.")
-                print(raw.times[-1] / 60, "min")
+                print(f"___MEGqc___: Recording duration: {recording_duration_min:.2f} min")
+            else:
+                print(f"___MEGqc___: Recording duration: {recording_duration_min:.2f} min")
             shielding_str = ''' <p>This fif file contains Internal Active Shielding data. Quality measurements calculated on this data should not be compared to the measuremnts calculated on the data without active shileding, since in the current case environmental noise reduction was already partially performed by shileding, which normally should not be done before assesing the quality.</p>'''
 
     else:
