@@ -999,6 +999,12 @@ def save_meg_with_suffix(
     if ext.lower() == '.ds':
         ext = '.fif'
 
+    # Drop BIDS split tags so derivatives use the base recording name. When
+    # MNE saves large files it may split them internally, but the resulting
+    # derivatives should reference the unified recording rather than the
+    # individual split chunk that happened to be loaded first.
+    name = re.sub(r"_split-\d+", "", name)
+
     new_filename = f"{name}_{final_suffix}{ext}"
     new_file_path = os.path.join(output_dir, new_filename)
     print("New file path:", new_file_path)

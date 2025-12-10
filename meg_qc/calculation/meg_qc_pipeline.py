@@ -1,5 +1,6 @@
 import os
 import gc
+import re
 import ancpbids
 from ancpbids.query import query_entities
 from ancpbids import DatasetOptions
@@ -185,6 +186,47 @@ def get_files_list(sid: str, dataset_path: str, dataset):
     else:
         list_of_files = []
         raise ValueError('No fif or ctf files found in the dataset.')
+
+    # Deduplicate split FIF files so we only process the first chunk
+    # -----------------------------------------------------------------
+    # Some recordings are stored as BIDS splits (e.g., ``_split-01`` and
+    # ``_split-02``). MNE stitches them automatically when reading the first
+    # part, so we must ignore the later chunks to avoid treating them as
+    # separate recordings. We keep only the first path encountered for each
+    # base recording and drop the ``split`` entity from the ANCPBIDS artifact
+    # to prevent split tags from leaking into derivative filenames.
+    filtered_files = []
+    filtered_entities = []
+    seen_recordings = set()
+
+    for file_path, entity in zip(list_of_files, entities_per_file):
+        base_name = os.path.basename(file_path)
+        base_root, _ = os.path.splitext(base_name)
+        normalized_root = re.sub(r"_split-\d+", "", base_root)
+
+        if normalized_root in seen_recordings:
+            continue
+
+        seen_recordings.add(normalized_root)
+        filtered_files.append(file_path)
+
+        # Remove split entity when present so downstream derivatives do not
+        # include split tags. We guard access to support different artifact
+        # representations (dict-like or with an ``entities`` attribute).
+        try:
+            if hasattr(entity, 'entities') and isinstance(entity.entities, dict):
+                entity.entities.pop('split', None)
+            if isinstance(entity, dict):
+                entity.pop('split', None)
+        except Exception:
+            # We want to avoid breaking other entity handling; silently ignore
+            # any unexpected structure and keep the artifact as-is.
+            pass
+
+        filtered_entities.append(entity)
+
+    list_of_files = filtered_files
+    entities_per_file = filtered_entities
 
     # Find if we have crosstalk in list of files and entities_per_file, give notification that they will be skipped:
     # read about crosstalk files here: https://bids-specification.readthedocs.io/en/stable/appendices/meg-file-formats.html
