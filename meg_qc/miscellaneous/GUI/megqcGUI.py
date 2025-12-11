@@ -34,7 +34,7 @@ from PyQt6.QtCore import QObject, QProcess, pyqtSignal, Qt, QCoreApplication
 from PyQt6.QtGui import QPixmap, QIcon, QPalette, QColor  # for loading images, setting icon, and theme toggling
 
 # Core MEG QC pipeline functions
-from meg_qc.calculation.meg_qc_pipeline import make_derivative_meg_qc
+from meg_qc.calculation.meg_qc_pipeline import make_derivative_meg_qc, resolve_output_roots
 from meg_qc.plotting.meg_qc_plots import make_plots_meg_qc
 from meg_qc.calculation.metrics.summary_report_GQI import generate_gqi_summary
 
@@ -1000,7 +1000,11 @@ class MainWindow(QMainWindow):
         """Run Global Quality Index calculation only."""
         data_dir = self.data_dir.text().strip()
         derivatives_dir = self.derivatives_dir.text().strip() or None
-        args = (data_dir, derivatives_dir, str(SETTINGS_PATH))
+        # Align the GQI rerun with the calculation pipeline: resolve any
+        # external derivatives base into the concrete derivatives folder so
+        # downstream code can find the previously computed metrics.
+        _, derivatives_root = resolve_output_roots(data_dir, derivatives_dir)
+        args = (data_dir, derivatives_root, str(SETTINGS_PATH))
         worker = Worker(generate_gqi_summary, *args)
         # Prevent concurrent GQI runs; enable again once finished or stopped.
         self.btn_gqi_run.setEnabled(False)
