@@ -82,7 +82,23 @@ def resolve_output_roots(dataset_path: str, external_derivatives_root: Optional[
     """Return dataset output root and derivatives folder respecting overrides."""
 
     ds_name = os.path.basename(os.path.normpath(dataset_path))
-    output_root = dataset_path if external_derivatives_root is None else os.path.join(external_derivatives_root, ds_name)
+
+    if external_derivatives_root is None:
+        output_root = dataset_path
+    else:
+        external_root = os.path.normpath(external_derivatives_root)
+
+        # Accept three possible shapes for ``external_root``:
+        # 1) a base folder where MEGqc should create ``<ds_name>/derivatives``
+        # 2) the dataset root itself (already containing ``derivatives``)
+        # 3) the derivatives folder directly
+        if os.path.basename(external_root) == 'derivatives':
+            output_root = os.path.dirname(external_root)
+        elif os.path.isdir(os.path.join(external_root, 'derivatives')):
+            output_root = external_root
+        else:
+            output_root = os.path.join(external_root, ds_name)
+
     derivatives_root = os.path.join(output_root, 'derivatives')
     os.makedirs(derivatives_root, exist_ok=True)
     return output_root, derivatives_root
