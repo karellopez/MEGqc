@@ -14,7 +14,6 @@ import configparser
 from pathlib import Path
 import time
 from typing import Tuple, Optional
-from contextlib import contextmanager
 
 # Get the absolute path of the parent directory of the current script
 parent_dir = os.path.dirname(os.getcwd())
@@ -25,6 +24,10 @@ sys.path.append(parent_dir)
 sys.path.append(gradparent_dir)
 
 from meg_qc.calculation.objects import QC_derivative
+from meg_qc.calculation.meg_qc_pipeline import (
+    resolve_output_roots,
+    temporary_dataset_base,
+)
 
 # Plotting backends (``universal_plots`` vs ``universal_plots_lite``) and the
 # accompanying report helpers need to be available not only in the main process
@@ -77,27 +80,6 @@ def _load_plotting_backend():
 
 _load_plotting_backend()
 
-
-def resolve_output_roots(dataset_path: str, external_derivatives_root: Optional[str]) -> Tuple[str, str]:
-    """Return dataset output root and derivatives folder respecting overrides."""
-
-    ds_name = os.path.basename(os.path.normpath(dataset_path))
-    output_root = dataset_path if external_derivatives_root is None else os.path.join(external_derivatives_root, ds_name)
-    derivatives_root = os.path.join(output_root, 'derivatives')
-    os.makedirs(derivatives_root, exist_ok=True)
-    return output_root, derivatives_root
-
-
-@contextmanager
-def temporary_dataset_base(dataset, base_dir: str):
-    """Temporarily repoint the ANCPBIDS dataset to a new base directory."""
-
-    original_base = getattr(dataset, 'base_dir_', None)
-    dataset.base_dir_ = base_dir
-    try:
-        yield
-    finally:
-        dataset.base_dir_ = original_base
 
 # IMPORTANT: keep this order of imports, first need to add parent dir to sys.path, then import from it.
 
@@ -284,12 +266,14 @@ def get_ds_entities(dataset, calculated_derivs_folder: str):
 
     """
 
-    try:
-        entities = dataset.query_entities(scope=calculated_derivs_folder)
-        print('___MEGqc___: ', 'Entities found in the dataset: ', entities)
-        #we only get entities of calculated derivatives here, not entire raw ds.
-    except:
-        raise FileNotFoundError(f'___MEGqc___: No calculated derivatives found for this ds!')
+    if not os.path.isdir(calculated_derivs_folder):
+        raise FileNotFoundError(
+            f'___MEGqc___: No calculated derivatives found at {calculated_derivs_folder}!'
+        )
+
+    entities = dataset.query_entities(scope=calculated_derivs_folder)
+    print('___MEGqc___: ', 'Entities found in the dataset: ', entities)
+    #we only get entities of calculated derivatives here, not entire raw ds.
 
     return entities
 
@@ -715,14 +699,13 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
 
     output_root, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
 
-    calculated_derivs_folder = os.path.join('derivatives', 'Meg_QC', 'calculation')
+    calculated_derivs_folder = os.path.join(derivatives_root, 'Meg_QC', 'calculation')
 
     # --------------------------------------------------------------------------------
     # REPLACE THE SELECTOR WITH A HARDCODED "ALL" CHOICE
     # --------------------------------------------------------------------------------
     # 1) Get all discovered entities from the derivatives scope
-    with temporary_dataset_base(dataset, output_root):
-        entities_found = get_ds_entities(dataset, calculated_derivs_folder)
+    entities_found = get_ds_entities(dataset, calculated_derivs_folder)
 
     # Suppose 'description' is the metric list
     all_metrics = entities_found.get('description', [])
