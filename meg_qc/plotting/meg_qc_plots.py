@@ -617,6 +617,7 @@ def process_subject(
         derivs_to_plot: list,
         chosen_entities: dict,
         plot_settings: dict,
+        output_root: str,
 ):
     """Plot all metrics for a single subject."""
 
@@ -720,144 +721,147 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
     # --------------------------------------------------------------------------------
     # REPLACE THE SELECTOR WITH A HARDCODED "ALL" CHOICE
     # --------------------------------------------------------------------------------
-    # 1) Get all discovered entities from the derivatives scope
+    # Work entirely within the resolved output root so that derivative queries
+    # respect external derivatives locations configured via CLI/GUI.
     with temporary_dataset_base(dataset, output_root):
+        # 1) Get all discovered entities from the derivatives scope
         entities_found = get_ds_entities(dataset, calculated_derivs_folder)
 
-    # Suppose 'description' is the metric list
-    all_metrics = entities_found.get('description', [])
+        # Suppose 'description' is the metric list
+        all_metrics = entities_found.get('description', [])
 
-    # If you want them deduplicated, do:
-    all_metrics = list(set(all_metrics))
+        # If you want them deduplicated, do:
+        all_metrics = list(set(all_metrics))
 
-    # Collapse individual PSD descriptions into a single entry so that the
-    # general PSD report (``PSDs``) can gather all derivatives at once.  This
-    # prevents the loss of the ``PSDs`` report when only the noise/waves
-    # derivatives are present in the dataset.
-    psd_related = {'PSDnoiseMag', 'PSDnoiseGrad', 'PSDwavesMag', 'PSDwavesGrad'}
-    if psd_related.intersection(all_metrics):
-        all_metrics = [m for m in all_metrics if m not in psd_related]
-        if 'PSDs' not in all_metrics:
-            all_metrics.append('PSDs')
+        # Collapse individual PSD descriptions into a single entry so that the
+        # general PSD report (``PSDs``) can gather all derivatives at once.  This
+        # prevents the loss of the ``PSDs`` report when only the noise/waves
+        # derivatives are present in the dataset.
+        psd_related = {'PSDnoiseMag', 'PSDnoiseGrad', 'PSDwavesMag', 'PSDwavesGrad'}
+        if psd_related.intersection(all_metrics):
+            all_metrics = [m for m in all_metrics if m not in psd_related]
+            if 'PSDs' not in all_metrics:
+                all_metrics.append('PSDs')
 
-    # Retain only recognised metrics and normalise some aliases. This prevents
-    # intermediate derivatives like ``ECGchannel`` from being treated as
-    # standalone metrics and generating separate HTML reports.
-    valid_metrics = {
-        'STDs': 'STDs',
-        'STD': 'STDs',
-        'PSDs': 'PSDs',
-        'PtPsManual': 'PtPsManual',
-        'PtPsAuto': 'PtPsAuto',
-        'ECGs': 'ECGs',
-        'EOGs': 'EOGs',
-        'Head': 'Head',
-        'Muscle': 'Muscle',
-        'RawInfo': 'RawInfo',
-        'ReportStrings': 'ReportStrings',
-        'SimpleMetrics': 'SimpleMetrics',
-    }
-    all_metrics = [valid_metrics[m] for m in all_metrics if m in valid_metrics]
-    # Preserve order while removing duplicates
-    #all_metrics = list(dict.fromkeys(all_metrics))
+        # Retain only recognised metrics and normalise some aliases. This prevents
+        # intermediate derivatives like ``ECGchannel`` from being treated as
+        # standalone metrics and generating separate HTML reports.
+        valid_metrics = {
+            'STDs': 'STDs',
+            'STD': 'STDs',
+            'PSDs': 'PSDs',
+            'PtPsManual': 'PtPsManual',
+            'PtPsAuto': 'PtPsAuto',
+            'ECGs': 'ECGs',
+            'EOGs': 'EOGs',
+            'Head': 'Head',
+            'Muscle': 'Muscle',
+            'RawInfo': 'RawInfo',
+            'ReportStrings': 'ReportStrings',
+            'SimpleMetrics': 'SimpleMetrics',
+        }
+        all_metrics = [valid_metrics[m] for m in all_metrics if m in valid_metrics]
+        # Preserve order while removing duplicates
+        #all_metrics = list(dict.fromkeys(all_metrics))
 
-    # Now store it in chosen_entities as a list
-    chosen_entities = {
-        'subject': list(entities_found.get('subject', [])),
-        'task': list(entities_found.get('task', [])),
-        'session': list(entities_found.get('session', [])),
-        'run': list(entities_found.get('run', [])),
-        'METRIC': all_metrics
-    }
-
-    # And now you can append or pop, etc.
-    chosen_entities['METRIC'].append('stimulus')
-    chosen_entities['METRIC'].append('RawInfo')
-    chosen_entities['METRIC'].append('ReportStrings')
-    # Ensure SimpleMetrics is always present so that summary reports can be built
-    chosen_entities['METRIC'].append('SimpleMetrics')
-
-    # 5) Define a simple plot_settings. Example: always 'mag' and 'grad'
-    plot_settings = {'m_or_g': ['mag', 'grad']}
-
-    print('___MEGqc___: CHOSEN entities to plot:', chosen_entities)
-    print('___MEGqc___: CHOSEN settings:', plot_settings)
-    # --------------------------------------------------------------------------------
-
-    # 2. Collect TSVs for each sub + metric
-    tsvs_to_plot_by_metric = {}
-    tsv_entities_by_metric = {}
-
-    for metric in chosen_entities['METRIC']:
-        query_args = {
-            'subj': chosen_entities['subject'],
-            'task': chosen_entities['task'],
-            'suffix': 'meg',
-            'extension': ['tsv', 'json', 'fif'],
-            'return_type': 'filename',
-            'desc': '',
-            'scope': calculated_derivs_folder,
+        # Now store it in chosen_entities as a list
+        chosen_entities = {
+            'subject': list(entities_found.get('subject', [])),
+            'task': list(entities_found.get('task', [])),
+            'session': list(entities_found.get('session', [])),
+            'run': list(entities_found.get('run', [])),
+            'METRIC': all_metrics
         }
 
-        # If the user (now "all") had multiple possible descs for PSDs, ECGs, etc.
-        if metric == 'PSDs':
-            # Include all PSD derivatives (noise and waves) so the PSD report is
-            # generated correctly.
-            query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDwavesMag', 'PSDwavesGrad']
-        elif metric == 'ECGs':
-            query_args['desc'] = ['ECGchannel', 'ECGs']
-        elif metric == 'EOGs':
-            query_args['desc'] = ['EOGchannel', 'EOGs']
-        else:
-            query_args['desc'] = [metric]
+        # And now you can append or pop, etc.
+        chosen_entities['METRIC'].append('stimulus')
+        chosen_entities['METRIC'].append('RawInfo')
+        chosen_entities['METRIC'].append('ReportStrings')
+        # Ensure SimpleMetrics is always present so that summary reports can be built
+        chosen_entities['METRIC'].append('SimpleMetrics')
 
-        # Optional session/run
-        if chosen_entities['session']:
-            query_args['session'] = chosen_entities['session']
-        if chosen_entities['run']:
-            query_args['run'] = chosen_entities['run']
+        # 5) Define a simple plot_settings. Example: always 'mag' and 'grad'
+        plot_settings = {'m_or_g': ['mag', 'grad']}
 
-        tsv_paths = list(dataset.query(**query_args))
-        tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
+        print('___MEGqc___: CHOSEN entities to plot:', chosen_entities)
+        print('___MEGqc___: CHOSEN settings:', plot_settings)
+        # --------------------------------------------------------------------------------
 
-        # Now query object form for ancpbids entities
-        query_args['return_type'] = 'object'
-        entities_obj = sorted(list(dataset.query(**query_args)), key=lambda k: k['name'])
-        tsv_entities_by_metric[metric] = entities_obj
+        # 2. Collect TSVs for each sub + metric
+        tsvs_to_plot_by_metric = {}
+        tsv_entities_by_metric = {}
 
-    # Convert them into a list of Deriv_to_plot objects
-    derivs_to_plot = []
-    for (tsv_metric, tsv_paths), (entity_metric, entity_vals) in zip(
-        tsvs_to_plot_by_metric.items(),
-        tsv_entities_by_metric.items()
-    ):
-        if tsv_metric != entity_metric:
-            raise ValueError('Different metrics in tsvs_to_plot_by_metric and entities_per_file')
-        if len(tsv_paths) != len(entity_vals):
-            raise ValueError(f'Different number of tsvs and entities for metric: {tsv_metric}')
+        for metric in chosen_entities['METRIC']:
+            query_args = {
+                'subj': chosen_entities['subject'],
+                'task': chosen_entities['task'],
+                'suffix': 'meg',
+                'extension': ['tsv', 'json', 'fif'],
+                'return_type': 'filename',
+                'desc': '',
+                'scope': calculated_derivs_folder,
+            }
 
-        for tsv_path, deriv_entities in zip(tsv_paths, entity_vals):
-            file_name_in_path = os.path.basename(tsv_path).split('_meg.')[0]
-            file_name_in_obj = deriv_entities['name'].split('_meg.')[0]
+            # If the user (now "all") had multiple possible descs for PSDs, ECGs, etc.
+            if metric == 'PSDs':
+                # Include all PSD derivatives (noise and waves) so the PSD report is
+                # generated correctly.
+                query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDwavesMag', 'PSDwavesGrad']
+            elif metric == 'ECGs':
+                query_args['desc'] = ['ECGchannel', 'ECGs']
+            elif metric == 'EOGs':
+                query_args['desc'] = ['EOGchannel', 'EOGs']
+            else:
+                query_args['desc'] = [metric]
 
-            if file_name_in_obj not in file_name_in_path:
-                raise ValueError('Different names in tsvs_to_plot_by_metric and entities_per_file')
+            # Optional session/run
+            if chosen_entities['session']:
+                query_args['session'] = chosen_entities['session']
+            if chosen_entities['run']:
+                query_args['run'] = chosen_entities['run']
 
-            deriv = Deriv_to_plot(path=tsv_path, metric=tsv_metric, deriv_entity_obj=deriv_entities)
-            deriv.find_raw_entity_name()
-            derivs_to_plot.append(deriv)
+            tsv_paths = list(dataset.query(**query_args))
+            tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
 
-    # Parallel execution per subject
-    Parallel(n_jobs=n_jobs)(
-        delayed(process_subject)(
-            sub=sub,
-            dataset=dataset,
-            derivs_to_plot=derivs_to_plot,
-            chosen_entities=chosen_entities,
-            plot_settings=plot_settings,
+            # Now query object form for ancpbids entities
+            query_args['return_type'] = 'object'
+            entities_obj = sorted(list(dataset.query(**query_args)), key=lambda k: k['name'])
+            tsv_entities_by_metric[metric] = entities_obj
+
+        # Convert them into a list of Deriv_to_plot objects
+        derivs_to_plot = []
+        for (tsv_metric, tsv_paths), (entity_metric, entity_vals) in zip(
+            tsvs_to_plot_by_metric.items(),
+            tsv_entities_by_metric.items()
+        ):
+            if tsv_metric != entity_metric:
+                raise ValueError('Different metrics in tsvs_to_plot_by_metric and entities_per_file')
+            if len(tsv_paths) != len(entity_vals):
+                raise ValueError(f'Different number of tsvs and entities for metric: {tsv_metric}')
+
+            for tsv_path, deriv_entities in zip(tsv_paths, entity_vals):
+                file_name_in_path = os.path.basename(tsv_path).split('_meg.')[0]
+                file_name_in_obj = deriv_entities['name'].split('_meg.')[0]
+
+                if file_name_in_obj not in file_name_in_path:
+                    raise ValueError('Different names in tsvs_to_plot_by_metric and entities_per_file')
+
+                deriv = Deriv_to_plot(path=tsv_path, metric=tsv_metric, deriv_entity_obj=deriv_entities)
+                deriv.find_raw_entity_name()
+                derivs_to_plot.append(deriv)
+
+        # Parallel execution per subject
+        Parallel(n_jobs=n_jobs)(
+            delayed(process_subject)(
+                sub=sub,
+                dataset=dataset,
+                derivs_to_plot=derivs_to_plot,
+                chosen_entities=chosen_entities,
+                plot_settings=plot_settings,
+                output_root=output_root,
+            )
+            for sub in chosen_entities['subject']
         )
-        for sub in chosen_entities['subject']
-    )
 
     end_time = time.time()
     elapsed_seconds = end_time - start_time
