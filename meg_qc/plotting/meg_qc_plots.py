@@ -617,6 +617,7 @@ def process_subject(
         derivs_to_plot: list,
         chosen_entities: dict,
         plot_settings: dict,
+        output_root: str,
 ):
     """Plot all metrics for a single subject."""
 
@@ -855,6 +856,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
             derivs_to_plot=derivs_to_plot,
             chosen_entities=chosen_entities,
             plot_settings=plot_settings,
+            output_root=output_root,
         )
         for sub in chosen_entities['subject']
     )
