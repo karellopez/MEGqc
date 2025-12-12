@@ -13,8 +13,7 @@ from ancpbids import DatasetOptions
 import configparser
 from pathlib import Path
 import time
-from typing import Tuple, Optional
-from contextlib import contextmanager
+from typing import Optional
 
 # Get the absolute path of the parent directory of the current script
 parent_dir = os.path.dirname(os.getcwd())
@@ -24,6 +23,7 @@ gradparent_dir = os.path.dirname(parent_dir)
 sys.path.append(parent_dir)
 sys.path.append(gradparent_dir)
 
+from meg_qc.calculation.meg_qc_pipeline import resolve_output_roots, temporary_dataset_base
 from meg_qc.calculation.objects import QC_derivative
 
 # Plotting backends (``universal_plots`` vs ``universal_plots_lite``) and the
@@ -76,28 +76,9 @@ def _load_plotting_backend():
 
 
 _load_plotting_backend()
-
-
-def resolve_output_roots(dataset_path: str, external_derivatives_root: Optional[str]) -> Tuple[str, str]:
-    """Return dataset output root and derivatives folder respecting overrides."""
-
-    ds_name = os.path.basename(os.path.normpath(dataset_path))
-    output_root = dataset_path if external_derivatives_root is None else os.path.join(external_derivatives_root, ds_name)
-    derivatives_root = os.path.join(output_root, 'derivatives')
-    os.makedirs(derivatives_root, exist_ok=True)
-    return output_root, derivatives_root
-
-
-@contextmanager
-def temporary_dataset_base(dataset, base_dir: str):
-    """Temporarily repoint the ANCPBIDS dataset to a new base directory."""
-
-    original_base = getattr(dataset, 'base_dir_', None)
-    dataset.base_dir_ = base_dir
-    try:
-        yield
-    finally:
-        dataset.base_dir_ = original_base
+# ``resolve_output_roots`` and ``temporary_dataset_base`` are shared with the
+# calculation pipeline so that plotting can find derivatives even when they are
+# stored outside of the BIDS dataset.
 
 # IMPORTANT: keep this order of imports, first need to add parent dir to sys.path, then import from it.
 
@@ -265,7 +246,7 @@ def select_subcategory(subcategories: List, category_title: str, window_title: s
     return results, quit_selector
 
 
-def get_ds_entities(dataset, calculated_derivs_folder: str):
+def get_ds_entities(dataset, calculated_derivs_folder: str, output_root: str):
 
     """
     Get the entities of the dataset using ancpbids, only get derivative entities, not all raw data.
@@ -285,11 +266,12 @@ def get_ds_entities(dataset, calculated_derivs_folder: str):
     """
 
     try:
-        entities = dataset.query_entities(scope=calculated_derivs_folder)
+        with temporary_dataset_base(dataset, output_root):
+            entities = dataset.query_entities(scope=calculated_derivs_folder)
         print('___MEGqc___: ', 'Entities found in the dataset: ', entities)
         #we only get entities of calculated derivatives here, not entire raw ds.
-    except:
-        raise FileNotFoundError(f'___MEGqc___: No calculated derivatives found for this ds!')
+    except Exception as exc:
+        raise FileNotFoundError(f'___MEGqc___: No calculated derivatives found for this ds!') from exc
 
     return entities
 
@@ -713,7 +695,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
               'No data found in the given directory path! \nCheck directory path in config file and presence of data.')
         return
 
-    output_root, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
+    output_root, _ = resolve_output_roots(dataset_path, derivatives_base)
 
     calculated_derivs_folder = os.path.join('derivatives', 'Meg_QC', 'calculation')
 
@@ -721,8 +703,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
     # REPLACE THE SELECTOR WITH A HARDCODED "ALL" CHOICE
     # --------------------------------------------------------------------------------
     # 1) Get all discovered entities from the derivatives scope
-    with temporary_dataset_base(dataset, output_root):
-        entities_found = get_ds_entities(dataset, calculated_derivs_folder)
+    entities_found = get_ds_entities(dataset, calculated_derivs_folder, output_root)
 
     # Suppose 'description' is the metric list
     all_metrics = entities_found.get('description', [])
@@ -817,12 +798,14 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
         if chosen_entities['run']:
             query_args['run'] = chosen_entities['run']
 
-        tsv_paths = list(dataset.query(**query_args))
+        with temporary_dataset_base(dataset, output_root):
+            tsv_paths = list(dataset.query(**query_args))
         tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
 
         # Now query object form for ancpbids entities
         query_args['return_type'] = 'object'
-        entities_obj = sorted(list(dataset.query(**query_args)), key=lambda k: k['name'])
+        with temporary_dataset_base(dataset, output_root):
+            entities_obj = sorted(list(dataset.query(**query_args)), key=lambda k: k['name'])
         tsv_entities_by_metric[metric] = entities_obj
 
     # Convert them into a list of Deriv_to_plot objects
