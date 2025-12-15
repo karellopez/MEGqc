@@ -265,7 +265,7 @@ def select_subcategory(subcategories: List, category_title: str, window_title: s
     return results, quit_selector
 
 
-def get_ds_entities(dataset, calculated_derivs_folder: str):
+def get_ds_entities(dataset, calculated_derivs_folder: str, output_root: str):
 
     """
     Get the entities of the dataset using ancpbids, only get derivative entities, not all raw data.
@@ -276,6 +276,9 @@ def get_ds_entities(dataset, calculated_derivs_folder: str):
         The dataset object.
     calculated_derivs_folder : str
         The path to the calculated derivatives folder.
+    output_root : str
+        Base directory where derivatives are stored (may differ from the
+        original BIDS dataset when users provide an external location).
 
     Returns
     -------
@@ -285,11 +288,15 @@ def get_ds_entities(dataset, calculated_derivs_folder: str):
     """
 
     try:
-        entities = dataset.query_entities(scope=calculated_derivs_folder)
+        # When users place derivatives outside the BIDS tree we need to temporarily
+        # repoint ANCPBIDS to the resolved output root so that queries search the
+        # correct folder hierarchy.
+        with temporary_dataset_base(dataset, output_root):
+            entities = dataset.query_entities(scope=calculated_derivs_folder)
         print('___MEGqc___: ', 'Entities found in the dataset: ', entities)
         #we only get entities of calculated derivatives here, not entire raw ds.
-    except:
-        raise FileNotFoundError(f'___MEGqc___: No calculated derivatives found for this ds!')
+    except Exception as exc:
+        raise FileNotFoundError(f'___MEGqc___: No calculated derivatives found for this ds!') from exc
 
     return entities
 
@@ -617,78 +624,79 @@ def process_subject(
         derivs_to_plot: list,
         chosen_entities: dict,
         plot_settings: dict,
+        output_root: str,
 ):
     """Plot all metrics for a single subject."""
 
-    derivative = dataset.create_derivative(name="Meg_QC")
-    derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
-    reports_folder = derivative.create_folder(name='reports')
-    subject_folder = reports_folder.create_folder(name='sub-' + sub)
-
-    existing_raws_per_sub = list(set(
-        d.raw_entity_name for d in derivs_to_plot if d.subject == sub
-    ))
-
-    for raw_entity_name in existing_raws_per_sub:
-        derivs_for_this_raw = [
-            d for d in derivs_to_plot if d.raw_entity_name == raw_entity_name
-        ]
-
-        raw_entities_base = derivs_for_this_raw[0].deriv_entity_obj
-
-        raw_info_path = None
-        report_str_path = None
-        simple_metrics_path = None
-        for d in derivs_for_this_raw:
-            if d.metric == 'RawInfo':
-                raw_info_path = d.path
-            elif d.metric == 'ReportStrings':
-                report_str_path = d.path
-            elif d.metric == 'SimpleMetrics':
-                simple_metrics_path = d.path
-
-        metrics_to_plot = [
-            m for m in chosen_entities['METRIC']
-            if m not in ['RawInfo', 'ReportStrings', 'SimpleMetrics']
-        ]
-
-        for metric in metrics_to_plot:
-            tsv_paths = [d.path for d in derivs_for_this_raw if d.metric == metric]
-            if not tsv_paths:
-                print(f'___MEGqc___: No tsvs found for {metric} / subject {sub}')
-                continue
-
-            tsvs_for_this_raw = [d for d in derivs_for_this_raw if d.metric == metric]
-            raw_entities_to_write = tsvs_for_this_raw[0].deriv_entity_obj
-
-            html_report = csv_to_html_report(
-                raw_info_path,
-                metric,
-                tsv_paths,
-                report_str_path,
-                plot_settings,
-            )
-
-            meg_artifact = subject_folder.create_artifact(raw=raw_entities_to_write)
-            meg_artifact.add_entity('desc', metric)
-            meg_artifact.suffix = 'meg'
-            meg_artifact.extension = '.html'
-
-            meg_artifact.content = lambda file_path, rep=html_report: rep.save(
-                file_path, overwrite=True, open_browser=False
-            )
-
-        if report_str_path and simple_metrics_path:
-            summary_html = make_summary_qc_report(report_str_path, simple_metrics_path)
-            meg_artifact = subject_folder.create_artifact(raw=raw_entities_base)
-            meg_artifact.add_entity('desc', 'summary_qc_report')
-            meg_artifact.suffix = 'meg'
-            meg_artifact.extension = '.html'
-            meg_artifact.content = (
-                lambda file_path, cont=summary_html: open(file_path, "w", encoding="utf-8").write(cont)
-            )
-
     with temporary_dataset_base(dataset, output_root):
+        derivative = dataset.create_derivative(name="Meg_QC")
+        derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
+        reports_folder = derivative.create_folder(name='reports')
+        subject_folder = reports_folder.create_folder(name='sub-' + sub)
+
+        existing_raws_per_sub = list(set(
+            d.raw_entity_name for d in derivs_to_plot if d.subject == sub
+        ))
+
+        for raw_entity_name in existing_raws_per_sub:
+            derivs_for_this_raw = [
+                d for d in derivs_to_plot if d.raw_entity_name == raw_entity_name
+            ]
+
+            raw_entities_base = derivs_for_this_raw[0].deriv_entity_obj
+
+            raw_info_path = None
+            report_str_path = None
+            simple_metrics_path = None
+            for d in derivs_for_this_raw:
+                if d.metric == 'RawInfo':
+                    raw_info_path = d.path
+                elif d.metric == 'ReportStrings':
+                    report_str_path = d.path
+                elif d.metric == 'SimpleMetrics':
+                    simple_metrics_path = d.path
+
+            metrics_to_plot = [
+                m for m in chosen_entities['METRIC']
+                if m not in ['RawInfo', 'ReportStrings', 'SimpleMetrics']
+            ]
+
+            for metric in metrics_to_plot:
+                tsv_paths = [d.path for d in derivs_for_this_raw if d.metric == metric]
+                if not tsv_paths:
+                    print(f'___MEGqc___: No tsvs found for {metric} / subject {sub}')
+                    continue
+
+                tsvs_for_this_raw = [d for d in derivs_for_this_raw if d.metric == metric]
+                raw_entities_to_write = tsvs_for_this_raw[0].deriv_entity_obj
+
+                html_report = csv_to_html_report(
+                    raw_info_path,
+                    metric,
+                    tsv_paths,
+                    report_str_path,
+                    plot_settings,
+                )
+
+                meg_artifact = subject_folder.create_artifact(raw=raw_entities_to_write)
+                meg_artifact.add_entity('desc', metric)
+                meg_artifact.suffix = 'meg'
+                meg_artifact.extension = '.html'
+
+                meg_artifact.content = lambda file_path, rep=html_report: rep.save(
+                    file_path, overwrite=True, open_browser=False
+                )
+
+            if report_str_path and simple_metrics_path:
+                summary_html = make_summary_qc_report(report_str_path, simple_metrics_path)
+                meg_artifact = subject_folder.create_artifact(raw=raw_entities_base)
+                meg_artifact.add_entity('desc', 'summary_qc_report')
+                meg_artifact.suffix = 'meg'
+                meg_artifact.extension = '.html'
+                meg_artifact.content = (
+                    lambda file_path, cont=summary_html: open(file_path, "w", encoding="utf-8").write(cont)
+                )
+
         ancpbids.write_derivative(dataset, derivative)
     return
 
@@ -714,6 +722,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
         return
 
     output_root, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
+    print(f"___MEGqc___: Reading derivatives from: {derivatives_root}")
 
     calculated_derivs_folder = os.path.join('derivatives', 'Meg_QC', 'calculation')
 
@@ -721,8 +730,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
     # REPLACE THE SELECTOR WITH A HARDCODED "ALL" CHOICE
     # --------------------------------------------------------------------------------
     # 1) Get all discovered entities from the derivatives scope
-    with temporary_dataset_base(dataset, output_root):
-        entities_found = get_ds_entities(dataset, calculated_derivs_folder)
+    entities_found = get_ds_entities(dataset, calculated_derivs_folder, output_root)
 
     # Suppose 'description' is the metric list
     all_metrics = entities_found.get('description', [])
@@ -817,12 +825,14 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
         if chosen_entities['run']:
             query_args['run'] = chosen_entities['run']
 
-        tsv_paths = list(dataset.query(**query_args))
+        with temporary_dataset_base(dataset, output_root):
+            tsv_paths = list(dataset.query(**query_args))
         tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
 
         # Now query object form for ancpbids entities
         query_args['return_type'] = 'object'
-        entities_obj = sorted(list(dataset.query(**query_args)), key=lambda k: k['name'])
+        with temporary_dataset_base(dataset, output_root):
+            entities_obj = sorted(list(dataset.query(**query_args)), key=lambda k: k['name'])
         tsv_entities_by_metric[metric] = entities_obj
 
     # Convert them into a list of Deriv_to_plot objects
@@ -855,6 +865,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
             derivs_to_plot=derivs_to_plot,
             chosen_entities=chosen_entities,
             plot_settings=plot_settings,
+            output_root=output_root,
         )
         for sub in chosen_entities['subject']
     )
