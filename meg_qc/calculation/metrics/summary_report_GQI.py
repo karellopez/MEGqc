@@ -27,52 +27,6 @@ def _safe_dict(val):
     return val if isinstance(val, dict) else {}
 
 
-def _available_sensors(source):
-    """Return the available sensor types in ``source`` preserving priority.
-
-    Metrics emitted by different MEG systems can expose different channel
-    groupings. For example, CTF files only include gradiometers, while Elekta
-    data exposes both magnetometers and gradiometers. This helper inspects the
-    provided mapping and reports which of the expected sensor types are
-    present so that downstream tables can omit absent sensors instead of
-    rendering empty columns.
-    """
-
-    if not isinstance(source, dict):
-        return []
-
-    return [sensor for sensor in ("mag", "grad") if sensor in source]
-
-
-def _format_count_percent(count, percent):
-    """Return a formatted ``"<count> (<percent>%)"`` string or ``"NA"``.
-
-    Some sensors may be absent (e.g. magnetometers in CTF data) or the metrics
-    may be missing. In that case we return a neutral ``"NA"`` marker to avoid
-    raising formatting errors while keeping the table layout consistent.
-    """
-
-    if count is None or percent is None:
-        return "NA"
-    return f"{count} ({percent:.1f}%)"
-
-
-def _first_available_value(source, key, default=None):
-    """Return ``key`` from the first available sensor block.
-
-    Values such as ``std_lvl`` are typically stored under the magnetometer
-    section for Elekta data, but CTF files store only gradiometer entries. This
-    helper tries magnetometers first to preserve existing behaviour and then
-    falls back to gradiometers when the former are absent.
-    """
-
-    for sensor in ("mag", "grad"):
-        candidate = _safe_dict(source.get(sensor, {}))
-        if key in candidate:
-            return candidate.get(key, default)
-    return default
-
-
 def _safe_dataframe(obj):
     """Return a ``DataFrame`` from ``obj`` while tolerating malformed inputs.
 
@@ -188,63 +142,34 @@ def create_summary_report(
             "",
         )
 
-    # Identify which sensor types are present across the supplied metrics so
-    # downstream tables can omit absent sensors (e.g. magnetometers for CTF
-    # recordings) while retaining consistent column ordering for gradiometers.
-    sensor_sources = [
-        _safe_dict(_safe_dict(data.get("STD")).get("STD_all_time_series")),
-        _safe_dict(_safe_dict(data.get("PTP_MANUAL")).get("ptp_manual_all")),
-        psd_global,
-    ]
-    dataset_sensors = []
-    for source in sensor_sources:
-        for sensor in _available_sensors(source):
-            if sensor not in dataset_sensors:
-                dataset_sensors.append(sensor)
-    if not dataset_sensors:
-        dataset_sensors = ["mag", "grad"]
-
     def build_summary_table(source):
-        """Return a table summarising noisy and flat channels.
-
-        The table dynamically omits absent sensor types (e.g. magnetometers in
-        CTF data) while keeping the gradiometer column in the same position so
-        downstream consumers can fuse the result with Elekta-based tables.
-        """
-
-        sensors = _available_sensors(source) or dataset_sensors
-        rows = [{"Metric": "Noisy Channels"}, {"Metric": "Flat Channels"}]
-        for sensor_type in sensors:
-            sensor_values = _safe_dict(source.get(sensor_type))
-            noisy_val = _format_count_percent(
-                sensor_values.get("number_of_noisy_ch"),
-                sensor_values.get("percent_of_noisy_ch"),
-            )
-            flat_val = _format_count_percent(
-                sensor_values.get("number_of_flat_ch"),
-                sensor_values.get("percent_of_flat_ch"),
-            )
-            rows[0][sensor_type] = noisy_val
-            rows[1][sensor_type] = flat_val
-
+        """Return a table summarising noisy and flat channels."""
+        rows = []
+        for sensor_type in ["mag", "grad"]:
+            n_noisy = source[sensor_type]["number_of_noisy_ch"]
+            p_noisy = source[sensor_type]["percent_of_noisy_ch"]
+            n_flat = source[sensor_type]["number_of_flat_ch"]
+            p_flat = source[sensor_type]["percent_of_flat_ch"]
+            rows.append({"Metric": "Noisy Channels", sensor_type: f"{n_noisy} ({p_noisy:.1f}%)"})
+            rows.append({"Metric": "Flat Channels", sensor_type: f"{n_flat} ({p_flat:.1f}%)"})
         df = pd.DataFrame(rows)
-        rename_map = {"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS"}
-        df.rename(columns=rename_map, inplace=True)
-
-        # Preserve column order and drop any completely empty sensor columns.
-        ordered_columns = ["Metric", *[rename_map[s] for s in sensors if rename_map[s] in df.columns]]
-        return df[ordered_columns]
+        df = df.groupby("Metric").first().reset_index()
+        df.rename(columns={"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS"}, inplace=True)
+        return df
 
     if std_present:
         general_df = build_summary_table(data["STD"]["STD_all_time_series"])
         std_epoch_df = _safe_dataframe(data["STD"].get("STD_epoch", {}))
-        std_lvl = _first_available_value(data["STD"]["STD_all_time_series"], "std_lvl", "NA")
+        std_lvl = data["STD"]["STD_all_time_series"]["mag"].get("std_lvl", "NA")
         # ``STD_epoch`` can be ``null`` in the metrics JSON. Applying ``_safe_dict``
         # twice ensures we always operate on a dictionary before requesting the
-        # channel multiplier. ``_first_available_value`` then handles missing
-        # magnetometer data gracefully (e.g. for CTF files).
-        std_epoch_lvl = _first_available_value(
-            _safe_dict(data.get("STD", {})).get("STD_epoch", {}), "noisy_channel_multiplier", "NA"
+        # magnetometer multiplier.
+        std_epoch_lvl = (
+            _safe_dict(
+                _safe_dict(
+                    _safe_dict(data.get("STD", {})).get("STD_epoch")
+                ).get("mag")
+            ).get("noisy_channel_multiplier", "NA")
         )
     else:
         general_df = pd.DataFrame()
@@ -255,15 +180,16 @@ def create_summary_report(
     if ptp_present:
         ptp_df = build_summary_table(data["PTP_MANUAL"]["ptp_manual_all"])
         ptp_epoch_df = _safe_dataframe(data["PTP_MANUAL"].get("ptp_manual_epoch", {}))
-        ptp_lvl = _first_available_value(data["PTP_MANUAL"]["ptp_manual_all"], "ptp_lvl", "NA")
+        ptp_lvl = data["PTP_MANUAL"]["ptp_manual_all"]["mag"].get("ptp_lvl", "NA")
         # ``ptp_manual_epoch`` can also be ``null``. By wrapping the nested
         # ``get`` calls with ``_safe_dict`` we ensure a default dictionary and
-        # avoid ``AttributeError`` when extracting the multiplier. The helper
-        # also skips the magnetometer column when absent.
-        ptp_epoch_lvl = _first_available_value(
-            _safe_dict(data.get("PTP_MANUAL", {})).get("ptp_manual_epoch", {}),
-            "noisy_channel_multiplier",
-            "NA",
+        # avoid ``AttributeError`` when extracting the multiplier.
+        ptp_epoch_lvl = (
+            _safe_dict(
+                _safe_dict(
+                    _safe_dict(data.get("PTP_MANUAL", {})).get("ptp_manual_epoch")
+                ).get("mag")
+            ).get("noisy_channel_multiplier", "NA")
         )
     else:
         ptp_df = pd.DataFrame()
@@ -271,40 +197,17 @@ def create_summary_report(
         ptp_lvl = "NA"
         ptp_epoch_lvl = "NA"
 
-    def build_psd_summary(noise_mag, noise_grad, psd_global_source):
-        """Return a table with global PSD noise percentages.
-
-        The PSD data mirrors the sensor availability logic used elsewhere, so
-        magnetometer columns are omitted entirely when the source data does not
-        expose them (as in CTF recordings).
-        """
-
-        sensors = [
-            sensor
-            for sensor in ("mag", "grad")
-            if sensor in _safe_dict(psd_global_source)
-        ]
-        rows = {"Metric": "Noise Power"}
-        if "mag" in sensors and noise_mag is not None:
-            rows["mag"] = noise_mag
-        if "grad" in sensors and noise_grad is not None:
-            rows["grad"] = noise_grad
-
-        df = pd.DataFrame([rows])
-        if "mag" in df.columns:
-            df["mag"] = df["mag"].map(lambda v: f"{v:.2f}%")
-        if "grad" in df.columns:
-            df["grad"] = df["grad"].map(lambda v: f"{v:.2f}%")
+    def build_psd_summary(noise_mag, noise_grad):
+        """Return a table with global PSD noise percentages."""
+        df = pd.DataFrame([
+            {"Metric": "Noise Power", "mag": noise_mag, "grad": noise_grad}
+        ])
+        df["mag"] = df["mag"].map(lambda v: f"{v:.2f}%")
+        df["grad"] = df["grad"].map(lambda v: f"{v:.2f}%")
         df.rename(columns={"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS"}, inplace=True)
+        return df
 
-        ordered_columns = ["Metric"]
-        if "MAGNETOMETERS" in df.columns:
-            ordered_columns.append("MAGNETOMETERS")
-        if "GRADIOMETERS" in df.columns:
-            ordered_columns.append("GRADIOMETERS")
-        return df[ordered_columns]
-
-    psd_df = build_psd_summary(noisy_power_mag, noisy_power_grad, psd_global)
+    psd_df = build_psd_summary(noisy_power_mag, noisy_power_grad)
 
     # Default thresholds and weights for the GQI formula
     thresholds = {
@@ -321,11 +224,6 @@ def create_summary_report(
 
     def quality_q(M, start, end):
         """Linear quality value between ``start`` and ``end`` thresholds."""
-        if M is None:
-            # Missing metrics should not penalise the GQI calculation. Returning
-            # ``1.0`` mirrors the previous behaviour where absent values were
-            # treated as perfect quality scores.
-            return 1.0
         if M <= start:
             return 1.0
         if M >= end:
@@ -334,25 +232,19 @@ def create_summary_report(
         return 1.0 - f
 
     def count_high_correlations_from_details(section, contamination_key):
-        """Return a table with channels having |corr| > 0.8 for ECG/EOG.
-
-        The table respects the available sensor types so that CTF datasets do
-        not render placeholder magnetometer rows.
-        """
-
-        entries = _safe_dict(data.get(section))
-        contamination_levels = _safe_dict(entries.get(contamination_key))
-        sensors = _available_sensors(contamination_levels) or dataset_sensors
-
+        """Return a table with channels having |corr| > 0.8 for ECG/EOG."""
         results = []
         percentages = []
-        for sensor_type in sensors:
-            sensor_entries = _safe_dict(contamination_levels.get(sensor_type))
-            sensor_entries = _safe_dict(sensor_entries.get("details"))
-            total = len(sensor_entries)
+        for sensor_type in ["mag", "grad"]:
+            entries = data.get(section)
+            entries = _safe_dict(entries)
+            entries = _safe_dict(entries.get(contamination_key))
+            entries = _safe_dict(entries.get(sensor_type))
+            entries = _safe_dict(entries.get("details"))
+            total = len(entries)
             high_corr = sum(
                 1
-                for _, pair in sensor_entries.items()
+                for _, pair in entries.items()
                 if isinstance(pair, (list, tuple)) and pair and abs(pair[0]) > 0.8
             )
             percent = 100 * high_corr / total if total > 0 else 0
