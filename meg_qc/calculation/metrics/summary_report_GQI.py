@@ -4,6 +4,7 @@
 import os
 import json
 import glob
+import re
 import configparser
 from statistics import mean
 from typing import Union, Optional, Dict
@@ -62,6 +63,20 @@ def _format_count_percent(count: Optional[float], percent: Optional[float]) -> s
     if percent is None:
         return str(count)
     return f"{count} ({percent:.1f}%)"
+
+
+def _extract_task_label(path: str) -> str:
+    """Return the BIDS task label encoded in ``path`` if present.
+
+    Filenames produced by the MEG QC pipeline follow the BIDS convention and
+    often include a ``task-<label>`` entity. This helper extracts that label so
+    group-level tables can display which task each row corresponds to. When no
+    task entity is found, an empty string is returned to avoid introducing a
+    placeholder that might be misinterpreted as a valid task name.
+    """
+
+    match = re.search(r"(?<=_task-)[^_]+", os.path.basename(path))
+    return match.group(0) if match else ""
 
 
 def _get_sensor_param(section: dict, subsection: str, param: str, preferred: str = "mag", fallback: str = "grad"):
@@ -678,23 +693,28 @@ def generate_gqi_summary(dataset_path: str, derivatives_root: str, config_file: 
         out_json = os.path.join(out_sub, base)
         # Generate per-subject summary JSON (no HTML)
         create_summary_report(json_path, None, out_json, gqi_params)
-        summary_paths.append(out_json)
+        task_label = _extract_task_label(json_path)
+        summary_paths.append((out_json, task_label))
 
     # Collate per-subject summaries into a group table and figure
     group_dir = os.path.join(reports_root, "group_metrics")
     os.makedirs(group_dir, exist_ok=True)
     from meg_qc.calculation.meg_qc_pipeline import flatten_summary_metrics
     rows = []
-    for path in summary_paths:
+    for path, task in summary_paths:
         # Flatten each summary JSON into a one-row dictionary
         with open(path, "r", encoding="utf-8") as f:
             js = json.load(f)
         subject = os.path.basename(os.path.dirname(path))
-        row = {"subject": subject}
+        row = {"task": task, "subject": subject}
         row.update(flatten_summary_metrics(js))
         rows.append(row)
     if rows:
         df = pd.DataFrame(rows)
+        # Ensure the task column is the first column of the table
+        cols = df.columns.tolist()
+        cols.insert(0, cols.pop(cols.index("task")))
+        df = df[cols]
         tsv_file = os.path.join(group_dir, f"Global_Quality_Index_attempt_{attempt}.tsv")
         df.to_csv(tsv_file, sep="\t", index=False)
         png_file = os.path.join(group_dir, f"Global_Quality_Index_attempt_{attempt}.png")
