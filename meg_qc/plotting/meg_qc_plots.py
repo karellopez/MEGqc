@@ -265,7 +265,7 @@ def select_subcategory(subcategories: List, category_title: str, window_title: s
     return results, quit_selector
 
 
-def get_ds_entities(dataset, calculated_derivs_folder: str):
+def get_ds_entities(dataset, calculated_derivs_folder: str, output_root: str):
 
     """
     Get the entities of the dataset using ancpbids, only get derivative entities, not all raw data.
@@ -276,6 +276,9 @@ def get_ds_entities(dataset, calculated_derivs_folder: str):
         The dataset object.
     calculated_derivs_folder : str
         The path to the calculated derivatives folder.
+    output_root : str
+        The resolved dataset root where derivatives are expected (original BIDS
+        root or the external derivatives root with the dataset name).
 
     Returns
     -------
@@ -285,11 +288,16 @@ def get_ds_entities(dataset, calculated_derivs_folder: str):
     """
 
     try:
-        entities = dataset.query_entities(scope=calculated_derivs_folder)
+        # Always scan the resolved output root so we look in the same location
+        # where calculation and GQI were instructed to write derivatives. When
+        # no external derivatives directory is provided, ``output_root`` points
+        # to the original BIDS dataset, preserving the legacy behaviour.
+        with temporary_dataset_base(dataset, output_root):
+            entities = dataset.query_entities(scope=calculated_derivs_folder)
         print('___MEGqc___: ', 'Entities found in the dataset: ', entities)
         #we only get entities of calculated derivatives here, not entire raw ds.
-    except:
-        raise FileNotFoundError(f'___MEGqc___: No calculated derivatives found for this ds!')
+    except Exception as exc:
+        raise FileNotFoundError(f'___MEGqc___: No calculated derivatives found for this ds!') from exc
 
     return entities
 
@@ -715,14 +723,17 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
 
     output_root, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
 
+    # Log the resolved derivatives path so users can confirm where plotting
+    # reads results from and where any new reports will be saved.
+    print(f"___MEGqc___: Using derivatives root: {derivatives_root}")
+
     calculated_derivs_folder = os.path.join('derivatives', 'Meg_QC', 'calculation')
 
     # --------------------------------------------------------------------------------
     # REPLACE THE SELECTOR WITH A HARDCODED "ALL" CHOICE
     # --------------------------------------------------------------------------------
     # 1) Get all discovered entities from the derivatives scope
-    with temporary_dataset_base(dataset, output_root):
-        entities_found = get_ds_entities(dataset, calculated_derivs_folder)
+    entities_found = get_ds_entities(dataset, calculated_derivs_folder, output_root)
 
     # Suppose 'description' is the metric list
     all_metrics = entities_found.get('description', [])
