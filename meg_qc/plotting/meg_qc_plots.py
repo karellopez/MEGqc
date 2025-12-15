@@ -265,7 +265,7 @@ def select_subcategory(subcategories: List, category_title: str, window_title: s
     return results, quit_selector
 
 
-def get_ds_entities(dataset, calculated_derivs_folder: str):
+def get_ds_entities(dataset, calculated_derivs_folder: str, output_root: str):
 
     """
     Get the entities of the dataset using ancpbids, only get derivative entities, not all raw data.
@@ -276,6 +276,8 @@ def get_ds_entities(dataset, calculated_derivs_folder: str):
         The dataset object.
     calculated_derivs_folder : str
         The path to the calculated derivatives folder.
+    output_root : str
+        Resolved dataset root that contains the derivatives folder.
 
     Returns
     -------
@@ -285,11 +287,15 @@ def get_ds_entities(dataset, calculated_derivs_folder: str):
     """
 
     try:
-        entities = dataset.query_entities(scope=calculated_derivs_folder)
+        # The dataset needs to be temporarily repointed to the resolved output
+        # root so that entity discovery happens in the right derivatives
+        # directory when an external derivatives path is used.
+        with temporary_dataset_base(dataset, output_root):
+            entities = dataset.query_entities(scope=calculated_derivs_folder)
         print('___MEGqc___: ', 'Entities found in the dataset: ', entities)
         #we only get entities of calculated derivatives here, not entire raw ds.
-    except:
-        raise FileNotFoundError(f'___MEGqc___: No calculated derivatives found for this ds!')
+    except Exception as exc:
+        raise FileNotFoundError(f'___MEGqc___: No calculated derivatives found for this ds!') from exc
 
     return entities
 
@@ -714,6 +720,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
         return
 
     output_root, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
+    print(f"___MEGqc___: Using derivatives from: {derivatives_root}")
 
     calculated_derivs_folder = os.path.join('derivatives', 'Meg_QC', 'calculation')
 
@@ -721,8 +728,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
     # REPLACE THE SELECTOR WITH A HARDCODED "ALL" CHOICE
     # --------------------------------------------------------------------------------
     # 1) Get all discovered entities from the derivatives scope
-    with temporary_dataset_base(dataset, output_root):
-        entities_found = get_ds_entities(dataset, calculated_derivs_folder)
+    entities_found = get_ds_entities(dataset, calculated_derivs_folder, output_root)
 
     # Suppose 'description' is the metric list
     all_metrics = entities_found.get('description', [])
@@ -788,42 +794,43 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
     tsvs_to_plot_by_metric = {}
     tsv_entities_by_metric = {}
 
-    for metric in chosen_entities['METRIC']:
-        query_args = {
-            'subj': chosen_entities['subject'],
-            'task': chosen_entities['task'],
-            'suffix': 'meg',
-            'extension': ['tsv', 'json', 'fif'],
-            'return_type': 'filename',
-            'desc': '',
-            'scope': calculated_derivs_folder,
-        }
+    with temporary_dataset_base(dataset, output_root):
+        for metric in chosen_entities['METRIC']:
+            query_args = {
+                'subj': chosen_entities['subject'],
+                'task': chosen_entities['task'],
+                'suffix': 'meg',
+                'extension': ['tsv', 'json', 'fif'],
+                'return_type': 'filename',
+                'desc': '',
+                'scope': calculated_derivs_folder,
+            }
 
-        # If the user (now "all") had multiple possible descs for PSDs, ECGs, etc.
-        if metric == 'PSDs':
-            # Include all PSD derivatives (noise and waves) so the PSD report is
-            # generated correctly.
-            query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDwavesMag', 'PSDwavesGrad']
-        elif metric == 'ECGs':
-            query_args['desc'] = ['ECGchannel', 'ECGs']
-        elif metric == 'EOGs':
-            query_args['desc'] = ['EOGchannel', 'EOGs']
-        else:
-            query_args['desc'] = [metric]
+            # If the user (now "all") had multiple possible descs for PSDs, ECGs, etc.
+            if metric == 'PSDs':
+                # Include all PSD derivatives (noise and waves) so the PSD report is
+                # generated correctly.
+                query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDwavesMag', 'PSDwavesGrad']
+            elif metric == 'ECGs':
+                query_args['desc'] = ['ECGchannel', 'ECGs']
+            elif metric == 'EOGs':
+                query_args['desc'] = ['EOGchannel', 'EOGs']
+            else:
+                query_args['desc'] = [metric]
 
-        # Optional session/run
-        if chosen_entities['session']:
-            query_args['session'] = chosen_entities['session']
-        if chosen_entities['run']:
-            query_args['run'] = chosen_entities['run']
+            # Optional session/run
+            if chosen_entities['session']:
+                query_args['session'] = chosen_entities['session']
+            if chosen_entities['run']:
+                query_args['run'] = chosen_entities['run']
 
-        tsv_paths = list(dataset.query(**query_args))
-        tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
+            tsv_paths = list(dataset.query(**query_args))
+            tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
 
-        # Now query object form for ancpbids entities
-        query_args['return_type'] = 'object'
-        entities_obj = sorted(list(dataset.query(**query_args)), key=lambda k: k['name'])
-        tsv_entities_by_metric[metric] = entities_obj
+            # Now query object form for ancpbids entities
+            query_args['return_type'] = 'object'
+            entities_obj = sorted(list(dataset.query(**query_args)), key=lambda k: k['name'])
+            tsv_entities_by_metric[metric] = entities_obj
 
     # Convert them into a list of Deriv_to_plot objects
     derivs_to_plot = []
