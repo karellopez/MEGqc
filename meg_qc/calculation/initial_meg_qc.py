@@ -116,7 +116,10 @@ def get_all_config_params(config_file_path: str):
             'epoch_tmin': epoching_section.getfloat('epoch_tmin'),
             'epoch_tmax': epoching_section.getfloat('epoch_tmax'),
             'stim_channel': stim_channel,
-            'event_repeated': epoching_section['event_repeated']})
+            'event_repeated': epoching_section['event_repeated'],
+            'use_fixed_length_epochs': epoching_section.getboolean('use_fixed_length_epochs'),
+            'fixed_epoch_duration': epoching_section.getfloat('fixed_epoch_duration'),
+            'fixed_epoch_overlap': epoching_section.getfloat('fixed_epoch_overlap')})
         all_qc_params['Epoching'] = epoching_params
 
         std_section = config['STD']
@@ -357,6 +360,9 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
     epoch_tmin = epoching_params['epoch_tmin']
     epoch_tmax = epoching_params['epoch_tmax']
     stim_channel = epoching_params['stim_channel']
+    use_fixed_length_epochs = epoching_params['use_fixed_length_epochs']
+    fixed_epoch_duration = epoching_params['fixed_epoch_duration']
+    fixed_epoch_overlap = epoching_params['fixed_epoch_overlap']
 
     if stim_channel is None:
         picks_stim = mne.pick_types(data.info, stim=True)
@@ -376,27 +382,62 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
         # even if stim is None, mne will check once more when creating events.
 
     epochs_grad, epochs_mag = None, None
+    epoching_mode = 'stim'
 
-    try:
-        events = mne.find_events(data, stim_channel=stim_channel, min_duration=event_dur)
-
-        if len(events) < 1:
+    def _make_fixed_length_epochs(picks, channel_type):
+        """Create fixed-length epochs for a channel type when no stim events are available."""
+        if fixed_epoch_duration <= 0:
             print('___MEGqc___: ',
-                  'No events with set minimum duration were found using all stimulus channels. No epoching can be done. Try different event duration in config file.')
-        else:
-            print('___MEGqc___: ', 'Events found:', len(events))
-            epochs_mag = mne.Epochs(data, events, picks=picks_magn, tmin=epoch_tmin, tmax=epoch_tmax, preload=True,
-                                    baseline=None, event_repeated=epoching_params['event_repeated'])
-            epochs_grad = mne.Epochs(data, events, picks=picks_grad, tmin=epoch_tmin, tmax=epoch_tmax, preload=True,
-                                     baseline=None, event_repeated=epoching_params['event_repeated'])
+                  'Fixed-length epoch duration must be positive. No fixed-length epoching will be done.')
+            return None
+        if fixed_epoch_overlap < 0:
+            print('___MEGqc___: ',
+                  'Fixed-length epoch overlap must be >= 0. No fixed-length epoching will be done.')
+            return None
+        if fixed_epoch_overlap >= fixed_epoch_duration:
+            print('___MEGqc___: ',
+                  'Fixed-length epoch overlap must be smaller than duration. No fixed-length epoching will be done.')
+            return None
 
-    except:  # case when we use stim_channel=None, mne checks once more,  finds no other stim ch and no events and throws error:
-        print('___MEGqc___: ', 'No stim channels detected, no events found.')
-        pass  # go to returning empty dict
+        epochs = mne.make_fixed_length_epochs(
+            data,
+            duration=fixed_epoch_duration,
+            overlap=fixed_epoch_overlap,
+            picks=picks,
+            preload=True,
+            baseline=None)
+        print('___MEGqc___: ',
+              f'Fixed-length epochs created for {channel_type}: {len(epochs)} epochs.')
+        return epochs
+
+    if stim_channel is None and use_fixed_length_epochs:
+        print('___MEGqc___: ',
+              'No stimulus channels detected. Falling back to fixed-length epoching.')
+        epoching_mode = 'fixed_length'
+        epochs_mag = _make_fixed_length_epochs(picks_magn, 'magnetometers')
+        epochs_grad = _make_fixed_length_epochs(picks_grad, 'gradiometers')
+    else:
+        try:
+            events = mne.find_events(data, stim_channel=stim_channel, min_duration=event_dur)
+
+            if len(events) < 1:
+                print('___MEGqc___: ',
+                      'No events with set minimum duration were found using all stimulus channels. No epoching can be done. Try different event duration in config file.')
+            else:
+                print('___MEGqc___: ', 'Events found:', len(events))
+                epochs_mag = mne.Epochs(data, events, picks=picks_magn, tmin=epoch_tmin, tmax=epoch_tmax,
+                                        preload=True, baseline=None, event_repeated=epoching_params['event_repeated'])
+                epochs_grad = mne.Epochs(data, events, picks=picks_grad, tmin=epoch_tmin, tmax=epoch_tmax,
+                                         preload=True, baseline=None, event_repeated=epoching_params['event_repeated'])
+
+        except:  # case when we use stim_channel=None, mne checks once more,  finds no other stim ch and no events and throws error:
+            print('___MEGqc___: ', 'No stim channels detected, no events found.')
+            pass  # go to returning empty dict
 
     dict_epochs_mg = {
         'mag': epochs_mag,
-        'grad': epochs_grad}
+        'grad': epochs_grad,
+        'epoching_mode': epoching_mode}
 
     return dict_epochs_mg
 
@@ -1280,7 +1321,12 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
 
     dict_epochs_mg = Epoch_meg(epoching_params, data=raw_cropped_filtered)
     epoching_str = ''
-    if dict_epochs_mg['mag'] is None and dict_epochs_mg['grad'] is None:
+    if dict_epochs_mg.get('epoching_mode') == 'fixed_length':
+        epoching_str = (
+            '<p>No stimulus channels were detected. The data was epoched into fixed-length segments with '
+            f'duration {epoching_params["fixed_epoch_duration"]} s and overlap '
+            f'{epoching_params["fixed_epoch_overlap"]} s.</p><br></br>')
+    elif dict_epochs_mg['mag'] is None and dict_epochs_mg['grad'] is None:
         epoching_str = ''' <p>No epoching could be done in this data set: no events found. Quality measurement were only performed on the entire time series. If this was not expected, try: 1) checking the presence of stimulus channel in the data set, 2) setting stimulus channel explicitly in config file, 3) setting different event duration in config file.</p><br></br>'''
 
     resample_str = '<p>' + resample_str + '</p>'
