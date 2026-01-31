@@ -410,19 +410,26 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
               f'Fixed-length epochs created for {channel_type}: {len(epochs)} epochs.')
         return epochs
 
-    if stim_channel is None and use_fixed_length_epochs:
-        print('___MEGqc___: ',
-              'No stimulus channels detected. Falling back to fixed-length epoching.')
+    def _apply_fixed_length_fallback(reason):
+        if not use_fixed_length_epochs:
+            print('___MEGqc___: ', reason)
+            return
+        print('___MEGqc___: ', f'{reason} Falling back to fixed-length epoching.')
+        nonlocal epoching_mode, epochs_mag, epochs_grad
         epoching_mode = 'fixed_length'
         epochs_mag = _make_fixed_length_epochs(picks_magn, 'magnetometers')
         epochs_grad = _make_fixed_length_epochs(picks_grad, 'gradiometers')
+
+    if stim_channel is None:
+        _apply_fixed_length_fallback('No stimulus channels detected.')
     else:
         try:
             events = mne.find_events(data, stim_channel=stim_channel, min_duration=event_dur)
 
             if len(events) < 1:
-                print('___MEGqc___: ',
-                      'No events with set minimum duration were found using all stimulus channels. No epoching can be done. Try different event duration in config file.')
+                _apply_fixed_length_fallback(
+                    'No events with set minimum duration were found using all stimulus channels.'
+                )
             else:
                 print('___MEGqc___: ', 'Events found:', len(events))
                 epochs_mag = mne.Epochs(data, events, picks=picks_magn, tmin=epoch_tmin, tmax=epoch_tmax,
@@ -430,9 +437,8 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
                 epochs_grad = mne.Epochs(data, events, picks=picks_grad, tmin=epoch_tmin, tmax=epoch_tmax,
                                          preload=True, baseline=None, event_repeated=epoching_params['event_repeated'])
 
-        except:  # case when we use stim_channel=None, mne checks once more,  finds no other stim ch and no events and throws error:
-            print('___MEGqc___: ', 'No stim channels detected, no events found.')
-            pass  # go to returning empty dict
+        except Exception:
+            _apply_fixed_length_fallback('No stim channels detected, no events found.')
 
     dict_epochs_mg = {
         'mag': epochs_mag,
