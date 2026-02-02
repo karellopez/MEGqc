@@ -404,8 +404,7 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
             data,
             duration=fixed_epoch_duration,
             overlap=fixed_epoch_overlap,
-            preload=True,
-            baseline=None)
+            preload=True)
         if picks:
             epochs.pick(picks)
         print('___MEGqc___: ',
