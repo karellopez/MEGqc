@@ -54,6 +54,9 @@ Epoching [Epoching]
 - **epoch_tmax** (float) : time in seconds after the event. Unit: sec. Default: 1
 - **stim_channel** (str) : leave blank if want it to be detected automatically or write explicitely like *STI101*. Default:  * blank *. 
 - **event_repeated** (str) : how to handle duplicates in events[:, 0]. Can be 'error' to raise an error, ‘drop’ to only retain the row occurring first in the events, or 'merge' to combine the coinciding events (=duplicates) into a new event (see Notes for details). Default: *merge*
+- **use_fixed_length_epochs** (bool) : if True and no stimulus channels are detected or fewer than 2 events are found, epoch the data into fixed-length segments. Default: *True*
+- **fixed_epoch_duration** (float) : length of fixed epochs in seconds. Used only when fixed-length epoching is enabled. Default: *2.0*
+- **fixed_epoch_overlap** (float) : overlap between consecutive fixed epochs in seconds. Must be smaller than duration. Default: *0.0*
 
 Standard deviation [STD]
 ------------------------
@@ -137,5 +140,4 @@ Muscle artifacts [Muscle]
 - **min_distance_between_different_muscle_events** (int or float) : minimum distance between different muscle events in seconds. If events happen closer to each other they will all be counted as one event and the time will be assigned as the first peak. Unit: seconds. Default: *1*  
 
 Difference between last 2 settings: **min_length_good** - used to detect ALL muscle events, **min_distance_between_different_muscle_events** - used to detect evets with z-score higher than the threshold on base of ALL muscle events
-
 
