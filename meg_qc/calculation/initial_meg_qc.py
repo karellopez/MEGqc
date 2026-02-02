@@ -363,6 +363,7 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
     use_fixed_length_epochs = epoching_params['use_fixed_length_epochs']
     fixed_epoch_duration = epoching_params['fixed_epoch_duration']
     fixed_epoch_overlap = epoching_params['fixed_epoch_overlap']
+    min_event_count = 2 if use_fixed_length_epochs else 1
 
     if stim_channel is None:
         picks_stim = mne.pick_types(data.info, stim=True)
@@ -426,9 +427,10 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
         try:
             events = mne.find_events(data, stim_channel=stim_channel, min_duration=event_dur)
 
-            if len(events) < 1:
+            if len(events) < min_event_count:
                 _apply_fixed_length_fallback(
-                    'No events with set minimum duration were found using all stimulus channels.'
+                    f'Only {len(events)} event(s) were found using all stimulus channels '
+                    f'(minimum required: {min_event_count}).'
                 )
             else:
                 print('___MEGqc___: ', 'Events found:', len(events))
