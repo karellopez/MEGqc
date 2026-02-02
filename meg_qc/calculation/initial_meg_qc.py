@@ -372,8 +372,8 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
             stim_channel.append(data.info['chs'][ch]['ch_name'])
     print('___MEGqc___: ', 'Stimulus channels detected:', stim_channel)
 
-    picks_magn = mne.pick_types(data.info, meg='mag')
-    picks_grad = mne.pick_types(data.info, meg='grad')
+    picks_magn = data.copy().pick('mag').ch_names if 'mag' in data else None
+    picks_grad = data.copy().pick('grad').ch_names if 'grad' in data else None
 
     if not stim_channel:
         print('___MEGqc___: ',
@@ -387,9 +387,6 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
 
     def _make_fixed_length_epochs(picks, channel_type):
         """Create fixed-length epochs for a channel type when no stim events are available."""
-        if not picks:
-            print('___MEGqc___: ', f'No {channel_type} channels available for fixed-length epochs.')
-            return None
         if fixed_epoch_duration <= 0:
             print('___MEGqc___: ',
                   'Fixed-length epoch duration must be positive. No fixed-length epoching will be done.')
@@ -408,7 +405,8 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
             duration=fixed_epoch_duration,
             overlap=fixed_epoch_overlap,
             preload=True)
-        epochs.pick(picks)
+        if picks:
+            epochs.pick(picks)
         print('___MEGqc___: ',
               f'Fixed-length epochs created for {channel_type}: {len(epochs)} epochs.')
         return epochs
@@ -436,14 +434,10 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
                 )
             else:
                 print('___MEGqc___: ', 'Events found:', len(events))
-                if picks_magn:
-                    epochs_mag = mne.Epochs(data, events, picks=picks_magn, tmin=epoch_tmin, tmax=epoch_tmax,
-                                            preload=True, baseline=None,
-                                            event_repeated=epoching_params['event_repeated'])
-                if picks_grad:
-                    epochs_grad = mne.Epochs(data, events, picks=picks_grad, tmin=epoch_tmin, tmax=epoch_tmax,
-                                             preload=True, baseline=None,
-                                             event_repeated=epoching_params['event_repeated'])
+                epochs_mag = mne.Epochs(data, events, picks=picks_magn, tmin=epoch_tmin, tmax=epoch_tmax,
+                                        preload=True, baseline=None, event_repeated=epoching_params['event_repeated'])
+                epochs_grad = mne.Epochs(data, events, picks=picks_grad, tmin=epoch_tmin, tmax=epoch_tmax,
+                                         preload=True, baseline=None, event_repeated=epoching_params['event_repeated'])
 
         except Exception:
             _apply_fixed_length_fallback('No stim channels detected, no events found.')
