@@ -227,9 +227,52 @@ def create_summary_report(
         df.rename(columns={"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS"}, inplace=True)
         return df
 
+    def build_epoch_summary(source):
+        """Return a table summarising noisy and flat epochs."""
+        def _resolve_epoch_totals(data_for_sensor):
+            total_noisy = data_for_sensor.get("total_num_noisy_ep")
+            total_noisy_pct = data_for_sensor.get("total_perc_noisy_ep")
+            total_flat = data_for_sensor.get("total_num_flat_ep")
+            total_flat_pct = data_for_sensor.get("total_perc_flat_ep")
+
+            details = data_for_sensor.get("details")
+            if isinstance(details, list) and details:
+                total_epochs = len(details)
+                noisy_count = sum(1 for item in details if item.get("epoch_too_noisy") is True)
+                flat_count = sum(1 for item in details if item.get("epoch_too_flat") is True)
+                if total_noisy is None:
+                    total_noisy = noisy_count
+                if total_flat is None:
+                    total_flat = flat_count
+                if total_noisy_pct is None:
+                    total_noisy_pct = round(noisy_count / total_epochs * 100, 1)
+                if total_flat_pct is None:
+                    total_flat_pct = round(flat_count / total_epochs * 100, 1)
+
+            return total_noisy, total_noisy_pct, total_flat, total_flat_pct
+
+        rows = []
+        for sensor_type in ["mag", "grad"]:
+            data_for_sensor = _safe_dict(_safe_dict(source).get(sensor_type))
+            total_noisy, total_noisy_pct, total_flat, total_flat_pct = _resolve_epoch_totals(data_for_sensor)
+            rows.append(
+                {
+                    "Sensor Type": "MAGNETOMETERS" if sensor_type == "mag" else "GRADIOMETERS",
+                    "Noisy Epochs": _format_count_percent(
+                        total_noisy,
+                        total_noisy_pct,
+                    ),
+                    "Flat Epochs": _format_count_percent(
+                        total_flat,
+                        total_flat_pct,
+                    ),
+                }
+            )
+        return pd.DataFrame(rows)
+
     if std_present:
         general_df = build_summary_table(data["STD"]["STD_all_time_series"])
-        std_epoch_df = _safe_dataframe(data["STD"].get("STD_epoch", {}))
+        std_epoch_df = build_epoch_summary(_safe_dict(data["STD"].get("STD_epoch", {})))
         std_lvl = _get_sensor_param(data.get("STD", {}), "STD_all_time_series", "std_lvl")
         # ``STD_epoch`` can be ``null`` in the metrics JSON. Applying ``_safe_dict``
         # twice ensures we always operate on a dictionary before requesting the
@@ -245,7 +288,7 @@ def create_summary_report(
 
     if ptp_present:
         ptp_df = build_summary_table(data["PTP_MANUAL"]["ptp_manual_all"])
-        ptp_epoch_df = _safe_dataframe(data["PTP_MANUAL"].get("ptp_manual_epoch", {}))
+        ptp_epoch_df = build_epoch_summary(_safe_dict(data["PTP_MANUAL"].get("ptp_manual_epoch", {})))
         ptp_lvl = _get_sensor_param(data.get("PTP_MANUAL", {}), "ptp_manual_all", "ptp_lvl")
         # ``ptp_manual_epoch`` can also be ``null``. By wrapping the nested
         # ``get`` calls with ``_safe_dict`` we ensure a default dictionary and
