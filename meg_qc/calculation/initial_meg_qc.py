@@ -404,9 +404,10 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
             data,
             duration=fixed_epoch_duration,
             overlap=fixed_epoch_overlap,
-            picks=picks,
             preload=True,
             baseline=None)
+        if picks:
+            epochs.pick(picks)
         print('___MEGqc___: ',
               f'Fixed-length epochs created for {channel_type}: {len(epochs)} epochs.')
         return epochs
