@@ -168,6 +168,8 @@ def get_all_config_params(config_file_path: str):
             'min_duration': ptp_mne_section.getfloat('min_duration')})
 
         ecg_section = config['ECG']
+        ecg_fixed_ch = ecg_section.get('fixed_channel_names', '')
+        ecg_fixed_ch = [name.strip() for name in ecg_fixed_ch.split(',') if name.strip()]
         all_qc_params['ECG'] = dict({
             'drop_bad_ch': ecg_section.getboolean('drop_bad_ch'),
             'n_breaks_bursts_allowed_per_10min': ecg_section.getint('n_breaks_bursts_allowed_per_10min'),
@@ -175,15 +177,19 @@ def get_all_config_params(config_file_path: str):
             'norm_lvl': ecg_section.getfloat('norm_lvl'),
             'gaussian_sigma': ecg_section.getint('gaussian_sigma'),
             'thresh_lvl_peakfinder': ecg_section.getfloat('thresh_lvl_peakfinder'),
-            'height_multiplier': ecg_section.getfloat('height_multiplier')})
+            'height_multiplier': ecg_section.getfloat('height_multiplier'),
+            'fixed_channel_names': ecg_fixed_ch})
 
         eog_section = config['EOG']
+        eog_fixed_ch = eog_section.get('fixed_channel_names', '')
+        eog_fixed_ch = [name.strip() for name in eog_fixed_ch.split(',') if name.strip()]
         all_qc_params['EOG'] = dict({
             'n_breaks_bursts_allowed_per_10min': eog_section.getint('n_breaks_bursts_allowed_per_10min'),
             'allowed_range_of_peaks_stds': eog_section.getfloat('allowed_range_of_peaks_stds'),
             'norm_lvl': eog_section.getfloat('norm_lvl'),
             'gaussian_sigma': ecg_section.getint('gaussian_sigma'),
-            'thresh_lvl_peakfinder': eog_section.getfloat('thresh_lvl_peakfinder'), })
+            'thresh_lvl_peakfinder': eog_section.getfloat('thresh_lvl_peakfinder'),
+            'fixed_channel_names': eog_fixed_ch})
 
         head_section = config['Head_movement']
         all_qc_params['Head'] = dict({})

@@ -109,6 +109,7 @@ Heart beat artifacts [ECG]
 - **ecg_epoch_tmax** (float) : time in seconds after the event. Unit: seconds. Dont set smaller than 0.03. Default: *0.04*
 - **norm_lvl** (int) : The norm level is the scaling factor for the threshold. The mean artifact amplitude over all channels is multiplied by the norm_lvl to get the threshold. Default: *1*
 - **gaussian_sigma** (int) - The sigma of the gaussian kernel used to smooth the data. The higher the sigma, the more smoothing. Typically ECG data is less noisy than EOG nd requires smaller sigma. Default: 4
+- **fixed_channel_names** (str) - Optional comma-separated list of channel names to treat as ECG (e.g., *EEG059*). Leave blank to use automatic ECG detection via the raw object.
 
 
 Eye movement artifacts [EOG]
@@ -126,6 +127,7 @@ Eye movement artifacts [EOG]
 - **eog_epoch_tmax** (float) : time in seconds after the event. Unit: seconds. Default: *0.4*
 - **norm_lvl** (int) : the norm level is the scaling factor for the threshold. The mean artifact amplitude over all channels is multiplied by the norm_lvl to get the threshold. Default: *1*
 - **gaussian_sigma** (int) - The sigma of the gaussian kernel used to smooth the data. The higher the sigma, the more smoothing. Typically EOG data is more noisy than EG nd requires larger sigma. Default: 6
+- **fixed_channel_names** (str) - Optional comma-separated list of channel names to treat as EOG (e.g., *EEG057, EEG058*). Leave blank to use automatic EOG detection via the raw object.
 
 Head_movement artifacts [Head_movement]
 ---------------------------------------
@@ -140,4 +142,3 @@ Muscle artifacts [Muscle]
 - **min_distance_between_different_muscle_events** (int or float) : minimum distance between different muscle events in seconds. If events happen closer to each other they will all be counted as one event and the time will be assigned as the first peak. Unit: seconds. Default: *1*  
 
 Difference between last 2 settings: **min_length_good** - used to detect ALL muscle events, **min_distance_between_different_muscle_events** - used to detect evets with z-score higher than the threshold on base of ALL muscle events
-
