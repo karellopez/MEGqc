@@ -1606,6 +1606,8 @@ def get_EOG_data(raw: mne.io.Raw, eog_params: dict):
         missing = [name for name in fixed_eog_names if name not in raw.ch_names]
         if missing:
             print('___MEGqc___: EOG fixed channels not found in data:', missing)
+        if eog_channel_names:
+            raw.set_channel_types({name: 'eog' for name in eog_channel_names})
     else:
         # Select the EOG channels
         eog_channels = mne.pick_types(raw.info, meg=False, eeg=False, stim=False, eog=True)
