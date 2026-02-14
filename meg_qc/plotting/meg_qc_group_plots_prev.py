@@ -214,12 +214,6 @@ def _extract_run_and_desc(file_name: str) -> Tuple[Optional[str], Optional[str]]
 
 
 def _discover_run_records(calculation_dir: Path) -> Dict[str, RunRecord]:
-    """Scan calculation derivatives and group files by run key.
-
-    A run may have repeated outputs for the same desc (reruns or updates).
-    We keep only the newest file for each run+desc pair so group plots reflect
-    the latest available derivative without requiring cleanup of old files.
-    """
     tmp_files: Dict[str, Dict[str, List[Path]]] = defaultdict(lambda: defaultdict(list))
     run_meta: Dict[str, RunMeta] = {}
 
@@ -244,12 +238,6 @@ def _discover_run_records(calculation_dir: Path) -> Dict[str, RunRecord]:
 
 
 def _read_tsv(path: Path) -> Optional[pd.DataFrame]:
-    """Read TSV robustly for heterogeneous derivatives.
-
-    We intentionally load everything as strings and convert per-column later.
-    This avoids mixed-type parser instability on large datasets and keeps
-    parsing behavior deterministic across modules.
-    """
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DtypeWarning)
@@ -382,11 +370,6 @@ def _update_topomap_payload_mean(
     layout: Optional[SensorLayout],
     values: np.ndarray,
 ) -> None:
-    """Update condition-level topomap values as an online mean.
-
-    Topomap vectors can contain NaNs and runs can appear in different order.
-    We keep per-channel counts so each channel mean only uses finite inputs.
-    """
     if layout is None:
         return
     vals = np.asarray(values, dtype=float).reshape(-1)
@@ -823,12 +806,6 @@ def _accumulate_matrix_mean(
     condition_label: str,
     matrix: np.ndarray,
 ) -> None:
-    """Accumulate sum/count matrices with zero padding for ragged epoch sizes.
-
-    Different recordings can have different numbers of channels/epochs. We pad
-    to the current max shape and maintain sum/count separately so downstream
-    means are unbiased and missing cells remain undefined.
-    """
     arr = np.asarray(matrix, dtype=float)
     if arr.ndim != 2 or arr.size == 0:
         return
@@ -1132,13 +1109,6 @@ def plot_heatmap_sorted_channels_windows(
     color_title: str,
     summary_mode: str = "median",
 ) -> Optional[go.Figure]:
-    """Render channel-by-epoch heatmap with compact summaries in one panel.
-
-    Layout:
-    - Top-left: epoch profile with median + quantile bands across channels.
-    - Bottom-left: channel x epoch heatmap (channels sorted by summary burden).
-    - Bottom-right: per-channel summary strip for quick ranking context.
-    """
     arr = np.asarray(matrix, dtype=float)
     if arr.ndim != 2 or arr.size == 0:
         return None
@@ -1391,12 +1361,6 @@ def _trace_numeric(values) -> Optional[np.ndarray]:
 
 
 def _normalize_figure_for_mode(fig: Optional[go.Figure], mode: str) -> Optional[go.Figure]:
-    """Create a normalized copy of a Plotly figure for UI toggles.
-
-    The goal is visual comparability, not replacement of raw values. We only
-    transform coordinates relevant to the requested mode and keep structure,
-    labels, and trace grouping intact so users can switch views consistently.
-    """
     if fig is None:
         return None
     out = go.Figure(fig)
@@ -1573,12 +1537,6 @@ def _figure_block(
     normalized_variant: bool = False,
     norm_mode: str = "y",
 ) -> str:
-    """Build one HTML figure block with interpretation text.
-
-    When ``normalized_variant`` is enabled, we emit paired raw/normalized views
-    controlled by a lightweight client-side toggle. Each block gets a unique id
-    so toggles remain independent even in deeply nested tab layouts.
-    """
     auto_details = _auto_figure_details(fig)
     detailed_note = f"{interpretation} {auto_details}".strip()
     if (not normalized_variant) or fig is None:
@@ -1628,11 +1586,6 @@ def _condition_figure_blocks(
 
 
 def _build_subtabs_html(group_id: str, tabs: Sequence[Tuple[str, str]], *, level: int = 1) -> str:
-    """Render a tab group and attach a hierarchy level for styling.
-
-    The level value is used only for visual hierarchy (panel/background tone),
-    which helps users orient inside multi-layer tab structures.
-    """
     if not tabs:
         return "<p>No content available.</p>"
     buttons = []
@@ -1922,8 +1875,6 @@ def plot_run_fingerprint_scatter(
         dcond = data.loc[data["condition_label"] == cond].copy()
         if dcond.empty:
             continue
-        # One trace per condition enables native legend filtering (click to hide
-        # all points for that task/condition).
         fig.add_trace(
             go.Scattergl(
                 x=dcond[x_col],
@@ -2030,7 +1981,6 @@ def plot_subject_metric_heatmap(df: pd.DataFrame, title: str) -> Optional[go.Fig
     z = np.full((agg.shape[0], len(metrics)), np.nan, dtype=float)
     for idx, col in enumerate(metrics.values()):
         raw[:, idx] = agg[col].to_numpy(dtype=float)
-        # Normalize per metric column for comparability across heterogeneous units.
         z[:, idx] = _robust_normalize_array(raw[:, idx])
 
     bounds = _robust_bounds(z)
@@ -2046,7 +1996,6 @@ def plot_subject_metric_heatmap(df: pd.DataFrame, title: str) -> Optional[go.Fig
             zmin=zmin,
             zmax=zmax,
             colorbar={"title": "Normalized value (robust z)"},
-            # Keep raw values in hover so users retain physical interpretability.
             customdata=np.stack([raw], axis=-1),
             hovertemplate="subject=%{y}<br>metric=%{x}<br>raw=%{customdata[0]:.3g}<br>normalized=%{z:.2f}<extra></extra>",
         )
@@ -2352,50 +2301,15 @@ def plot_violin_with_subject_jitter(
                     )
                 )
 
-    if points_df.empty or point_col not in points_df.columns or "subject" not in points_df.columns:
+    if points_df.empty or point_col not in points_df.columns:
         points_data = pd.DataFrame()
     else:
-        # Subject points: one robust value per subject per condition label.
         tmp = points_df.loc[np.isfinite(points_df[point_col])].copy()
-        tmp["condition_label"] = tmp.get("condition_label", "all recordings").astype(str)
-        tmp["subject"] = tmp["subject"].fillna("n/a").astype(str)
-        tmp["task"] = tmp.get("task", "n/a").fillna("n/a").astype(str)
-
         recs = []
-        by_condition_subject = tmp.groupby(["condition_label", "subject"], dropna=False)
-        for (label, subject), group in by_condition_subject:
-            vals = pd.to_numeric(group[point_col], errors="coerce").to_numpy(dtype=float)
-            vals = _finite_array(vals)
-            if vals.size == 0:
-                continue
-            value = float(np.nanmedian(vals))
-            tasks = sorted({t for t in group["task"].tolist() if t != "n/a"})
-            hover = (
-                f"sub={subject}"
-                f"<br>condition={label}"
-                f"<br>n_recordings={len(group)}"
-                + (f"<br>tasks={', '.join(tasks)}" if tasks else "")
-                + f"<br>value={value:.3g}"
-            )
-            recs.append((str(label), value, str(subject), hover))
-
-        by_subject = tmp.groupby("subject", dropna=False)
-        for subject, group in by_subject:
-            vals = pd.to_numeric(group[point_col], errors="coerce").to_numpy(dtype=float)
-            vals = _finite_array(vals)
-            if vals.size == 0:
-                continue
-            value = float(np.nanmedian(vals))
-            tasks = sorted({t for t in group["task"].tolist() if t != "n/a"})
-            hover = (
-                f"sub={subject}"
-                "<br>condition=all tasks"
-                f"<br>n_recordings={len(group)}"
-                + (f"<br>tasks={', '.join(tasks)}" if tasks else "")
-                + f"<br>value={value:.3g}"
-            )
-            recs.append(("all tasks", value, str(subject), hover))
-
+        for _, row in tmp.iterrows():
+            label = str(row.get("condition_label", "all recordings"))
+            recs.append((label, float(row[point_col]), str(row.get("subject", "n/a")), str(row.get("hover_entities", ""))))
+            recs.append(("all tasks", float(row[point_col]), str(row.get("subject", "n/a")), str(row.get("hover_entities", ""))))
         points_data = pd.DataFrame(recs, columns=["label", "value", "subject", "hover"])
         points_data = points_data.loc[points_data["label"].isin(labels)]
 
@@ -2460,7 +2374,6 @@ def plot_recording_metric_heatmap(
     for col, label in valid_specs:
         vals = pd.to_numeric(data[col], errors="coerce").to_numpy(dtype=float)
         raw_cols.append(vals)
-        # Per-metric robust normalization improves visual contrast in mixed-unit matrices.
         z_cols.append(_robust_normalize_array(vals))
         labels.append(label)
 
@@ -2759,12 +2672,6 @@ def _vstack_nan_padded(left: np.ndarray, right: np.ndarray) -> np.ndarray:
 
 
 def _combine_accumulators(acc_by_type: Dict[str, ChTypeAccumulator]) -> ChTypeAccumulator:
-    """Merge MAG and GRAD accumulators into a cumulative all-channel view.
-
-    This is intentionally cumulative (channel concatenation), not unit
-    harmonization. Matrix-like payloads are row-stacked with epoch padding so
-    combined tabs can preserve all available channels from each type.
-    """
     combined = ChTypeAccumulator()
     for ch_type in CH_TYPES:
         if ch_type not in acc_by_type:
@@ -2792,8 +2699,6 @@ def _combine_accumulators(acc_by_type: Dict[str, ChTypeAccumulator]) -> ChTypeAc
                 combined.ptp_window_profiles_by_condition[cond].append(profile)
 
         for cond, matrix in acc.std_heatmap_by_condition.items():
-            # Representative matrices are merged by concatenating channel rows.
-            # Epoch axis may differ across runs/ch-types, so we pad columns.
             if cond in combined.std_heatmap_by_condition:
                 combined.std_heatmap_by_condition[cond] = _vstack_nan_padded(
                     combined.std_heatmap_by_condition[cond],
@@ -3806,7 +3711,6 @@ def _build_report_html(
     tab_accumulators: Dict[str, ChTypeAccumulator],
     settings_snapshot: str,
 ) -> str:
-    """Compose the self-contained HTML report (tabs + plots + client JS)."""
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     version = getattr(meg_qc, "__version__", "unknown")
     tab_order = ["Combined (mag+grad)", "MAG", "GRAD"]
@@ -3855,6 +3759,16 @@ def _build_report_html(
       align-items: flex-start;
       justify-content: space-between;
       flex-wrap: wrap;
+    }}
+    .theme-toggle {{
+      border: 1px solid #9bbce0;
+      border-radius: 10px;
+      background: #ecf4ff;
+      color: #21415c;
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
     }}
     section {{
       background: rgba(255, 255, 255, 0.90);
@@ -4029,6 +3943,64 @@ def _build_report_html(
     .fig-view.active {{
       display: block;
     }}
+    body[data-theme="dark"] {{
+      color: #dbe6f3;
+      background: linear-gradient(140deg, #111723, #162434 45%, #10212f);
+    }}
+    body[data-theme="dark"] section {{
+      background: rgba(16, 26, 39, 0.88);
+      border-color: #2b3f56;
+      box-shadow: 0 8px 28px rgba(0, 0, 0, 0.33);
+    }}
+    body[data-theme="dark"] h4,
+    body[data-theme="dark"] .fig-note {{
+      color: #b8cbe0;
+    }}
+    body[data-theme="dark"] .tab-btn,
+    body[data-theme="dark"] .subtab-btn,
+    body[data-theme="dark"] .fig-switch-btn,
+    body[data-theme="dark"] .theme-toggle {{
+      background: #1a3046;
+      color: #d8e5f2;
+      border-color: #3f5f80;
+    }}
+    body[data-theme="dark"] .tab-btn.active,
+    body[data-theme="dark"] .subtab-btn.active,
+    body[data-theme="dark"] .fig-switch-btn.active {{
+      background: #244766;
+      border-color: #6ea0cf;
+    }}
+    body[data-theme="dark"] .subtab-group.level-1 {{
+      background: #162637;
+      border-color: #2d4560;
+    }}
+    body[data-theme="dark"] .subtab-group.level-2 {{
+      background: #132233;
+      border-color: #294158;
+    }}
+    body[data-theme="dark"] .subtab-group.level-3 {{
+      background: #11202f;
+      border-color: #243a52;
+    }}
+    body[data-theme="dark"] .subtab-group.level-4 {{
+      background: #0f1d2b;
+      border-color: #1f3449;
+    }}
+    body[data-theme="dark"] pre {{
+      background: #142436;
+      border-color: #2b4058;
+      color: #d5e3f2;
+    }}
+    body[data-theme="dark"] table,
+    body[data-theme="dark"] th,
+    body[data-theme="dark"] td {{
+      border-color: #2b4058;
+      color: #d5e3f2;
+      background: #132233;
+    }}
+    body[data-theme="dark"] th {{
+      background: #1b3248;
+    }}
   </style>
 </head>
 <body>
@@ -4041,6 +4013,7 @@ def _build_report_html(
           <p><strong>MEGqc version:</strong> {version}</p>
           <p><strong>Epoch label:</strong> epochs</p>
         </div>
+        <button id="theme-toggle" class="theme-toggle" type="button">Dark mode</button>
       </div>
       <h3>Settings snapshot</h3>
       <pre>{settings_snapshot}</pre>
@@ -4053,7 +4026,6 @@ def _build_report_html(
   </main>
   <script>
     (function() {{
-      // Top-level tab activation and responsive plot resizing.
       const buttons = Array.from(document.querySelectorAll('.tab-btn'));
       const tabs = Array.from(document.querySelectorAll('.tab-content'));
       function resizePlots(targetId) {{
@@ -4068,6 +4040,31 @@ def _build_report_html(
         plots.forEach((plotEl) => {{
           try {{
             Plotly.Plots.resize(plotEl);
+          }} catch (err) {{
+            // no-op
+          }}
+        }});
+      }}
+      function stylePlotsForTheme(theme) {{
+        if (typeof Plotly === 'undefined') {{
+          return;
+        }}
+        const plots = Array.from(document.querySelectorAll('.js-plotly-plot'));
+        const dark = theme === 'dark';
+        const update = dark
+          ? {{
+              paper_bgcolor: '#0f1d2b',
+              plot_bgcolor: '#0f1d2b',
+              font: {{ color: '#d8e5f2' }},
+            }}
+          : {{
+              paper_bgcolor: '#ffffff',
+              plot_bgcolor: '#ffffff',
+              font: {{ color: '#1a1a1a' }},
+            }};
+        plots.forEach((plotEl) => {{
+          try {{
+            Plotly.relayout(plotEl, update);
           }} catch (err) {{
             // no-op
           }}
@@ -4113,7 +4110,6 @@ def _build_report_html(
           activateSubtab(groupId, firstBtn.dataset.target);
         }}
       }});
-      // Per-figure raw/normalized toggles.
       function activateFigVariant(toggleId, targetId) {{
         const root = document.querySelector(`.fig-switch[data-fig-toggle="${{toggleId}}"]`);
         if (!root) return;
@@ -4136,6 +4132,31 @@ def _build_report_html(
         const first = sw.querySelector('.fig-switch-btn');
         if (first) activateFigVariant(toggleId, first.dataset.target);
       }});
+      const themeBtn = document.getElementById('theme-toggle');
+      function applyTheme(themeName) {{
+        const theme = themeName === 'dark' ? 'dark' : 'light';
+        document.body.setAttribute('data-theme', theme);
+        if (themeBtn) {{
+          themeBtn.textContent = theme === 'dark' ? 'Light mode' : 'Dark mode';
+        }}
+        stylePlotsForTheme(theme);
+        const active = tabs.find(t => t.classList.contains('active'));
+        if (active) {{
+          window.requestAnimationFrame(() => resizePlots(active.id));
+        }}
+      }}
+      if (themeBtn) {{
+        const savedTheme = window.localStorage ? localStorage.getItem('megqc-theme') : null;
+        applyTheme(savedTheme || 'light');
+        themeBtn.addEventListener('click', () => {{
+          const current = document.body.getAttribute('data-theme') || 'light';
+          const next = current === 'dark' ? 'light' : 'dark';
+          applyTheme(next);
+          if (window.localStorage) {{
+            localStorage.setItem('megqc-theme', next);
+          }}
+        }});
+      }}
       window.addEventListener('resize', () => {{
         const active = tabs.find(t => t.classList.contains('active'));
         if (active) {{
@@ -4150,12 +4171,6 @@ def _build_report_html(
 
 
 def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], record: RunRecord) -> None:
-    """Ingest one run into accumulators using a streaming summary strategy.
-
-    The function loads only one run's derivative files, computes compact
-    summaries needed for plotting, and appends them to condition/channel-type
-    accumulators. This keeps memory bounded for large cohorts.
-    """
     files = record.files
     condition_label = _condition_label(record.meta)
 
@@ -4228,7 +4243,6 @@ def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], recor
 
         if ch_type in std_data:
             matrix = std_data[ch_type]
-            # Channel scalar summaries are used for distribution views.
             ch_summary_all = np.nanmedian(matrix, axis=1)
             ch_summary_norm = _robust_normalize_array(ch_summary_all)
             ch_summary = _finite_array(ch_summary_all)
@@ -4258,7 +4272,6 @@ def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], recor
                 row.std_median_norm = _as_float(np.nanmedian(ch_summary_norm_finite))
                 row.std_upper_tail_norm = _as_float(np.nanquantile(ch_summary_norm_finite, 0.95))
             std_profile = _profile_quantiles(matrix)
-            # Profile quantiles preserve epoch structure with channel collapse.
             acc.std_window_profiles.append(std_profile)
             acc.std_window_profiles_by_condition[condition_label].append(std_profile)
             _accumulate_matrix_mean(
