@@ -1377,7 +1377,7 @@ def _figure_to_div(fig: Optional[go.Figure]) -> str:
         return "<p>No distribution is available for this section.</p>"
     fig_out = go.Figure(fig)
 
-    # Global title/legend spacing guard: keep horizontal legends away from titles.
+    # Global title-spacing guard (legend coordinates are preserved as authored).
     has_title = bool(getattr(getattr(fig_out.layout, "title", None), "text", None))
     legend_obj = getattr(fig_out.layout, "legend", None)
     has_legend = legend_obj is not None
@@ -1387,28 +1387,19 @@ def _figure_to_div(fig: Optional[go.Figure]) -> str:
     if has_title:
         title_json = fig_out.layout.title.to_plotly_json() if fig_out.layout.title is not None else {}
         title_pad = dict(title_json.get("pad", {}))
-        title_pad["b"] = max(int(title_pad.get("b", 0) or 0), 18)
+        title_pad["b"] = max(int(title_pad.get("b", 0) or 0), 34)
         title_pad["t"] = max(int(title_pad.get("t", 0) or 0), 10)
         title_json["pad"] = title_pad
+        title_json.setdefault("yanchor", "top")
+        title_json.setdefault("y", 0.98)
         fig_out.update_layout(title=title_json)
-
-    if has_horizontal_legend:
-        legend_json = fig_out.layout.legend.to_plotly_json() if fig_out.layout.legend is not None else {}
-        legend_json["yanchor"] = "bottom"
-        y_val = legend_json.get("y", 1.02)
-        try:
-            y_num = float(y_val)
-        except Exception:
-            y_num = 1.02
-        legend_json["y"] = max(1.10, y_num)
-        fig_out.update_layout(legend=legend_json)
 
     margin_json = fig_out.layout.margin.to_plotly_json() if fig_out.layout.margin is not None else {}
     top_margin = int(margin_json.get("t", 65) or 65)
     if has_title:
-        top_margin = max(top_margin, 90)
+        top_margin = max(top_margin, 102)
     if has_horizontal_legend:
-        top_margin = max(top_margin, 130)
+        top_margin = max(top_margin, 120)
     margin_json["t"] = top_margin
     fig_out.update_layout(margin=margin_json)
 
