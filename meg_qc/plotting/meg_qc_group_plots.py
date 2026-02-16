@@ -4761,9 +4761,62 @@ def _build_report_html(
     .fig-view.active {{
       display: block;
     }}
+    .loading-overlay {{
+      position: fixed;
+      inset: 0;
+      background: rgba(241, 245, 249, 0.95);
+      backdrop-filter: blur(2px);
+      z-index: 9999;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: opacity 220ms ease;
+    }}
+    .loading-overlay.hidden {{
+      opacity: 0;
+      pointer-events: none;
+    }}
+    .loading-card {{
+      min-width: 280px;
+      max-width: 420px;
+      padding: 18px 20px;
+      border-radius: 14px;
+      border: 1px solid #93c5fd;
+      background: #ffffff;
+      box-shadow: 0 12px 28px rgba(15, 23, 42, 0.14);
+      text-align: center;
+    }}
+    .loading-spinner {{
+      width: 34px;
+      height: 34px;
+      margin: 0 auto 10px;
+      border: 4px solid #bfdbfe;
+      border-top-color: #1d4ed8;
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }}
+    .loading-title {{
+      font-weight: 700;
+      color: #1e3a5f;
+      margin-bottom: 4px;
+    }}
+    .loading-subtitle {{
+      color: #334e68;
+      font-size: 13px;
+    }}
+    @keyframes spin {{
+      to {{ transform: rotate(360deg); }}
+    }}
   </style>
 </head>
 <body>
+  <div id="report-loading-overlay" class="loading-overlay">
+    <div class="loading-card">
+      <div class="loading-spinner"></div>
+      <div class="loading-title">Loading QA report</div>
+      <div class="loading-subtitle">Rendering visible figures...</div>
+    </div>
+  </div>
   <main>
     <section>
       <div class="report-header">
@@ -4793,6 +4846,7 @@ def _build_report_html(
       const buttons = Array.from(document.querySelectorAll('.tab-btn'));
       const tabs = Array.from(document.querySelectorAll('.tab-content'));
       const gridToggleBtn = document.getElementById('grid-toggle-btn');
+      const loadingOverlay = document.getElementById('report-loading-overlay');
       const lazyStoreEl = document.getElementById('lazy-plot-store');
       let lazyFigureStore = {{}};
       if (lazyStoreEl && lazyStoreEl.textContent) {{
@@ -4804,12 +4858,26 @@ def _build_report_html(
       }}
       let gridsVisible = true;
 
+      function hideLoadingOverlay() {{
+        if (!loadingOverlay || loadingOverlay.dataset.hidden === '1') {{
+          return;
+        }}
+        loadingOverlay.dataset.hidden = '1';
+        loadingOverlay.classList.add('hidden');
+        window.setTimeout(() => {{
+          if (loadingOverlay && loadingOverlay.parentNode) {{
+            loadingOverlay.parentNode.removeChild(loadingOverlay);
+          }}
+        }}, 260);
+      }}
+
       function renderLazyInScope(scopeRoot) {{
         if (typeof Plotly === 'undefined') {{
-          return;
+          return Promise.resolve();
         }}
         const scope = scopeRoot || document;
         const placeholders = Array.from(scope.querySelectorAll('.js-lazy-plot'));
+        const renderPromises = [];
         placeholders.forEach((el) => {{
           if (el.dataset.rendered === '1') {{
             return;
@@ -4823,12 +4891,16 @@ def _build_report_html(
             return;
           }}
           try {{
-            Plotly.newPlot(el, payload.figure.data || [], payload.figure.layout || {{}}, payload.config || {{responsive: true, displaylogo: false}});
+            const renderResult = Plotly.newPlot(el, payload.figure.data || [], payload.figure.layout || {{}}, payload.config || {{responsive: true, displaylogo: false}});
             el.dataset.rendered = '1';
+            if (renderResult && typeof renderResult.then === 'function') {{
+              renderPromises.push(renderResult.catch(() => undefined));
+            }}
           }} catch (err) {{
             // no-op
           }}
         }});
+        return renderPromises.length > 0 ? Promise.all(renderPromises).then(() => undefined) : Promise.resolve();
       }}
 
       function applyGridToPlot(plotEl, show) {{
@@ -4867,31 +4939,33 @@ def _build_report_html(
 
       function resizePlots(targetId) {{
         if (typeof Plotly === 'undefined') {{
-          return;
+          return Promise.resolve();
         }}
         const root = document.getElementById(targetId);
         if (!root) {{
-          return;
+          return Promise.resolve();
         }}
-        renderLazyInScope(root);
-        const plots = Array.from(root.querySelectorAll('.js-plotly-plot'));
-        plots.forEach((plotEl) => {{
-          try {{
-            Plotly.Plots.resize(plotEl);
-          }} catch (err) {{
-            // no-op
+        return renderLazyInScope(root).then(() => {{
+          const plots = Array.from(root.querySelectorAll('.js-plotly-plot'));
+          plots.forEach((plotEl) => {{
+            try {{
+              Plotly.Plots.resize(plotEl);
+            }} catch (err) {{
+              // no-op
+            }}
+          }});
+          if (!gridsVisible) {{
+            applyGridState(false, root);
           }}
         }});
-        if (!gridsVisible) {{
-          applyGridState(false, root);
-        }}
       }}
       function activate(targetId) {{
         tabs.forEach(t => t.classList.toggle('active', t.id === targetId));
         buttons.forEach(b => b.classList.toggle('active', b.dataset.target === targetId));
         window.requestAnimationFrame(() => {{
-          resizePlots(targetId);
-          window.setTimeout(() => resizePlots(targetId), 120);
+          resizePlots(targetId).then(() => {{
+            window.setTimeout(() => resizePlots(targetId), 120);
+          }});
         }});
       }}
       buttons.forEach(btn => {{
@@ -4970,6 +5044,15 @@ def _build_report_html(
         if (active) {{
           resizePlots(active.id);
         }}
+      }});
+      window.requestAnimationFrame(() => {{
+        const active = tabs.find(t => t.classList.contains('active'));
+        const renderPromise = active ? resizePlots(active.id) : Promise.resolve();
+        renderPromise.then(() => {{
+          window.setTimeout(hideLoadingOverlay, 120);
+        }}).catch(() => {{
+          hideLoadingOverlay();
+        }});
       }});
     }})();
   </script>
