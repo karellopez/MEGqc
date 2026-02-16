@@ -107,6 +107,7 @@ class RunMetricRow:
     ecg_p95_abs_corr: float = np.nan
     eog_mean_abs_corr: float = np.nan
     eog_p95_abs_corr: float = np.nan
+    muscle_mean: float = np.nan
     muscle_median: float = np.nan
     muscle_p95: float = np.nan
 
@@ -1787,7 +1788,7 @@ def _run_rows_dataframe(rows: List[RunMetricRow]) -> pd.DataFrame:
         "std_mean", "std_median", "std_upper_tail", "std_median_norm", "std_upper_tail_norm",
         "ptp_mean", "ptp_median", "ptp_upper_tail", "ptp_median_norm", "ptp_upper_tail_norm",
         "mains_ratio", "mains_harmonics_ratio", "ecg_mean_abs_corr", "ecg_p95_abs_corr",
-        "eog_mean_abs_corr", "eog_p95_abs_corr", "muscle_median", "muscle_p95",
+        "eog_mean_abs_corr", "eog_p95_abs_corr", "muscle_mean", "muscle_median", "muscle_p95",
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -2654,6 +2655,95 @@ def plot_condition_effect_grid(
     return fig
 
 
+def plot_condition_effect_single(
+    df: pd.DataFrame,
+    metric_col: str,
+    title: str,
+    y_label: str,
+) -> Optional[go.Figure]:
+    """Render one subject-profile condition plot for a single metric."""
+    if df.empty or metric_col not in df.columns:
+        return None
+    conditions = sorted(df["condition_label"].unique())
+    if len(conditions) < 2:
+        return None
+
+    pivot = df.pivot_table(
+        index="subject",
+        columns="condition_label",
+        values=metric_col,
+        aggfunc="median",
+    )
+    if pivot.empty:
+        return None
+    pivot = pivot.reindex(columns=conditions)
+    pivot = pivot.dropna(how="all")
+    if pivot.empty:
+        return None
+
+    subject_var = pivot.var(axis=1, skipna=True).fillna(-np.inf)
+    selected_subjects = subject_var.sort_values(ascending=False).index.tolist()
+    if len(selected_subjects) > MAX_SUBJECT_LINES:
+        selected_subjects = selected_subjects[:MAX_SUBJECT_LINES]
+
+    all_subjects = sorted(pivot.index.astype(str).tolist())
+    color_map = _subject_color_map(all_subjects)
+    show_subject_legend = len(selected_subjects) <= 10
+
+    fig = go.Figure()
+    for subject in selected_subjects:
+        vals = pivot.loc[subject].to_numpy(dtype=float)
+        finite = np.isfinite(vals)
+        if np.sum(finite) < 2:
+            continue
+        s = str(subject)
+        fig.add_trace(
+            go.Scatter(
+                x=[conditions[i] for i in range(len(conditions)) if finite[i]],
+                y=vals[finite],
+                mode="lines+markers",
+                line={"width": 1.2, "color": color_map.get(s, "#4F6F84")},
+                marker={"size": 5, "color": color_map.get(s, "#4F6F84")},
+                name=f"sub-{s}",
+                legendgroup=f"sub-{s}",
+                showlegend=show_subject_legend,
+                hovertemplate=f"sub={s}<br>condition=%{{x}}<br>value=%{{y:.3g}}<extra></extra>",
+            )
+        )
+
+    median_vals = np.nanmedian(pivot.to_numpy(dtype=float), axis=0)
+    fig.add_trace(
+        go.Scatter(
+            x=conditions,
+            y=median_vals,
+            mode="lines+markers",
+            line={"width": 3.0, "color": "#0A2F51"},
+            marker={"size": 7, "color": "#0A2F51"},
+            name="Median subject profile",
+            legendgroup="median-profile",
+            showlegend=True,
+            hovertemplate="condition=%{x}<br>median=%{y:.3g}<extra></extra>",
+        )
+    )
+
+    fig.update_layout(
+        title={"text": title, "x": 0.5},
+        xaxis_title="Task / condition",
+        yaxis_title=y_label,
+        template="plotly_white",
+        margin={"l": 62, "r": 22, "t": 78, "b": 80},
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "left",
+            "x": 0.0,
+            "font": {"size": 11},
+        },
+    )
+    return fig
+
+
 def plot_subject_epoch_small_multiples(
     profiles_by_subject: Dict[str, List[Dict[str, np.ndarray]]],
     subject_scores: Dict[str, float],
@@ -3377,8 +3467,7 @@ def _build_subject_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_u
 
 def _build_cohort_overview_section(acc: ChTypeAccumulator, amplitude_unit: str, is_combined: bool) -> str:
     df = _run_rows_dataframe(acc.run_rows)
-    if df.empty:
-        return "<section><h2>Cohort Overview</h2><p>No recording-level summaries are available.</p></section>"
+    token = "combined" if is_combined else ("grad" if "/m" in amplitude_unit else "mag")
 
     suffix = " (all channels)" if is_combined else ""
     amp_label = "all channels" if is_combined else amplitude_unit
@@ -3390,33 +3479,98 @@ def _build_cohort_overview_section(acc: ChTypeAccumulator, amplitude_unit: str, 
         ("eog_p95_abs_corr", "EOG |r| upper tail"),
         ("muscle_p95", "Muscle upper tail"),
     ]
-    overview_heatmap = plot_recording_metric_heatmap(
-        df,
-        metric_specs=metric_specs,
-        title=f"Recording-by-metric cohort overview{suffix}",
-    )
+    if df.empty:
+        return (
+            "<section><h2>Cohort QA overview</h2>"
+            + _summary_table_html(acc)
+            + "<h3>Machine-readable derivatives used</h3>"
+            + _paths_html(acc.source_paths)
+            + "</section>"
+        )
+
+    overview_heatmap = plot_recording_metric_heatmap(df, metric_specs=metric_specs, title=f"Recording-by-metric cohort overview{suffix}")
+    subject_matrix = plot_subject_metric_heatmap(df, f"Subject-by-metric normalized summary matrix{suffix} (raw values on hover)")
     ranking = plot_subject_ranking_table(df, "Subject ranking by robust summary footprint")
+    std_profiles = plot_subject_epoch_small_multiples(
+        acc.std_subject_profiles,
+        _subject_scores_from_df(df, "std_upper_tail"),
+        f"Top subject epoch profiles (STD){suffix}",
+        y_label=f"STD ({amplitude_unit})",
+        top_n=12,
+    )
+    ptp_profiles = plot_subject_epoch_small_multiples(
+        acc.ptp_subject_profiles,
+        _subject_scores_from_df(df, "ptp_upper_tail"),
+        f"Top subject epoch profiles (PtP){suffix}",
+        y_label=f"PtP ({amplitude_unit})",
+        top_n=12,
+    )
+
+    heatmap_tabs = _build_subtabs_html(
+        f"cohort-heatmaps-{token}",
+        [
+            (
+                "Recording-by-metric",
+                _figure_block(
+                    overview_heatmap,
+                    (
+                        "Rows are recordings and columns are metric summaries. "
+                        "Color is robustly normalized for readability across mixed scales; hover reports the raw value in metric units."
+                    ),
+                ),
+            ),
+            (
+                "Subject-by-metric",
+                _figure_block(
+                    subject_matrix,
+                    (
+                        "Rows are subjects and columns are metrics. "
+                        "Color is normalized per metric to support cross-metric contrast; hover keeps raw summaries."
+                    ),
+                ),
+            ),
+        ],
+        level=2,
+    )
+    profile_tabs = _build_subtabs_html(
+        f"cohort-profiles-{token}",
+        [
+            (
+                "STD",
+                _figure_block(
+                    std_profiles,
+                    "Each panel is one subject, showing epoch-wise channel quantile bands for STD. Panels are ordered by subject upper-tail summary.",
+                ),
+            ),
+            (
+                "PtP",
+                _figure_block(
+                    ptp_profiles,
+                    "Each panel is one subject, showing epoch-wise channel quantile bands for PtP. Panels are ordered by subject upper-tail summary.",
+                ),
+            ),
+        ],
+        level=2,
+    )
 
     return (
         "<section>"
-        "<h2>Cohort Overview</h2>"
-        "<p>Rows are recordings and columns are metric summaries. This view answers who shows elevated burden patterns across the cohort.</p>"
-        + _figure_block(
-            overview_heatmap,
-            (
-                "Each row is one recording (subject x task x run) and each column is a robust metric summary. "
-                "Cell color encodes normalized magnitude for cross-metric readability, while hover keeps raw values in native units. "
-                "Use this as the first triage step to select recordings for deeper epoch/channel inspection."
-            ),
-        )
+        "<h2>Cohort QA overview</h2>"
+        "<p>This section merges cohort metadata, ranking, normalized cohort maps, and top subject epoch footprints for integrated QA triage.</p>"
+        + _summary_table_html(acc)
         + _figure_block(
             ranking,
             (
                 "Rows are subjects ranked by robust aggregated summaries and recording count. "
-                "Higher rank indicates larger relative burden across one or more metrics. "
-                "This ranking supports prioritization and does not define decisions."
+                "Higher rank indicates larger relative burden across one or more metrics."
             ),
         )
+        + "<h3>Cohort matrices</h3>"
+        + heatmap_tabs
+        + "<h3>Top subject epoch profiles</h3>"
+        + profile_tabs
+        + "<h3>Machine-readable derivatives used</h3>"
+        + _paths_html(acc.source_paths)
         + "</section>"
     )
 
@@ -3424,37 +3578,111 @@ def _build_cohort_overview_section(acc: ChTypeAccumulator, amplitude_unit: str, 
 def _build_condition_effect_section(acc: ChTypeAccumulator, amplitude_unit: str, is_combined: bool) -> str:
     df = _run_rows_dataframe(acc.run_rows)
     if df.empty:
-        return "<section><h2>Task/Condition Effects</h2><p>No condition comparison is available.</p></section>"
+        return "<section><h2>QA metrics across tasks</h2><p>No condition comparison is available.</p></section>"
+
+    if "condition_label" not in df.columns or df["condition_label"].nunique() < 2:
+        return "<section><h2>QA metrics across tasks</h2><p>Condition comparison requires at least two task/condition labels.</p></section>"
 
     suffix = " (all channels)" if is_combined else ""
-    std_y = "STD median (all channels)" if is_combined else f"STD median ({amplitude_unit})"
-    ptp_y = "PtP upper tail (all channels)" if is_combined else f"PtP upper tail ({amplitude_unit})"
-    metric_specs = [
-        ("std_median", std_y),
-        ("ptp_upper_tail", ptp_y),
-        ("mains_ratio", "Mains relative power"),
-        ("ecg_mean_abs_corr", "ECG |r| mean"),
-        ("eog_mean_abs_corr", "EOG |r| mean"),
-        ("muscle_median", "Muscle median"),
+    token = "combined" if is_combined else ("grad" if "/m" in amplitude_unit else "mag")
+
+    def _variant_order(default_label: str) -> List[str]:
+        base = ["Median", "Mean", "Upper tail"]
+        return [default_label] + [lbl for lbl in base if lbl != default_label]
+
+    metric_defs = [
+        {
+            "name": "STD",
+            "default": "Median",
+            "variants": {
+                "Median": ("std_median", f"STD median ({amplitude_unit})"),
+                "Mean": ("std_mean", f"STD mean ({amplitude_unit})"),
+                "Upper tail": ("std_upper_tail", f"STD upper tail ({amplitude_unit})"),
+            },
+        },
+        {
+            "name": "PtP",
+            "default": "Upper tail",
+            "variants": {
+                "Median": ("ptp_median", f"PtP median ({amplitude_unit})"),
+                "Mean": ("ptp_mean", f"PtP mean ({amplitude_unit})"),
+                "Upper tail": ("ptp_upper_tail", f"PtP upper tail ({amplitude_unit})"),
+            },
+        },
+        {
+            "name": "PSD mains ratio",
+            "default": "Mean",
+            "variants": {
+                "Median": ("mains_ratio", "Mains relative power"),
+                "Mean": ("mains_ratio", "Mains relative power"),
+                "Upper tail": ("mains_harmonics_ratio", "Harmonics relative power"),
+            },
+        },
+        {
+            "name": "ECG correlation",
+            "default": "Mean",
+            "variants": {
+                "Median": ("ecg_mean_abs_corr", "ECG |r| median proxy"),
+                "Mean": ("ecg_mean_abs_corr", "ECG |r| mean"),
+                "Upper tail": ("ecg_p95_abs_corr", "ECG |r| upper tail"),
+            },
+        },
+        {
+            "name": "EOG correlation",
+            "default": "Mean",
+            "variants": {
+                "Median": ("eog_mean_abs_corr", "EOG |r| median proxy"),
+                "Mean": ("eog_mean_abs_corr", "EOG |r| mean"),
+                "Upper tail": ("eog_p95_abs_corr", "EOG |r| upper tail"),
+            },
+        },
+        {
+            "name": "Muscle score",
+            "default": "Median",
+            "variants": {
+                "Median": ("muscle_median", "Muscle median"),
+                "Mean": ("muscle_mean", "Muscle mean"),
+                "Upper tail": ("muscle_p95", "Muscle upper tail"),
+            },
+        },
     ]
-    cond_effect = plot_condition_effect_grid(
-        df,
-        metric_specs=metric_specs,
-        title=f"Within-subject task/condition profiles{suffix}",
-    )
+
+    metric_tabs: List[Tuple[str, str]] = []
+    for metric in metric_defs:
+        metric_name = str(metric["name"])
+        variants = metric["variants"]
+        default = str(metric["default"])
+        variant_tabs: List[Tuple[str, str]] = []
+        for variant_label in _variant_order(default):
+            col, y_label = variants.get(variant_label, ("", ""))
+            fig = plot_condition_effect_single(
+                df,
+                metric_col=col,
+                title=f"{metric_name} across tasks{suffix} [{variant_label}]",
+                y_label=y_label,
+            )
+            interpretation = (
+                f"Each thin line is one subject profile across task/condition labels for the {variant_label.lower()} summary. "
+                "The dark line is the cohort median profile across subjects. "
+                "Consistent separation between task labels indicates a task-linked shift in this QA summary."
+            )
+            variant_tabs.append((variant_label, _figure_block(fig, interpretation)))
+        metric_tabs.append(
+            (
+                metric_name,
+                _build_subtabs_html(
+                    f"task-effect-{token}-{re.sub(r'[^a-z0-9]+', '-', metric_name.lower())}",
+                    variant_tabs,
+                    level=3,
+                ),
+            )
+        )
 
     return (
         "<section>"
-        "<h2>Task/Condition Effects</h2>"
-        "<p>Each thin line is one subject profile across conditions. The dark line is the cohort median profile. Subject identity is always available in hover text.</p>"
-        + _figure_block(
-            cond_effect,
-            (
-                "Panels summarize within-subject condition effects for each metric. "
-                "Thin lines indicate subject trajectories; the dark line indicates median trajectory across subjects. "
-                "Consistent separation between conditions suggests task-related shifts in distribution burden."
-            ),
-        )
+        "<h2>QA metrics across tasks</h2>"
+        "<p>One tab per metric. Inside each metric, switch between median, mean, and upper-tail summaries to inspect how subject trajectories change across task/condition labels.</p>"
+        + _build_subtabs_html(f"task-effects-main-{token}", metric_tabs, level=2)
         + "</section>"
     )
 
@@ -3463,6 +3691,8 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
     suffix = " (all channels)" if is_combined else ""
     df = _run_rows_dataframe(acc.run_rows)
     tab_token = "combined" if is_combined else ("grad" if "/m" in amplitude_unit else "mag")
+
+    VariantSpec = Tuple[str, Dict[str, List[float]], str]
 
     def _count_map_values(values_map: Dict[str, List[float]]) -> int:
         return int(sum(_finite_array(vals).size for vals in values_map.values()))
@@ -3473,7 +3703,7 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
         ch_values: Dict[str, List[float]],
         epoch_values: Dict[str, List[float]],
     ) -> str:
-        if point_col in df.columns:
+        if (point_col in df.columns) and (not df.empty):
             finite_mask = np.isfinite(pd.to_numeric(df[point_col], errors="coerce").to_numpy(dtype=float))
             dff = df.loc[finite_mask].copy()
         else:
@@ -3500,16 +3730,18 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
         group_id: str,
         values_map: Dict[str, List[float]],
         point_col: str,
+        variant_label: str,
         title_prefix: str,
         value_label: str,
     ) -> str:
         vals = _values_with_task_agnostic(values_map)
         if not vals:
             return "<p>No values are available for this variant.</p>"
+        point_col_safe = point_col if point_col in df.columns else "__none__"
         violin = plot_violin_with_subject_jitter(
             vals,
             df,
-            point_col=point_col,
+            point_col=point_col_safe,
             title=f"{title_prefix} - violin",
             y_title=value_label,
         )
@@ -3532,7 +3764,8 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
                         violin,
                         (
                             "Each violin is the pooled distribution for the selected group. "
-                            "Jittered dots show one robust value per subject (median over available runs for the selected summary). "
+                            f"Jittered dots show one robust value per subject for the selected {variant_label.lower()} summary "
+                            "(median over available runs). "
                             f"Units: {value_label}."
                         ),
                         normalized_variant=True,
@@ -3561,33 +3794,33 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
             level=4,
         )
 
-    def _summary_variants(
-        default_values: Dict[str, List[float]],
-        mean_values: Optional[Dict[str, List[float]]] = None,
-        upper_values: Optional[Dict[str, List[float]]] = None,
-    ) -> List[Tuple[str, Dict[str, List[float]]]]:
-        return [
-            ("Default", default_values),
-            ("Mean", default_values if mean_values is None else mean_values),
-            ("Upper tail", default_values if upper_values is None else upper_values),
-        ]
+    def _ordered_variant_specs(
+        default_label: str,
+        values_by_label: Dict[str, Dict[str, List[float]]],
+        point_col_by_label: Dict[str, str],
+    ) -> List[VariantSpec]:
+        ordered = [default_label] + [label for label in ("Median", "Mean", "Upper tail") if label != default_label]
+        specs: List[VariantSpec] = []
+        for label in ordered:
+            specs.append((label, values_by_label.get(label, {}), point_col_by_label.get(label, "")))
+        return specs
 
     def _summary_variant_tabs(
         group_id: str,
-        variants: List[Tuple[str, Dict[str, List[float]]]],
-        point_col: str,
+        variants: List[VariantSpec],
         title_prefix: str,
         value_label: str,
     ) -> str:
         items: List[Tuple[str, str]] = []
-        for idx, (variant_label, values_map) in enumerate(variants):
+        for idx, (variant_label, values_map, variant_point_col) in enumerate(variants):
             items.append(
                 (
                     variant_label,
                     _variant_tabs(
                         f"{group_id}-variant-{idx}",
                         values_map,
-                        point_col=point_col,
+                        point_col=variant_point_col,
+                        variant_label=variant_label,
                         title_prefix=f"{title_prefix} [{variant_label}]",
                         value_label=value_label,
                     ),
@@ -3595,24 +3828,57 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
             )
         return _build_subtabs_html(group_id, items, level=4)
 
+    def _heatmap_variant_tabs(
+        metric_name: str,
+        unit_label: str,
+        variants: List[Tuple[str, Dict[str, np.ndarray], str, str]],
+    ) -> str:
+        tabs: List[Tuple[str, str]] = []
+        for idx, (variant_label, matrices_by_condition, summary_mode, interpretation) in enumerate(variants):
+            figures = {
+                cond: plot_heatmap_sorted_channels_windows(
+                    matrix,
+                    title=f"{metric_name} channel-epoch map ({variant_label}) ({cond}){suffix}",
+                    color_title=unit_label,
+                    summary_mode=summary_mode,
+                )
+                for cond, matrix in sorted(matrices_by_condition.items())
+            }
+            tabs.append(
+                (
+                    variant_label,
+                    _condition_figure_blocks(
+                        figures,
+                        interpretation,
+                        normalized_variant=True,
+                        norm_mode="z",
+                    ),
+                )
+            )
+        return _build_subtabs_html(
+            f"heatmap-{re.sub(r'[^a-z0-9]+', '-', metric_name.lower())}-{tab_token}",
+            tabs,
+            level=4,
+        )
+
     def _metric_panel(
         metric_name: str,
-        rec_variants: List[Tuple[str, Dict[str, List[float]]]],
-        ch_variants: List[Tuple[str, Dict[str, List[float]]]],
-        epoch_variants: List[Tuple[str, Dict[str, List[float]]]],
-        point_col: str,
+        rec_variants: List[VariantSpec],
+        ch_variants: List[VariantSpec],
+        epoch_variants: List[VariantSpec],
         unit_label: str,
         formula_a: str,
         formula_b: str,
         formula_c: str,
-        mean_sum_map: Optional[Dict[str, np.ndarray]] = None,
-        mean_count_map: Optional[Dict[str, np.ndarray]] = None,
+        heatmap_variants: Optional[List[Tuple[str, Dict[str, np.ndarray], str, str]]] = None,
         topomap_payloads: Optional[Dict[str, TopomapPayload]] = None,
+        fingerprint_spec: Optional[Tuple[str, str, str, str]] = None,
     ) -> str:
         rec_default = rec_variants[0][1] if rec_variants else {}
         ch_default = ch_variants[0][1] if ch_variants else {}
         epoch_default = epoch_variants[0][1] if epoch_variants else {}
-        counts_html = _panel_counts_html(point_col, rec_default, ch_default, epoch_default)
+        point_col_default = rec_variants[0][2] if rec_variants else ""
+        counts_html = _panel_counts_html(point_col_default, rec_default, ch_default, epoch_default)
 
         dist_tabs = _build_subtabs_html(
             f"dist-{metric_name.lower()}-{tab_token}",
@@ -3623,7 +3889,6 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
                     + _summary_variant_tabs(
                         f"var-{metric_name.lower()}-a-{tab_token}",
                         rec_variants,
-                        point_col=point_col,
                         title_prefix=f"{metric_name} recording distribution{suffix}",
                         value_label=unit_label,
                     ),
@@ -3634,7 +3899,6 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
                     + _summary_variant_tabs(
                         f"var-{metric_name.lower()}-b-{tab_token}",
                         ch_variants,
-                        point_col=point_col,
                         title_prefix=f"{metric_name} epochs-per-channel distribution{suffix}",
                         value_label=unit_label,
                     ),
@@ -3645,7 +3909,6 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
                     + _summary_variant_tabs(
                         f"var-{metric_name.lower()}-c-{tab_token}",
                         epoch_variants,
-                        point_col=point_col,
                         title_prefix=f"{metric_name} channels-per-epoch distribution{suffix}",
                         value_label=unit_label,
                     ),
@@ -3656,28 +3919,10 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
 
         blocks = [f"<div class='metric-block'><h3>{metric_name}</h3>{dist_tabs}</div>"]
 
-        if mean_sum_map is not None and mean_count_map is not None:
-            mean_mats = _mean_matrices_by_condition(mean_sum_map, mean_count_map, include_all_tasks=True)
-            heatmaps = {
-                cond: plot_heatmap_sorted_channels_windows(
-                    matrix,
-                    title=f"{metric_name} mean channel-epoch map across subjects ({cond}){suffix}",
-                    color_title=unit_label,
-                    summary_mode="median",
-                )
-                for cond, matrix in sorted(mean_mats.items())
-            }
+        if heatmap_variants:
             blocks.append(
-                _condition_figure_blocks(
-                    heatmaps,
-                    (
-                        "Heatmap cell = mean metric value across subjects for one channel and one epoch. "
-                        "The top strip in the same figure shows median and quantile bands across channels per epoch, "
-                        "so the envelope and heatmap share the same epoch axis."
-                    ),
-                    normalized_variant=True,
-                    norm_mode="z",
-                )
+                "<h4>Channel x epoch maps</h4>"
+                + _heatmap_variant_tabs(metric_name=metric_name, unit_label=unit_label, variants=heatmap_variants)
             )
 
         if topomap_payloads is not None:
@@ -3694,81 +3939,184 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
                 )
             )
 
+        if fingerprint_spec is not None:
+            x_col, y_col, x_label, y_label = fingerprint_spec
+            fingerprint = plot_run_fingerprint_scatter(
+                df,
+                x_col=x_col,
+                y_col=y_col,
+                title=f"Run fingerprint ({metric_name}){suffix}",
+                x_label=x_label,
+                y_label=y_label,
+            )
+            blocks.append(
+                _figure_block(
+                    fingerprint,
+                    (
+                        "Each point is one recording (subject x task x run). "
+                        "X and Y summarize central and upper-tail dimensions for this metric to expose recording-level spread."
+                    ),
+                )
+            )
+
         return "".join(blocks)
 
+    std_mean_mats = _mean_matrices_by_condition(acc.std_heatmap_sum_by_condition, acc.std_heatmap_count_by_condition, include_all_tasks=True)
+    std_heatmaps_by_label = {
+        "Median": acc.std_heatmap_by_condition,
+        "Mean": std_mean_mats,
+        "Upper tail": acc.std_heatmap_upper_by_condition,
+    }
+    std_summary_mode = {"Median": "median", "Mean": "median", "Upper tail": "upper_tail"}
+    std_heatmap_variants = [
+        (
+            label,
+            std_heatmaps_by_label[label],
+            std_summary_mode[label],
+            (
+                "Heatmap cell is one channel-by-epoch value. "
+                "Top strip shows epoch-wise channel quantile bands, and the side strip shows sorted channel burden."
+            ),
+        )
+        for label in ["Median", "Mean", "Upper tail"]
+    ]
     std_panel = _metric_panel(
         metric_name="STD",
-        rec_variants=_summary_variants(
-            _run_values_by_condition(df, "std_median"),
-            _run_values_by_condition(df, "std_mean"),
-            _run_values_by_condition(df, "std_upper_tail"),
+        rec_variants=_ordered_variant_specs(
+            "Median",
+            {
+                "Median": _run_values_by_condition(df, "std_median"),
+                "Mean": _run_values_by_condition(df, "std_mean"),
+                "Upper tail": _run_values_by_condition(df, "std_upper_tail"),
+            },
+            {"Median": "std_median", "Mean": "std_mean", "Upper tail": "std_upper_tail"},
         ),
-        ch_variants=_summary_variants(
-            acc.std_dist_by_condition,
-            acc.std_dist_mean_by_condition,
-            acc.std_dist_upper_by_condition,
+        ch_variants=_ordered_variant_specs(
+            "Median",
+            {
+                "Median": acc.std_dist_by_condition,
+                "Mean": acc.std_dist_mean_by_condition,
+                "Upper tail": acc.std_dist_upper_by_condition,
+            },
+            {"Median": "std_median", "Mean": "std_mean", "Upper tail": "std_upper_tail"},
         ),
-        epoch_variants=_summary_variants(
-            _epoch_values_from_profiles(acc.std_window_profiles_by_condition, field="q50"),
-            _epoch_values_from_profiles(acc.std_window_profiles_by_condition, field="mean"),
-            _epoch_values_from_profiles(acc.std_window_profiles_by_condition, field="q95"),
+        epoch_variants=_ordered_variant_specs(
+            "Median",
+            {
+                "Median": _epoch_values_from_profiles(acc.std_window_profiles_by_condition, field="q50"),
+                "Mean": _epoch_values_from_profiles(acc.std_window_profiles_by_condition, field="mean"),
+                "Upper tail": _epoch_values_from_profiles(acc.std_window_profiles_by_condition, field="q95"),
+            },
+            {"Median": "std_median", "Mean": "std_mean", "Upper tail": "std_upper_tail"},
         ),
-        point_col="std_median",
         unit_label=f"STD ({amplitude_unit})",
-        formula_a="Default: median_c(median_t STD[c,t]); Mean: mean_c(mean_t STD[c,t]); Upper tail: q95_c(q95_t STD[c,t]).",
-        formula_b="Default: median_t STD[c,t] per channel c; Mean: mean_t STD[c,t] per channel c; Upper tail: q95_t STD[c,t] per channel c.",
-        formula_c="Default: median_c STD[c,t] per epoch t; Mean: mean_c STD[c,t] per epoch t; Upper tail: q95_c STD[c,t] per epoch t.",
-        mean_sum_map=acc.std_heatmap_sum_by_condition,
-        mean_count_map=acc.std_heatmap_count_by_condition,
+        formula_a="Median: median_c(median_t STD[c,t]); Mean: mean_c(mean_t STD[c,t]); Upper tail: q95_c(q95_t STD[c,t]).",
+        formula_b="Median: median_t STD[c,t] per channel c; Mean: mean_t STD[c,t] per channel c; Upper tail: q95_t STD[c,t] per channel c.",
+        formula_c="Median: median_c STD[c,t] per epoch t; Mean: mean_c STD[c,t] per epoch t; Upper tail: q95_c STD[c,t] per epoch t.",
+        heatmap_variants=std_heatmap_variants,
         topomap_payloads=acc.std_topomap_by_condition,
+        fingerprint_spec=(
+            "std_median",
+            "std_upper_tail",
+            f"Median channel STD per recording ({amplitude_unit})",
+            f"Upper-tail channel STD per recording ({amplitude_unit})",
+        ),
     )
 
+    ptp_mean_mats = _mean_matrices_by_condition(acc.ptp_heatmap_sum_by_condition, acc.ptp_heatmap_count_by_condition, include_all_tasks=True)
+    ptp_heatmaps_by_label = {
+        "Median": acc.ptp_heatmap_by_condition,
+        "Mean": ptp_mean_mats,
+        "Upper tail": acc.ptp_heatmap_upper_by_condition,
+    }
+    ptp_summary_mode = {"Median": "median", "Mean": "median", "Upper tail": "upper_tail"}
+    ptp_heatmap_variants = [
+        (
+            label,
+            ptp_heatmaps_by_label[label],
+            ptp_summary_mode[label],
+            (
+                "Heatmap cell is one channel-by-epoch value. "
+                "Top strip shows epoch-wise channel quantile bands, and the side strip shows sorted channel burden."
+            ),
+        )
+        for label in ["Upper tail", "Mean", "Median"]
+    ]
     ptp_panel = _metric_panel(
         metric_name="PtP",
-        rec_variants=_summary_variants(
-            _run_values_by_condition(df, "ptp_upper_tail"),
-            _run_values_by_condition(df, "ptp_mean"),
-            _run_values_by_condition(df, "ptp_upper_tail"),
+        rec_variants=_ordered_variant_specs(
+            "Upper tail",
+            {
+                "Median": _run_values_by_condition(df, "ptp_median"),
+                "Mean": _run_values_by_condition(df, "ptp_mean"),
+                "Upper tail": _run_values_by_condition(df, "ptp_upper_tail"),
+            },
+            {"Median": "ptp_median", "Mean": "ptp_mean", "Upper tail": "ptp_upper_tail"},
         ),
-        ch_variants=_summary_variants(
-            acc.ptp_dist_by_condition,
-            acc.ptp_dist_mean_by_condition,
-            acc.ptp_dist_upper_by_condition,
+        ch_variants=_ordered_variant_specs(
+            "Upper tail",
+            {
+                "Median": acc.ptp_dist_by_condition,
+                "Mean": acc.ptp_dist_mean_by_condition,
+                "Upper tail": acc.ptp_dist_upper_by_condition,
+            },
+            {"Median": "ptp_median", "Mean": "ptp_mean", "Upper tail": "ptp_upper_tail"},
         ),
-        epoch_variants=_summary_variants(
-            _epoch_values_from_profiles(acc.ptp_window_profiles_by_condition, field="q50"),
-            _epoch_values_from_profiles(acc.ptp_window_profiles_by_condition, field="mean"),
-            _epoch_values_from_profiles(acc.ptp_window_profiles_by_condition, field="q95"),
+        epoch_variants=_ordered_variant_specs(
+            "Upper tail",
+            {
+                "Median": _epoch_values_from_profiles(acc.ptp_window_profiles_by_condition, field="q50"),
+                "Mean": _epoch_values_from_profiles(acc.ptp_window_profiles_by_condition, field="mean"),
+                "Upper tail": _epoch_values_from_profiles(acc.ptp_window_profiles_by_condition, field="q95"),
+            },
+            {"Median": "ptp_median", "Mean": "ptp_mean", "Upper tail": "ptp_upper_tail"},
         ),
-        point_col="ptp_upper_tail",
         unit_label=f"PtP ({amplitude_unit})",
-        formula_a="Default: q95_c(q95_t PtP[c,t]); Mean: mean_c(mean_t PtP[c,t]); Upper tail: q95_c(q99_t PtP[c,t]).",
-        formula_b="Default: q95_t PtP[c,t] per channel c; Mean: mean_t PtP[c,t] per channel c; Upper tail: q99_t PtP[c,t] per channel c.",
-        formula_c="Default: median_c PtP[c,t] per epoch t; Mean: mean_c PtP[c,t] per epoch t; Upper tail: q95_c PtP[c,t] per epoch t.",
-        mean_sum_map=acc.ptp_heatmap_sum_by_condition,
-        mean_count_map=acc.ptp_heatmap_count_by_condition,
+        formula_a="Upper tail (default): q95_c(q99_t PtP[c,t]); Mean: mean_c(mean_t PtP[c,t]); Median: median_c(q95_t PtP[c,t]).",
+        formula_b="Upper tail (default): q99_t PtP[c,t] per channel c; Mean: mean_t PtP[c,t] per channel c; Median: stored central channel summary per c.",
+        formula_c="Upper tail (default): q95_c PtP[c,t] per epoch t; Mean: mean_c PtP[c,t] per epoch t; Median: median_c PtP[c,t] per epoch t.",
+        heatmap_variants=ptp_heatmap_variants,
         topomap_payloads=acc.ptp_topomap_by_condition,
+        fingerprint_spec=(
+            "ptp_median",
+            "ptp_upper_tail",
+            f"Median channel PtP per recording ({amplitude_unit})",
+            f"Upper-tail channel PtP per recording ({amplitude_unit})",
+        ),
     )
 
     psd_panel = _metric_panel(
         metric_name="PSD mains ratio",
-        rec_variants=_summary_variants(
-            _run_values_by_condition(df, "mains_ratio"),
-            _run_values_by_condition(df, "mains_ratio"),
-            _run_values_by_condition(df, "mains_harmonics_ratio"),
+        rec_variants=_ordered_variant_specs(
+            "Mean",
+            {
+                "Median": _run_values_by_condition(df, "mains_ratio"),
+                "Mean": _run_values_by_condition(df, "mains_ratio"),
+                "Upper tail": _run_values_by_condition(df, "mains_harmonics_ratio"),
+            },
+            {"Median": "mains_ratio", "Mean": "mains_ratio", "Upper tail": "mains_harmonics_ratio"},
         ),
-        ch_variants=_summary_variants(
-            acc.psd_ratio_by_condition,
-            acc.psd_ratio_by_condition,
-            acc.psd_harmonics_ratio_by_condition,
+        ch_variants=_ordered_variant_specs(
+            "Mean",
+            {
+                "Median": acc.psd_ratio_by_condition,
+                "Mean": acc.psd_ratio_by_condition,
+                "Upper tail": acc.psd_harmonics_ratio_by_condition,
+            },
+            {"Median": "mains_ratio", "Mean": "mains_ratio", "Upper tail": "mains_harmonics_ratio"},
         ),
-        epoch_variants=_summary_variants({}, {}, {}),
-        point_col="mains_ratio",
+        epoch_variants=_ordered_variant_specs("Mean", {"Median": {}, "Mean": {}, "Upper tail": {}}, {"Median": "mains_ratio", "Mean": "mains_ratio", "Upper tail": "mains_harmonics_ratio"}),
         unit_label="Relative power (unitless)",
-        formula_a="Default/Mean: mean_c mains_ratio[c]; Upper tail: mean_c harmonics_ratio[c].",
-        formula_b="Default/Mean: mains_ratio[c] per channel c; Upper tail: harmonics_ratio[c] per channel c.",
+        formula_a="Mean/Median: mean_c mains_ratio[c]; Upper tail: mean_c harmonics_ratio[c].",
+        formula_b="Mean/Median: mains_ratio[c] per channel c; Upper tail: harmonics_ratio[c] per channel c.",
         formula_c="Not available: epoch-wise PSD summaries are not stored in run derivatives.",
         topomap_payloads=acc.psd_topomap_by_condition,
+        fingerprint_spec=(
+            "mains_ratio",
+            "mains_harmonics_ratio",
+            "Mains relative power per recording",
+            "Harmonics relative power per recording",
+        ),
     ) + _condition_figure_blocks(
         {
             cond: plot_psd_median_band(_aggregate_psd_profiles(profiles), title=f"PSD profile ({cond})")
@@ -3781,36 +4129,70 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
 
     ecg_panel = _metric_panel(
         metric_name="ECG correlation",
-        rec_variants=_summary_variants(
-            _run_values_by_condition(df, "ecg_mean_abs_corr"),
-            _run_values_by_condition(df, "ecg_mean_abs_corr"),
-            _run_values_by_condition(df, "ecg_p95_abs_corr"),
+        rec_variants=_ordered_variant_specs(
+            "Mean",
+            {
+                "Median": _run_values_by_condition(df, "ecg_mean_abs_corr"),
+                "Mean": _run_values_by_condition(df, "ecg_mean_abs_corr"),
+                "Upper tail": _run_values_by_condition(df, "ecg_p95_abs_corr"),
+            },
+            {"Median": "ecg_mean_abs_corr", "Mean": "ecg_mean_abs_corr", "Upper tail": "ecg_p95_abs_corr"},
         ),
-        ch_variants=_summary_variants(acc.ecg_corr_by_condition, acc.ecg_corr_by_condition, acc.ecg_corr_by_condition),
-        epoch_variants=_summary_variants({}, {}, {}),
-        point_col="ecg_mean_abs_corr",
+        ch_variants=_ordered_variant_specs(
+            "Mean",
+            {
+                "Median": acc.ecg_corr_by_condition,
+                "Mean": acc.ecg_corr_by_condition,
+                "Upper tail": acc.ecg_corr_by_condition,
+            },
+            {"Median": "ecg_mean_abs_corr", "Mean": "ecg_mean_abs_corr", "Upper tail": "ecg_p95_abs_corr"},
+        ),
+        epoch_variants=_ordered_variant_specs("Mean", {"Median": {}, "Mean": {}, "Upper tail": {}}, {"Median": "ecg_mean_abs_corr", "Mean": "ecg_mean_abs_corr", "Upper tail": "ecg_p95_abs_corr"}),
         unit_label="|r| (unitless)",
-        formula_a="Default/Mean: mean_c |r[c]|; Upper tail: q95_c |r[c]|.",
-        formula_b="Channel values are |r[c]|. Mean and upper-tail variants coincide with the same channel-level distribution in stored outputs.",
+        formula_a="Mean/Median: mean_c |r[c]|; Upper tail: q95_c |r[c]|.",
+        formula_b="Channel values are |r[c]|. Median and mean variants coincide with stored channel-level magnitudes.",
         formula_c="Not available: epoch-wise ECG channel summaries are not stored in run derivatives.",
         topomap_payloads=acc.ecg_topomap_by_condition,
+        fingerprint_spec=(
+            "ecg_mean_abs_corr",
+            "ecg_p95_abs_corr",
+            "Mean |ECG correlation| per recording",
+            "Upper-tail |ECG correlation| per recording",
+        ),
     )
 
     eog_panel = _metric_panel(
         metric_name="EOG correlation",
-        rec_variants=_summary_variants(
-            _run_values_by_condition(df, "eog_mean_abs_corr"),
-            _run_values_by_condition(df, "eog_mean_abs_corr"),
-            _run_values_by_condition(df, "eog_p95_abs_corr"),
+        rec_variants=_ordered_variant_specs(
+            "Mean",
+            {
+                "Median": _run_values_by_condition(df, "eog_mean_abs_corr"),
+                "Mean": _run_values_by_condition(df, "eog_mean_abs_corr"),
+                "Upper tail": _run_values_by_condition(df, "eog_p95_abs_corr"),
+            },
+            {"Median": "eog_mean_abs_corr", "Mean": "eog_mean_abs_corr", "Upper tail": "eog_p95_abs_corr"},
         ),
-        ch_variants=_summary_variants(acc.eog_corr_by_condition, acc.eog_corr_by_condition, acc.eog_corr_by_condition),
-        epoch_variants=_summary_variants({}, {}, {}),
-        point_col="eog_mean_abs_corr",
+        ch_variants=_ordered_variant_specs(
+            "Mean",
+            {
+                "Median": acc.eog_corr_by_condition,
+                "Mean": acc.eog_corr_by_condition,
+                "Upper tail": acc.eog_corr_by_condition,
+            },
+            {"Median": "eog_mean_abs_corr", "Mean": "eog_mean_abs_corr", "Upper tail": "eog_p95_abs_corr"},
+        ),
+        epoch_variants=_ordered_variant_specs("Mean", {"Median": {}, "Mean": {}, "Upper tail": {}}, {"Median": "eog_mean_abs_corr", "Mean": "eog_mean_abs_corr", "Upper tail": "eog_p95_abs_corr"}),
         unit_label="|r| (unitless)",
-        formula_a="Default/Mean: mean_c |r[c]|; Upper tail: q95_c |r[c]|.",
-        formula_b="Channel values are |r[c]|. Mean and upper-tail variants coincide with the same channel-level distribution in stored outputs.",
+        formula_a="Mean/Median: mean_c |r[c]|; Upper tail: q95_c |r[c]|.",
+        formula_b="Channel values are |r[c]|. Median and mean variants coincide with stored channel-level magnitudes.",
         formula_c="Not available: epoch-wise EOG channel summaries are not stored in run derivatives.",
         topomap_payloads=acc.eog_topomap_by_condition,
+        fingerprint_spec=(
+            "eog_mean_abs_corr",
+            "eog_p95_abs_corr",
+            "Mean |EOG correlation| per recording",
+            "Upper-tail |EOG correlation| per recording",
+        ),
     )
 
     muscle_epoch_profiles = {
@@ -3819,26 +4201,43 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
     }
     muscle_panel = _metric_panel(
         metric_name="Muscle score",
-        rec_variants=_summary_variants(
-            _run_values_by_condition(df, "muscle_p95"),
-            _run_values_by_condition(df, "muscle_median"),
-            _run_values_by_condition(df, "muscle_p95"),
+        rec_variants=_ordered_variant_specs(
+            "Median",
+            {
+                "Median": _run_values_by_condition(df, "muscle_median"),
+                "Mean": _run_values_by_condition(df, "muscle_mean"),
+                "Upper tail": _run_values_by_condition(df, "muscle_p95"),
+            },
+            {"Median": "muscle_median", "Mean": "muscle_mean", "Upper tail": "muscle_p95"},
         ),
-        ch_variants=_summary_variants(
-            acc.muscle_scalar_by_condition,
-            acc.muscle_mean_by_condition,
-            acc.muscle_scalar_by_condition,
+        ch_variants=_ordered_variant_specs(
+            "Median",
+            {
+                "Median": _run_values_by_condition(df, "muscle_median"),
+                "Mean": _run_values_by_condition(df, "muscle_mean"),
+                "Upper tail": _run_values_by_condition(df, "muscle_p95"),
+            },
+            {"Median": "muscle_median", "Mean": "muscle_mean", "Upper tail": "muscle_p95"},
         ),
-        epoch_variants=_summary_variants(
-            _epoch_values_from_profiles(muscle_epoch_profiles, field="q50"),
-            _epoch_values_from_profiles(muscle_epoch_profiles, field="mean"),
-            _epoch_values_from_profiles(muscle_epoch_profiles, field="q95"),
+        epoch_variants=_ordered_variant_specs(
+            "Median",
+            {
+                "Median": _epoch_values_from_profiles(muscle_epoch_profiles, field="q50"),
+                "Mean": _epoch_values_from_profiles(muscle_epoch_profiles, field="mean"),
+                "Upper tail": _epoch_values_from_profiles(muscle_epoch_profiles, field="q95"),
+            },
+            {"Median": "muscle_median", "Mean": "muscle_mean", "Upper tail": "muscle_p95"},
         ),
-        point_col="muscle_p95",
         unit_label="Muscle score (z-score)",
-        formula_a="Default/Upper tail: q95_t score[t] per run; Mean: mean_t score[t] per run.",
-        formula_b="Default/Upper tail: q95_t score[t] per run; Mean: mean_t score[t] per run.",
-        formula_c="Epoch values are score[t] (single stored muscle profile per run). Mean and upper-tail variants use the same stored epoch sequence.",
+        formula_a="Median: median_t score[t] per run; Mean: mean_t score[t] per run; Upper tail: q95_t score[t] per run.",
+        formula_b="Stored run-level summaries are reused (single channel-agnostic muscle score sequence per run).",
+        formula_c="Epoch values are score[t] per run; Median/Mean/Upper tail are computed across pooled epoch values.",
+        fingerprint_spec=(
+            "muscle_median",
+            "muscle_p95",
+            "Median muscle score per recording",
+            "Upper-tail muscle score per recording",
+        ),
     ) + _condition_figure_blocks(
         {
             cond: plot_quantile_band_timecourse(
@@ -3869,8 +4268,8 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
 
     return (
         "<section>"
-        "<h2>Metric Details</h2>"
-        "<p>Each metric is organized into subtabs with three distribution views (recording, epochs-per-channel, channels-per-epoch), each with violin/histogram/density variants, followed by mean channel-epoch maps whose top strip includes median and quantile bands.</p>"
+        "<h2>QA metrics details</h2>"
+        "<p>Each metric has three distribution panels (A/B/C), summary variants (default metric summary first, then the two alternatives), and run fingerprint scatter for recording-level spread. STD and PtP also include channel-epoch heatmap variants.</p>"
         + metric_tabs
         + "</section>"
     )
@@ -4000,7 +4399,7 @@ def _build_statistical_appendix_section(acc: ChTypeAccumulator, amplitude_unit: 
 
     return (
         "<section>"
-        "<h2>Statistical Appendix</h2>"
+        "<h2>Cummulative distributions</h2>"
         "<p>Supplementary distribution views for readers who prefer cumulative representations.</p>"
         + _figure_block(std_ecdf, "Cumulative distribution of channel-level STD summaries.")
         + _figure_block(ptp_ecdf, "Cumulative distribution of channel-level PtP summaries.")
@@ -4036,19 +4435,10 @@ def _build_tab_content(tab_name: str, acc: ChTypeAccumulator, is_combined: bool)
         )
 
     sections = [
-        ("Cohort Overview", _build_cohort_overview_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
-        ("Task/Condition Effects", _build_condition_effect_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
-        ("Metric Details", _build_metric_details_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
-        ("Subject Drill-down", _build_subject_drilldown_section(acc, amplitude_unit=amplitude_unit)),
-        ("Statistical Appendix", _build_statistical_appendix_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
-        (
-            "Metadata & Missingness",
-            "<section><h2>Metadata & Missingness</h2>"
-            + _summary_table_html(acc)
-            + "<h3>Machine-readable derivatives used</h3>"
-            + _paths_html(acc.source_paths)
-            + "</section>",
-        ),
+        ("Cohort QA overview", _build_cohort_overview_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
+        ("QA metrics across tasks", _build_condition_effect_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
+        ("QA metrics details", _build_metric_details_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
+        ("Cummulative distributions", _build_statistical_appendix_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
     ]
     group_id = f"main-{re.sub(r'[^a-z0-9]+', '-', tab_name.lower())}"
     return combined_notice + _build_subtabs_html(group_id, sections, level=1)
@@ -4297,7 +4687,7 @@ def _build_report_html(
       </div>
       <h3>Settings snapshot</h3>
       <pre>{settings_snapshot}</pre>
-      <p><strong>Important:</strong> Cohort views summarize global footprints, while subject drill-down views preserve recording identity for interpretation.</p>
+      <p><strong>Important:</strong> Cohort QA overview combines global cohort footprints and subject-aware summaries; metric-level panels preserve recording identity in hover text.</p>
       <div class="tab-row">
         {"".join(tab_buttons)}
       </div>
@@ -4673,6 +5063,7 @@ def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], recor
                 acc.muscle_scalar_by_condition[condition_label].append(
                     float(np.nanquantile(scores, 0.95))
                 )
+                row.muscle_mean = _as_float(np.nanmean(scores))
                 row.muscle_median = _as_float(np.nanmedian(scores))
                 row.muscle_p95 = _as_float(np.nanquantile(scores, 0.95))
             acc.source_paths.add(str(files["Muscle"]))
