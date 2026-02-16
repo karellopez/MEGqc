@@ -1375,12 +1375,49 @@ def plot_topomap_if_available(
 def _figure_to_div(fig: Optional[go.Figure]) -> str:
     if fig is None:
         return "<p>No distribution is available for this section.</p>"
-    height = fig.layout.height
+    fig_out = go.Figure(fig)
+
+    # Global title/legend spacing guard: keep horizontal legends away from titles.
+    has_title = bool(getattr(getattr(fig_out.layout, "title", None), "text", None))
+    legend_obj = getattr(fig_out.layout, "legend", None)
+    has_legend = legend_obj is not None
+    legend_orientation = str(getattr(legend_obj, "orientation", "") or "").lower() if has_legend else ""
+    has_horizontal_legend = legend_orientation == "h"
+
+    if has_title:
+        title_json = fig_out.layout.title.to_plotly_json() if fig_out.layout.title is not None else {}
+        title_pad = dict(title_json.get("pad", {}))
+        title_pad["b"] = max(int(title_pad.get("b", 0) or 0), 18)
+        title_pad["t"] = max(int(title_pad.get("t", 0) or 0), 10)
+        title_json["pad"] = title_pad
+        fig_out.update_layout(title=title_json)
+
+    if has_horizontal_legend:
+        legend_json = fig_out.layout.legend.to_plotly_json() if fig_out.layout.legend is not None else {}
+        legend_json["yanchor"] = "bottom"
+        y_val = legend_json.get("y", 1.02)
+        try:
+            y_num = float(y_val)
+        except Exception:
+            y_num = 1.02
+        legend_json["y"] = max(1.10, y_num)
+        fig_out.update_layout(legend=legend_json)
+
+    margin_json = fig_out.layout.margin.to_plotly_json() if fig_out.layout.margin is not None else {}
+    top_margin = int(margin_json.get("t", 65) or 65)
+    if has_title:
+        top_margin = max(top_margin, 90)
+    if has_horizontal_legend:
+        top_margin = max(top_margin, 130)
+    margin_json["t"] = top_margin
+    fig_out.update_layout(margin=margin_json)
+
+    height = fig_out.layout.height
     if height is None or not np.isfinite(height):
         height = 640
     height_px = f"{int(max(420, float(height)))}px"
     return pio.to_html(
-        fig,
+        fig_out,
         full_html=False,
         include_plotlyjs=False,
         default_height=height_px,
@@ -2336,6 +2373,7 @@ def plot_violin_with_subject_jitter(
         keep = _downsample_indices(vals.size, MAX_POINTS_VIOLIN)
         vals = vals[keep]
         color = palette[idx % len(palette)]
+        group_id = f"group::{label}"
         fig.add_trace(
             go.Violin(
                 x=np.full(vals.size, xpos[label], dtype=float),
@@ -2346,7 +2384,8 @@ def plot_violin_with_subject_jitter(
                 points=False,
                 line={"width": 1.0, "color": color},
                 opacity=0.45,
-                showlegend=False,
+                legendgroup=group_id,
+                showlegend=True,
             )
         )
         kde = _kde_curve(vals)
@@ -2362,6 +2401,7 @@ def plot_violin_with_subject_jitter(
                         mode="lines",
                         line={"width": 1.5, "color": color},
                         opacity=0.9,
+                        legendgroup=group_id,
                         showlegend=False,
                         hovertemplate=f"{label}<br>{y_title}=%{{y:.3g}}<br>density=%{{customdata:.3g}}<extra></extra>",
                         customdata=kde_y,
@@ -2418,28 +2458,33 @@ def plot_violin_with_subject_jitter(
     if not points_data.empty:
         keep = _downsample_indices(len(points_data), min(MAX_POINTS_SCATTER, len(points_data)))
         points_data = points_data.iloc[keep].copy()
-        subj_codes = pd.Categorical(points_data["subject"]).codes.astype(float)
+        points_data["subj_code"] = pd.Categorical(points_data["subject"]).codes.astype(float)
         rng = np.random.default_rng(0)
-        x_numeric = np.asarray([xpos[l] for l in points_data["label"]], dtype=float)
-        x_numeric = x_numeric + rng.uniform(-0.17, 0.17, size=x_numeric.size)
-        fig.add_trace(
-            go.Scattergl(
-                x=x_numeric,
-                y=points_data["value"],
-                mode="markers",
-                marker={
-                    "size": 6,
-                    "color": subj_codes,
-                    "colorscale": "Turbo",
-                    "opacity": 0.7,
-                    "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
-                    "showscale": False,
-                },
-                customdata=np.stack([points_data["hover"]], axis=-1),
-                hovertemplate="%{customdata[0]}<br>value=%{y:.3g}<extra></extra>",
-                showlegend=False,
+        for label in labels:
+            group_points = points_data.loc[points_data["label"] == label].copy()
+            if group_points.empty:
+                continue
+            x_numeric = np.full(group_points.shape[0], xpos[label], dtype=float)
+            x_numeric = x_numeric + rng.uniform(-0.17, 0.17, size=x_numeric.size)
+            fig.add_trace(
+                go.Scattergl(
+                    x=x_numeric,
+                    y=group_points["value"],
+                    mode="markers",
+                    marker={
+                        "size": 6,
+                        "color": group_points["subj_code"],
+                        "colorscale": "Turbo",
+                        "opacity": 0.7,
+                        "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
+                        "showscale": False,
+                    },
+                    customdata=np.stack([group_points["hover"]], axis=-1),
+                    hovertemplate="%{customdata[0]}<br>value=%{y:.3g}<extra></extra>",
+                    legendgroup=f"group::{label}",
+                    showlegend=False,
+                )
             )
-        )
 
     fig.update_layout(
         title={"text": title, "x": 0.5},
@@ -2447,6 +2492,14 @@ def plot_violin_with_subject_jitter(
         yaxis_title=y_title,
         template="plotly_white",
         margin={"l": 55, "r": 20, "t": 65, "b": 50},
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "left",
+            "x": 0,
+            "groupclick": "togglegroup",
+        },
     )
     fig.update_xaxes(
         tickmode="array",
@@ -4566,18 +4619,20 @@ def _build_report_html(
       margin-top: 12px;
     }}
     .tab-btn {{
-      border: 1px solid #c5d9f0;
+      border: 1px solid #99bbe5;
       border-radius: 10px;
-      background: #f4f9ff;
+      background: #e7f1ff;
       padding: 8px 14px;
       cursor: pointer;
       font-size: 14px;
-      color: #21415c;
+      color: #1f3b63;
+      font-weight: 600;
     }}
     .tab-btn.active {{
-      background: #e2f0ff;
-      border-color: #8db5dd;
-      font-weight: 600;
+      background: #1d4ed8;
+      border-color: #1d4ed8;
+      color: #ffffff;
+      font-weight: 700;
     }}
     .tab-content {{
       display: none;
@@ -4599,47 +4654,49 @@ def _build_report_html(
       margin-top: 10px;
     }}
     .subtab-group.level-1 {{
-      background: #f1f7ff;
-      border-color: #c5daf1;
+      background: #dbeafe;
+      border-color: #7fb0ea;
     }}
     .subtab-group.level-2 {{
-      background: #f7fbff;
-      border-color: #d4e4f7;
+      background: #ecf5ff;
+      border-color: #a8c8ee;
     }}
     .subtab-group.level-3 {{
-      background: #fbfdff;
-      border-color: #dce9f8;
+      background: #f5f9ff;
+      border-color: #c1d8f2;
     }}
     .subtab-group.level-4 {{
       background: #ffffff;
-      border-color: #e6eef9;
+      border-color: #d9e6f7;
     }}
     .subtab-group.level-1 > .subtab-row .subtab-btn {{
-      background: #eaf3ff;
-      border-color: #9ebfe4;
+      background: #cfe3ff;
+      border-color: #79a9e4;
       font-weight: 600;
     }}
     .subtab-group.level-2 > .subtab-row .subtab-btn {{
-      background: #f0f7ff;
-      border-color: #bdd4ee;
+      background: #e2efff;
+      border-color: #9fc2e8;
     }}
     .subtab-group.level-3 > .subtab-row .subtab-btn {{
-      background: #f6fbff;
-      border-color: #cddff2;
+      background: #edf5ff;
+      border-color: #b2cfea;
     }}
     .subtab-btn {{
-      border: 1px solid #c8daee;
+      border: 1px solid #9fc2e8;
       border-radius: 9px;
-      background: #f8fbff;
+      background: #eaf3ff;
       padding: 6px 10px;
       cursor: pointer;
       font-size: 13px;
-      color: #27475f;
+      color: #1f3f61;
+      font-weight: 600;
     }}
     .subtab-btn.active {{
-      background: #e9f3ff;
-      border-color: #8db5dd;
-      font-weight: 600;
+      background: #cfe3ff;
+      border-color: #79a9e4;
+      color: #16a34a;
+      font-weight: 700;
     }}
     .subtab-content {{
       display: none;
@@ -4653,18 +4710,40 @@ def _build_report_html(
       margin: 6px 0 10px;
     }}
     .fig-switch-btn {{
-      border: 1px solid #c8daee;
+      border: 1px solid #9fc2e8;
       border-radius: 8px;
-      background: #f8fbff;
+      background: #eaf3ff;
       padding: 5px 10px;
       font-size: 12px;
-      color: #24445d;
+      color: #1f3f61;
       cursor: pointer;
     }}
     .fig-switch-btn.active {{
-      background: #e9f3ff;
+      background: #d9ebff;
       border-color: #8db5dd;
+      color: #16a34a;
       font-weight: 600;
+    }}
+    .report-tools {{
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }}
+    .tool-btn {{
+      border: 1px solid #7da9dd;
+      border-radius: 9px;
+      background: #dbeafe;
+      padding: 7px 12px;
+      font-size: 13px;
+      color: #143a63;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .tool-btn.active {{
+      background: #1d4ed8;
+      border-color: #1d4ed8;
+      color: #ffffff;
     }}
     .fig-view {{
       display: none;
@@ -4688,6 +4767,9 @@ def _build_report_html(
       <h3>Settings snapshot</h3>
       <pre>{settings_snapshot}</pre>
       <p><strong>Important:</strong> Cohort QA overview combines global cohort footprints and subject-aware summaries; metric-level panels preserve recording identity in hover text.</p>
+      <div class="report-tools">
+        <button id="grid-toggle-btn" class="tool-btn active" type="button">Hide grids</button>
+      </div>
       <div class="tab-row">
         {"".join(tab_buttons)}
       </div>
@@ -4699,6 +4781,43 @@ def _build_report_html(
       // Top-level tab activation and responsive plot resizing.
       const buttons = Array.from(document.querySelectorAll('.tab-btn'));
       const tabs = Array.from(document.querySelectorAll('.tab-content'));
+      const gridToggleBtn = document.getElementById('grid-toggle-btn');
+      let gridsVisible = true;
+
+      function applyGridToPlot(plotEl, show) {{
+        if (typeof Plotly === 'undefined' || !plotEl) {{
+          return;
+        }}
+        const layout = plotEl.layout || {{}};
+        const axisKeys = Object.keys(layout).filter((k) => k.startsWith('xaxis') || k.startsWith('yaxis'));
+        const relayoutUpdate = {{}};
+        if (axisKeys.length === 0) {{
+          relayoutUpdate['xaxis.showgrid'] = show;
+          relayoutUpdate['yaxis.showgrid'] = show;
+        }} else {{
+          axisKeys.forEach((k) => {{
+            relayoutUpdate[`${{k}}.showgrid`] = show;
+          }});
+        }}
+        try {{
+          Plotly.relayout(plotEl, relayoutUpdate);
+        }} catch (err) {{
+          // no-op
+        }}
+      }}
+
+      function applyGridState(show, scopeRoot) {{
+        const scope = scopeRoot || document;
+        const plots = Array.from(scope.querySelectorAll('.js-plotly-plot'));
+        plots.forEach((plotEl) => applyGridToPlot(plotEl, show));
+      }}
+
+      function updateGridButtonState() {{
+        if (!gridToggleBtn) return;
+        gridToggleBtn.textContent = gridsVisible ? 'Hide grids' : 'Show grids';
+        gridToggleBtn.classList.toggle('active', gridsVisible);
+      }}
+
       function resizePlots(targetId) {{
         if (typeof Plotly === 'undefined') {{
           return;
@@ -4715,6 +4834,9 @@ def _build_report_html(
             // no-op
           }}
         }});
+        if (!gridsVisible) {{
+          applyGridState(false, root);
+        }}
       }}
       function activate(targetId) {{
         tabs.forEach(t => t.classList.toggle('active', t.id === targetId));
@@ -4729,6 +4851,14 @@ def _build_report_html(
       }});
       if (buttons.length > 0) {{
         activate(buttons[0].dataset.target);
+      }}
+      if (gridToggleBtn) {{
+        updateGridButtonState();
+        gridToggleBtn.addEventListener('click', () => {{
+          gridsVisible = !gridsVisible;
+          applyGridState(gridsVisible, document);
+          updateGridButtonState();
+        }});
       }}
       function activateSubtab(groupId, targetId) {{
         const subButtons = Array.from(document.querySelectorAll(`.subtab-btn[data-tab-group="${{groupId}}"]`));
