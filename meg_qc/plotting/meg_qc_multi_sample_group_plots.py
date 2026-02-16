@@ -41,9 +41,11 @@ from meg_qc.plotting.meg_qc_group_plots import (
     _epoch_values_from_profiles,
     _figure_block,
     _finite_array,
+    _lazy_figure_store_json,
     _load_settings_snapshot,
     _make_ecdf_figure,
     _mean_matrices_by_condition,
+    _reset_lazy_figure_store,
     _run_rows_dataframe,
     _update_accumulator_for_run,
     plot_density_distribution,
@@ -1071,6 +1073,7 @@ def _build_multi_sample_report_html(
     bundles: Sequence[SampleBundle],
     tab_order: Sequence[str],
 ) -> str:
+    _reset_lazy_figure_store()
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     version = getattr(meg_qc, "__version__", "unknown")
     sample_names = ", ".join(bundle.sample_id for bundle in bundles)
@@ -1083,6 +1086,7 @@ def _build_multi_sample_report_html(
         tab_buttons.append(f"<button class='tab-btn{active_class}' data-target='{tab_id}'>{tab}</button>")
         content = _build_tab_content(bundles, tab)
         tab_divs.append(f"<div id='{tab_id}' class='tab-content{active_class}'>{content}</div>")
+    lazy_figure_store_json = _lazy_figure_store_json()
 
     sample_rows = "".join(
         "<li>"
@@ -1339,12 +1343,49 @@ def _build_multi_sample_report_html(
       {"".join(tab_divs)}
     </section>
   </main>
+  <script id=\"lazy-plot-store\" type=\"application/json\">{lazy_figure_store_json}</script>
   <script>
     (function() {{
       const buttons = Array.from(document.querySelectorAll('.tab-btn'));
       const tabs = Array.from(document.querySelectorAll('.tab-content'));
       const gridToggleBtn = document.getElementById('grid-toggle-btn');
+      const lazyStoreEl = document.getElementById('lazy-plot-store');
+      let lazyFigureStore = {{}};
+      if (lazyStoreEl && lazyStoreEl.textContent) {{
+        try {{
+          lazyFigureStore = JSON.parse(lazyStoreEl.textContent);
+        }} catch (err) {{
+          lazyFigureStore = {{}};
+        }}
+      }}
       let gridsVisible = true;
+
+      function renderLazyInScope(scopeRoot) {{
+        if (typeof Plotly === 'undefined') {{
+          return;
+        }}
+        const scope = scopeRoot || document;
+        const placeholders = Array.from(scope.querySelectorAll('.js-lazy-plot'));
+        placeholders.forEach((el) => {{
+          if (el.dataset.rendered === '1') {{
+            return;
+          }}
+          if (el.offsetParent === null) {{
+            return;
+          }}
+          const figId = el.dataset.figId;
+          const payload = lazyFigureStore[figId];
+          if (!payload || !payload.figure) {{
+            return;
+          }}
+          try {{
+            Plotly.newPlot(el, payload.figure.data || [], payload.figure.layout || {{}}, payload.config || {{responsive: true, displaylogo: false}});
+            el.dataset.rendered = '1';
+          }} catch (err) {{
+            // no-op
+          }}
+        }});
+      }}
 
       function applyGridToPlot(plotEl, show) {{
         if (typeof Plotly === 'undefined' || !plotEl) {{
@@ -1388,6 +1429,7 @@ def _build_multi_sample_report_html(
         if (!root) {{
           return;
         }}
+        renderLazyInScope(root);
         const plots = Array.from(root.querySelectorAll('.js-plotly-plot'));
         plots.forEach((plotEl) => {{
           try {{
@@ -1431,6 +1473,10 @@ def _build_multi_sample_report_html(
         const subPanels = Array.from(document.querySelectorAll(`.subtab-content[data-tab-group="${{groupId}}"]`));
         subPanels.forEach(p => p.classList.toggle('active', p.id === targetId));
         subButtons.forEach(b => b.classList.toggle('active', b.dataset.target === targetId));
+        const activePanel = document.getElementById(targetId);
+        if (activePanel) {{
+          renderLazyInScope(activePanel);
+        }}
         const activeTop = tabs.find(t => t.classList.contains('active'));
         if (activeTop) {{
           window.requestAnimationFrame(() => resizePlots(activeTop.id));
@@ -1463,6 +1509,10 @@ def _build_multi_sample_report_html(
         const norm = document.getElementById(`${{toggleId}}-norm`);
         if (raw) raw.classList.toggle('active', `${{toggleId}}-raw` === targetId);
         if (norm) norm.classList.toggle('active', `${{toggleId}}-norm` === targetId);
+        const activeView = document.getElementById(targetId);
+        if (activeView) {{
+          renderLazyInScope(activeView);
+        }}
         const activeTop = tabs.find(t => t.classList.contains('active'));
         if (activeTop) {{
           window.requestAnimationFrame(() => resizePlots(activeTop.id));

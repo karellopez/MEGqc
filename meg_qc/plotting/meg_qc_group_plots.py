@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import configparser
 import datetime as dt
+import json
 import os
 import re
 import warnings
@@ -26,7 +27,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.io as pio
+from plotly.utils import PlotlyJSONEncoder
 from plotly.subplots import make_subplots
 from pandas.errors import DtypeWarning
 
@@ -44,6 +45,8 @@ MAX_HEATMAP_CHANNELS = 350
 MAX_RECORDINGS_OVERVIEW = 2200
 MAX_SUBJECT_LINES = 160
 _FIG_TOGGLE_COUNTER = count(1)
+_LAZY_PLOT_COUNTER = count(1)
+_LAZY_FIGURE_STORE: Dict[str, Dict[str, object]] = {}
 TESLA_TO_PICO = 1e12
 
 
@@ -1372,6 +1375,27 @@ def plot_topomap_if_available(
     return fig
 
 
+def _reset_lazy_figure_store() -> None:
+    """Reset per-report lazy plot storage before composing HTML."""
+    global _LAZY_PLOT_COUNTER
+    _LAZY_FIGURE_STORE.clear()
+    _LAZY_PLOT_COUNTER = count(1)
+
+
+def _lazy_figure_store_json() -> str:
+    """Serialize lazy figure store to JSON for client-side rendering."""
+    return json.dumps(_LAZY_FIGURE_STORE, cls=PlotlyJSONEncoder, separators=(",", ":"))
+
+
+def _register_lazy_figure(fig: go.Figure, *, height_px: str) -> str:
+    fig_id = f"lazy-plot-{next(_LAZY_PLOT_COUNTER)}"
+    _LAZY_FIGURE_STORE[fig_id] = {
+        "figure": fig.to_plotly_json(),
+        "config": {"responsive": True, "displaylogo": False},
+    }
+    return f"<div id='{fig_id}' class='js-lazy-plot' data-fig-id='{fig_id}' style='height:{height_px}; width:100%;'></div>"
+
+
 def _figure_to_div(fig: Optional[go.Figure]) -> str:
     if fig is None:
         return "<p>No distribution is available for this section.</p>"
@@ -1407,14 +1431,7 @@ def _figure_to_div(fig: Optional[go.Figure]) -> str:
     if height is None or not np.isfinite(height):
         height = 640
     height_px = f"{int(max(420, float(height)))}px"
-    return pio.to_html(
-        fig_out,
-        full_html=False,
-        include_plotlyjs=False,
-        default_height=height_px,
-        default_width="100%",
-        config={"responsive": True, "displaylogo": False},
-    )
+    return _register_lazy_figure(fig_out, height_px=height_px)
 
 
 def _trace_numeric(values) -> Optional[np.ndarray]:
@@ -4494,6 +4511,7 @@ def _build_report_html(
     settings_snapshot: str,
 ) -> str:
     """Compose the self-contained HTML report (tabs + plots + client JS)."""
+    _reset_lazy_figure_store()
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     version = getattr(meg_qc, "__version__", "unknown")
     tab_order = ["Combined (mag+grad)", "MAG", "GRAD"]
@@ -4509,6 +4527,7 @@ def _build_report_html(
         tab_buttons.append(f"<button class='tab-btn{active_class}' data-target='{tab_id}'>{tab}</button>")
         content = _build_tab_content(tab, tab_accumulators[tab], is_combined=(tab == "Combined (mag+grad)"))
         tab_divs.append(f"<div id='{tab_id}' class='tab-content{active_class}'>{content}</div>")
+    lazy_figure_store_json = _lazy_figure_store_json()
 
     return f"""
 <!DOCTYPE html>
@@ -4767,13 +4786,50 @@ def _build_report_html(
       {"".join(tab_divs)}
     </section>
   </main>
+  <script id="lazy-plot-store" type="application/json">{lazy_figure_store_json}</script>
   <script>
     (function() {{
       // Top-level tab activation and responsive plot resizing.
       const buttons = Array.from(document.querySelectorAll('.tab-btn'));
       const tabs = Array.from(document.querySelectorAll('.tab-content'));
       const gridToggleBtn = document.getElementById('grid-toggle-btn');
+      const lazyStoreEl = document.getElementById('lazy-plot-store');
+      let lazyFigureStore = {{}};
+      if (lazyStoreEl && lazyStoreEl.textContent) {{
+        try {{
+          lazyFigureStore = JSON.parse(lazyStoreEl.textContent);
+        }} catch (err) {{
+          lazyFigureStore = {{}};
+        }}
+      }}
       let gridsVisible = true;
+
+      function renderLazyInScope(scopeRoot) {{
+        if (typeof Plotly === 'undefined') {{
+          return;
+        }}
+        const scope = scopeRoot || document;
+        const placeholders = Array.from(scope.querySelectorAll('.js-lazy-plot'));
+        placeholders.forEach((el) => {{
+          if (el.dataset.rendered === '1') {{
+            return;
+          }}
+          if (el.offsetParent === null) {{
+            return;
+          }}
+          const figId = el.dataset.figId;
+          const payload = lazyFigureStore[figId];
+          if (!payload || !payload.figure) {{
+            return;
+          }}
+          try {{
+            Plotly.newPlot(el, payload.figure.data || [], payload.figure.layout || {{}}, payload.config || {{responsive: true, displaylogo: false}});
+            el.dataset.rendered = '1';
+          }} catch (err) {{
+            // no-op
+          }}
+        }});
+      }}
 
       function applyGridToPlot(plotEl, show) {{
         if (typeof Plotly === 'undefined' || !plotEl) {{
@@ -4817,6 +4873,7 @@ def _build_report_html(
         if (!root) {{
           return;
         }}
+        renderLazyInScope(root);
         const plots = Array.from(root.querySelectorAll('.js-plotly-plot'));
         plots.forEach((plotEl) => {{
           try {{
@@ -4856,6 +4913,10 @@ def _build_report_html(
         const subPanels = Array.from(document.querySelectorAll(`.subtab-content[data-tab-group="${{groupId}}"]`));
         subPanels.forEach(p => p.classList.toggle('active', p.id === targetId));
         subButtons.forEach(b => b.classList.toggle('active', b.dataset.target === targetId));
+        const activePanel = document.getElementById(targetId);
+        if (activePanel) {{
+          renderLazyInScope(activePanel);
+        }}
         const activeTop = tabs.find(t => t.classList.contains('active'));
         if (activeTop) {{
           window.requestAnimationFrame(() => resizePlots(activeTop.id));
@@ -4887,6 +4948,10 @@ def _build_report_html(
         const norm = document.getElementById(`${{toggleId}}-norm`);
         if (raw) raw.classList.toggle('active', `${{toggleId}}-raw` === targetId);
         if (norm) norm.classList.toggle('active', `${{toggleId}}-norm` === targetId);
+        const activeView = document.getElementById(targetId);
+        if (activeView) {{
+          renderLazyInScope(activeView);
+        }}
         const activeTop = tabs.find(t => t.classList.contains('active'));
         if (activeTop) {{
           window.requestAnimationFrame(() => resizePlots(activeTop.id));
