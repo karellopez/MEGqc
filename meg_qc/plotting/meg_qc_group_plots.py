@@ -7,7 +7,7 @@ from ``derivatives/Meg_QC/calculation`` and writes group-level HTML reports to
 
 Public entrypoint
 -----------------
-``make_group_plots_meg_qc(dataset_path, derivatives_base=None)``
+``make_group_plots_meg_qc(dataset_path, derivatives_base=None, n_jobs=1)``
 """
 
 from __future__ import annotations
@@ -30,6 +30,11 @@ import plotly.graph_objects as go
 from plotly.utils import PlotlyJSONEncoder
 from plotly.subplots import make_subplots
 from pandas.errors import DtypeWarning
+try:
+    from joblib import Parallel, delayed
+except Exception:
+    Parallel = None
+    delayed = None
 
 import meg_qc
 
@@ -67,6 +72,18 @@ class RunMeta:
 class RunRecord:
     meta: RunMeta
     files: Dict[str, Path] = field(default_factory=dict)
+
+
+@dataclass
+class LoadedRunData:
+    std_data: Dict[str, np.ndarray] = field(default_factory=dict)
+    ptp_data: Dict[str, np.ndarray] = field(default_factory=dict)
+    psd_data: Dict[str, Tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    ecg_raw_data: Dict[str, np.ndarray] = field(default_factory=dict)
+    eog_raw_data: Dict[str, np.ndarray] = field(default_factory=dict)
+    muscle_data: Dict[str, np.ndarray] = field(default_factory=dict)
+    ptp_desc: Optional[str] = None
+    layout_cache: Dict[str, Dict[str, "SensorLayout"]] = field(default_factory=dict)
 
 
 @dataclass
@@ -5061,50 +5078,28 @@ def _build_report_html(
 """
 
 
-def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], record: RunRecord) -> None:
-    """Ingest one run into accumulators using a streaming summary strategy.
-
-    The function loads only one run's derivative files, computes compact
-    summaries needed for plotting, and appends them to condition/channel-type
-    accumulators. This keeps memory bounded for large cohorts.
-    """
+def _update_accumulator_for_loaded_run(
+    acc_by_type: Dict[str, ChTypeAccumulator],
+    record: RunRecord,
+    loaded: LoadedRunData,
+) -> None:
+    """Update accumulators for a run using preloaded derivative arrays."""
     files = record.files
     condition_label = _condition_label(record.meta)
 
-    std_data: Dict[str, np.ndarray] = {}
-    ptp_data: Dict[str, np.ndarray] = {}
-    psd_data: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-    ecg_raw_data: Dict[str, np.ndarray] = {}
-    eog_raw_data: Dict[str, np.ndarray] = {}
-    muscle_data: Dict[str, np.ndarray] = {}
-
-    ptp_desc = None
-
-    if "STDs" in files:
-        std_data = _load_std_or_ptp_matrix(files["STDs"], "STD epoch_", "STD all")
-    if "PtPsManual" in files:
-        ptp_desc = "PtPsManual"
-        ptp_data = _load_std_or_ptp_matrix(files["PtPsManual"], "PtP epoch_", "PtP all")
-    elif "PtPsAuto" in files:
-        ptp_desc = "PtPsAuto"
-        ptp_data = _load_std_or_ptp_matrix(files["PtPsAuto"], "PtP epoch_", "PtP all")
-    if "PSDs" in files:
-        psd_data = _load_psd_matrix(files["PSDs"])
-    if "ECGs" in files:
-        ecg_raw_data = _load_correlation_values(files["ECGs"], "ecg")
-    if "EOGs" in files:
-        eog_raw_data = _load_correlation_values(files["EOGs"], "eog")
-    if "Muscle" in files:
-        muscle_data = _load_muscle_scores(files["Muscle"])
-
-    layout_cache: Dict[str, Dict[str, SensorLayout]] = {}
+    std_data = loaded.std_data
+    ptp_data = loaded.ptp_data
+    psd_data = loaded.psd_data
+    ecg_raw_data = loaded.ecg_raw_data
+    eog_raw_data = loaded.eog_raw_data
+    muscle_data = loaded.muscle_data
+    ptp_desc = loaded.ptp_desc
+    layout_cache = loaded.layout_cache
 
     def _layout_by_desc(desc: str) -> Dict[str, SensorLayout]:
         if desc not in files:
             return {}
-        if desc not in layout_cache:
-            layout_cache[desc] = _load_sensor_layout(files[desc])
-        return layout_cache[desc]
+        return layout_cache.get(desc, {})
 
     run_ch_types = set()
     run_ch_types.update(std_data.keys())
@@ -5347,9 +5342,411 @@ def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], recor
                 acc.module_missing[module] += 1
 
 
+def _load_run_data(record: RunRecord) -> LoadedRunData:
+    """Load per-run machine-readable arrays once for optional parallel prefetch."""
+    files = record.files
+
+    std_data: Dict[str, np.ndarray] = {}
+    ptp_data: Dict[str, np.ndarray] = {}
+    psd_data: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    ecg_raw_data: Dict[str, np.ndarray] = {}
+    eog_raw_data: Dict[str, np.ndarray] = {}
+    muscle_data: Dict[str, np.ndarray] = {}
+    ptp_desc: Optional[str] = None
+
+    if "STDs" in files:
+        std_data = _load_std_or_ptp_matrix(files["STDs"], "STD epoch_", "STD all")
+    if "PtPsManual" in files:
+        ptp_desc = "PtPsManual"
+        ptp_data = _load_std_or_ptp_matrix(files["PtPsManual"], "PtP epoch_", "PtP all")
+    elif "PtPsAuto" in files:
+        ptp_desc = "PtPsAuto"
+        ptp_data = _load_std_or_ptp_matrix(files["PtPsAuto"], "PtP epoch_", "PtP all")
+    if "PSDs" in files:
+        psd_data = _load_psd_matrix(files["PSDs"])
+    if "ECGs" in files:
+        ecg_raw_data = _load_correlation_values(files["ECGs"], "ecg")
+    if "EOGs" in files:
+        eog_raw_data = _load_correlation_values(files["EOGs"], "eog")
+    if "Muscle" in files:
+        muscle_data = _load_muscle_scores(files["Muscle"])
+
+    layout_cache: Dict[str, Dict[str, SensorLayout]] = {}
+    for desc in ("STDs", "PSDs", "ECGs", "EOGs"):
+        if desc in files:
+            layout_cache[desc] = _load_sensor_layout(files[desc])
+    if ptp_desc is not None and ptp_desc in files:
+        layout_cache[ptp_desc] = _load_sensor_layout(files[ptp_desc])
+
+    return LoadedRunData(
+        std_data=std_data,
+        ptp_data=ptp_data,
+        psd_data=psd_data,
+        ecg_raw_data=ecg_raw_data,
+        eog_raw_data=eog_raw_data,
+        muscle_data=muscle_data,
+        ptp_desc=ptp_desc,
+        layout_cache=layout_cache,
+    )
+
+
+def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], record: RunRecord) -> None:
+    """Sequential update entrypoint (single-run read + aggregation)."""
+    loaded = _load_run_data(record)
+    _update_accumulator_for_loaded_run(acc_by_type, record, loaded)
+
+
+def _normalize_n_jobs(n_jobs: int) -> int:
+    try:
+        n_jobs = int(n_jobs)
+    except Exception as exc:
+        raise ValueError(f"n_jobs must be an integer, got {n_jobs!r}") from exc
+    if n_jobs == 0:
+        raise ValueError("n_jobs cannot be 0. Use 1 for sequential or -1 for all cores.")
+    return n_jobs
+
+
+def _merge_list_map(dst: Dict[str, List], src: Dict[str, List]) -> None:
+    for key, vals in src.items():
+        if vals:
+            dst[key].extend(vals)
+
+
+def _merge_sum_count_dict(
+    dst_sum: Dict[str, np.ndarray],
+    dst_count: Dict[str, np.ndarray],
+    src_sum: Dict[str, np.ndarray],
+    src_count: Dict[str, np.ndarray],
+) -> None:
+    for cond, src_sum_matrix in src_sum.items():
+        s = np.asarray(src_sum_matrix, dtype=float)
+        if s.ndim != 2 or s.size == 0:
+            continue
+        c = np.asarray(src_count.get(cond, np.zeros_like(s, dtype=float)), dtype=float)
+        if c.shape != s.shape:
+            c = np.zeros_like(s, dtype=float)
+
+        if cond not in dst_sum:
+            dst_sum[cond] = s.copy()
+            dst_count[cond] = c.copy()
+            continue
+
+        prev_s = np.asarray(dst_sum[cond], dtype=float)
+        prev_c = np.asarray(dst_count.get(cond, np.zeros_like(prev_s, dtype=float)), dtype=float)
+        n_rows = max(prev_s.shape[0], s.shape[0])
+        n_cols = max(prev_s.shape[1], s.shape[1])
+
+        def _pad(a: np.ndarray) -> np.ndarray:
+            if a.shape == (n_rows, n_cols):
+                return a
+            return np.pad(
+                a,
+                ((0, n_rows - a.shape[0]), (0, n_cols - a.shape[1])),
+                mode="constant",
+                constant_values=0.0,
+            )
+
+        dst_sum[cond] = _pad(prev_s) + _pad(s)
+        dst_count[cond] = _pad(prev_c) + _pad(c)
+
+
+def _merge_topomap_mean_dict(
+    dst_payloads: Dict[str, TopomapPayload],
+    dst_counts: Dict[str, np.ndarray],
+    src_payloads: Dict[str, TopomapPayload],
+    src_counts: Dict[str, np.ndarray],
+) -> None:
+    for cond, src_payload in src_payloads.items():
+        src_vals = np.asarray(src_payload.values, dtype=float).reshape(-1)
+        src_cnt = np.asarray(
+            src_counts.get(cond, np.isfinite(src_vals).astype(float)),
+            dtype=float,
+        ).reshape(-1)
+        if src_vals.size == 0:
+            continue
+
+        if cond not in dst_payloads:
+            dst_payloads[cond] = TopomapPayload(
+                layout=SensorLayout(
+                    x=np.asarray(src_payload.layout.x, dtype=float).copy(),
+                    y=np.asarray(src_payload.layout.y, dtype=float).copy(),
+                    names=list(src_payload.layout.names),
+                ),
+                values=src_vals.copy(),
+            )
+            dst_counts[cond] = src_cnt.copy()
+            continue
+
+        dst_payload = dst_payloads[cond]
+        dst_vals = np.asarray(dst_payload.values, dtype=float).reshape(-1)
+        dst_cnt = np.asarray(
+            dst_counts.get(cond, np.isfinite(dst_vals).astype(float)),
+            dtype=float,
+        ).reshape(-1)
+
+        m = min(
+            dst_vals.size,
+            src_vals.size,
+            dst_cnt.size,
+            src_cnt.size,
+            len(dst_payload.layout.names),
+            dst_payload.layout.x.size,
+            dst_payload.layout.y.size,
+        )
+        if m < 1:
+            continue
+
+        a_vals = dst_vals[:m]
+        b_vals = src_vals[:m]
+        a_cnt = dst_cnt[:m]
+        b_cnt = src_cnt[:m]
+        num = np.where(np.isfinite(a_vals), a_vals, 0.0) * a_cnt + np.where(np.isfinite(b_vals), b_vals, 0.0) * b_cnt
+        den = a_cnt + b_cnt
+        out = np.full(m, np.nan, dtype=float)
+        np.divide(num, np.maximum(den, np.finfo(float).eps), out=out, where=den > 0)
+
+        dst_payloads[cond] = TopomapPayload(
+            layout=SensorLayout(
+                x=np.asarray(dst_payload.layout.x[:m], dtype=float),
+                y=np.asarray(dst_payload.layout.y[:m], dtype=float),
+                names=list(dst_payload.layout.names[:m]),
+            ),
+            values=out,
+        )
+        dst_counts[cond] = den
+
+
+def _merge_representative_state(
+    dst_matrix: Dict[str, np.ndarray],
+    dst_score: Dict[str, float],
+    dst_history: Dict[str, List[float]],
+    src_matrix: Dict[str, np.ndarray],
+    src_score: Dict[str, float],
+    src_history: Dict[str, List[float]],
+) -> None:
+    for cond, hist in src_history.items():
+        finite_hist = _finite_array(hist)
+        if finite_hist.size:
+            dst_history[cond].extend(finite_hist.tolist())
+
+    for cond, matrix in src_matrix.items():
+        s = float(src_score.get(cond, np.nan))
+        if cond not in dst_matrix:
+            dst_matrix[cond] = np.asarray(matrix, dtype=float)
+            dst_score[cond] = s
+            continue
+
+        history = _finite_array(dst_history.get(cond, []))
+        if history.size == 0:
+            prev = float(dst_score.get(cond, np.nan))
+            if (not np.isfinite(prev)) and np.isfinite(s):
+                dst_matrix[cond] = np.asarray(matrix, dtype=float)
+                dst_score[cond] = s
+            continue
+
+        target = float(np.nanmedian(history))
+        prev = float(dst_score.get(cond, np.nan))
+        if np.isfinite(s) and ((not np.isfinite(prev)) or abs(s - target) <= abs(prev - target)):
+            dst_matrix[cond] = np.asarray(matrix, dtype=float)
+            dst_score[cond] = s
+
+
+def _merge_upper_tail_state(
+    dst_matrix: Dict[str, np.ndarray],
+    dst_score: Dict[str, float],
+    src_matrix: Dict[str, np.ndarray],
+    src_score: Dict[str, float],
+) -> None:
+    for cond, matrix in src_matrix.items():
+        s = float(src_score.get(cond, np.nan))
+        prev = float(dst_score.get(cond, float("-inf")))
+        if cond not in dst_matrix or (np.isfinite(s) and ((not np.isfinite(prev)) or s >= prev)):
+            dst_matrix[cond] = np.asarray(matrix, dtype=float)
+            dst_score[cond] = s
+
+
+def _merge_single_ch_accumulator(dst: ChTypeAccumulator, src: ChTypeAccumulator) -> None:
+    dst.subjects.update(src.subjects)
+    dst.run_count += int(src.run_count)
+    dst.runs_by_condition.update(src.runs_by_condition)
+    dst.module_present.update(src.module_present)
+    dst.module_missing.update(src.module_missing)
+
+    _merge_list_map(dst.std_dist_by_condition, src.std_dist_by_condition)
+    _merge_list_map(dst.std_dist_mean_by_condition, src.std_dist_mean_by_condition)
+    _merge_list_map(dst.std_dist_upper_by_condition, src.std_dist_upper_by_condition)
+    dst.std_window_profiles.extend(src.std_window_profiles)
+    for cond, profiles in src.std_window_profiles_by_condition.items():
+        dst.std_window_profiles_by_condition[cond].extend(profiles)
+
+    _merge_list_map(dst.ptp_dist_by_condition, src.ptp_dist_by_condition)
+    _merge_list_map(dst.ptp_dist_mean_by_condition, src.ptp_dist_mean_by_condition)
+    _merge_list_map(dst.ptp_dist_upper_by_condition, src.ptp_dist_upper_by_condition)
+    dst.ptp_window_profiles.extend(src.ptp_window_profiles)
+    for cond, profiles in src.ptp_window_profiles_by_condition.items():
+        dst.ptp_window_profiles_by_condition[cond].extend(profiles)
+
+    _merge_list_map(dst.psd_ratio_by_condition, src.psd_ratio_by_condition)
+    _merge_list_map(dst.psd_harmonics_ratio_by_condition, src.psd_harmonics_ratio_by_condition)
+    dst.psd_profiles.extend(src.psd_profiles)
+    for cond, profiles in src.psd_profiles_by_condition.items():
+        dst.psd_profiles_by_condition[cond].extend(profiles)
+
+    _merge_list_map(dst.ecg_corr_by_condition, src.ecg_corr_by_condition)
+    _merge_list_map(dst.eog_corr_by_condition, src.eog_corr_by_condition)
+
+    _merge_list_map(dst.muscle_scalar_by_condition, src.muscle_scalar_by_condition)
+    _merge_list_map(dst.muscle_mean_by_condition, src.muscle_mean_by_condition)
+    dst.muscle_profiles.extend(src.muscle_profiles)
+    for cond, profiles in src.muscle_profiles_by_condition.items():
+        dst.muscle_profiles_by_condition[cond].extend(profiles)
+
+    for subject, profiles in src.std_subject_profiles.items():
+        dst.std_subject_profiles[subject].extend(profiles)
+    for subject, profiles in src.ptp_subject_profiles.items():
+        dst.ptp_subject_profiles[subject].extend(profiles)
+
+    _merge_representative_state(
+        dst.std_heatmap_by_condition,
+        dst.std_heatmap_score_by_condition,
+        dst.std_heatmap_score_history,
+        src.std_heatmap_by_condition,
+        src.std_heatmap_score_by_condition,
+        src.std_heatmap_score_history,
+    )
+    _merge_representative_state(
+        dst.ptp_heatmap_by_condition,
+        dst.ptp_heatmap_score_by_condition,
+        dst.ptp_heatmap_score_history,
+        src.ptp_heatmap_by_condition,
+        src.ptp_heatmap_score_by_condition,
+        src.ptp_heatmap_score_history,
+    )
+    _merge_upper_tail_state(
+        dst.std_heatmap_upper_by_condition,
+        dst.std_heatmap_upper_score_by_condition,
+        src.std_heatmap_upper_by_condition,
+        src.std_heatmap_upper_score_by_condition,
+    )
+    _merge_upper_tail_state(
+        dst.ptp_heatmap_upper_by_condition,
+        dst.ptp_heatmap_upper_score_by_condition,
+        src.ptp_heatmap_upper_by_condition,
+        src.ptp_heatmap_upper_score_by_condition,
+    )
+
+    _merge_sum_count_dict(
+        dst.std_heatmap_sum_by_condition,
+        dst.std_heatmap_count_by_condition,
+        src.std_heatmap_sum_by_condition,
+        src.std_heatmap_count_by_condition,
+    )
+    _merge_sum_count_dict(
+        dst.ptp_heatmap_sum_by_condition,
+        dst.ptp_heatmap_count_by_condition,
+        src.ptp_heatmap_sum_by_condition,
+        src.ptp_heatmap_count_by_condition,
+    )
+
+    _merge_topomap_mean_dict(
+        dst.std_topomap_by_condition,
+        dst.std_topomap_count_by_condition,
+        src.std_topomap_by_condition,
+        src.std_topomap_count_by_condition,
+    )
+    _merge_topomap_mean_dict(
+        dst.ptp_topomap_by_condition,
+        dst.ptp_topomap_count_by_condition,
+        src.ptp_topomap_by_condition,
+        src.ptp_topomap_count_by_condition,
+    )
+    _merge_topomap_mean_dict(
+        dst.psd_topomap_by_condition,
+        dst.psd_topomap_count_by_condition,
+        src.psd_topomap_by_condition,
+        src.psd_topomap_count_by_condition,
+    )
+    _merge_topomap_mean_dict(
+        dst.ecg_topomap_by_condition,
+        dst.ecg_topomap_count_by_condition,
+        src.ecg_topomap_by_condition,
+        src.ecg_topomap_count_by_condition,
+    )
+    _merge_topomap_mean_dict(
+        dst.eog_topomap_by_condition,
+        dst.eog_topomap_count_by_condition,
+        src.eog_topomap_by_condition,
+        src.eog_topomap_count_by_condition,
+    )
+
+    dst.run_rows.extend(src.run_rows)
+    dst.source_paths.update(src.source_paths)
+
+
+def _group_run_records_by_subject(run_records: Dict[str, RunRecord]) -> List[List[RunRecord]]:
+    groups: Dict[str, List[RunRecord]] = defaultdict(list)
+    for run_key in sorted(run_records):
+        record = run_records[run_key]
+        if record.meta.subject != "n/a":
+            group_key = record.meta.subject
+        else:
+            group_key = f"no_subject::{run_key}"
+        groups[group_key].append(record)
+    return [groups[key] for key in sorted(groups)]
+
+
+def _process_subject_batch(records: Sequence[RunRecord]) -> Dict[str, ChTypeAccumulator]:
+    """Process one subject batch fully inside a worker."""
+    local_acc: Dict[str, ChTypeAccumulator] = {ch: ChTypeAccumulator() for ch in CH_TYPES}
+    for record in sorted(records, key=lambda rec: rec.meta.run_key):
+        _update_accumulator_for_run(local_acc, record)
+    return local_acc
+
+
+def _build_accumulators_for_runs(
+    run_records: Dict[str, RunRecord],
+    n_jobs: int = 1,
+) -> Dict[str, ChTypeAccumulator]:
+    """Build channel-type accumulators with optional subject-parallel workers."""
+    n_jobs = _normalize_n_jobs(n_jobs)
+    acc_by_type: Dict[str, ChTypeAccumulator] = {ch: ChTypeAccumulator() for ch in CH_TYPES}
+    run_keys = sorted(run_records)
+
+    if n_jobs == 1 or len(run_keys) <= 1:
+        for run_key in run_keys:
+            _update_accumulator_for_run(acc_by_type, run_records[run_key])
+        return acc_by_type
+
+    if Parallel is None or delayed is None:
+        print("___MEGqc___: joblib is unavailable; falling back to sequential run processing.")
+        for run_key in run_keys:
+            _update_accumulator_for_run(acc_by_type, run_records[run_key])
+        return acc_by_type
+
+    subject_batches = _group_run_records_by_subject(run_records)
+    print(
+        "___MEGqc___: Parallel subject processing enabled: "
+        f"n_jobs={n_jobs}, subject_batches={len(subject_batches)}."
+    )
+    try:
+        partials = Parallel(n_jobs=n_jobs, backend="loky", prefer="processes")(
+            delayed(_process_subject_batch)(batch) for batch in subject_batches
+        )
+        for part in partials:
+            for ch in CH_TYPES:
+                _merge_single_ch_accumulator(acc_by_type[ch], part[ch])
+    except Exception as exc:
+        print(f"___MEGqc___: Parallel processing failed ({exc}); falling back to sequential processing.")
+        acc_by_type = {ch: ChTypeAccumulator() for ch in CH_TYPES}
+        for run_key in run_keys:
+            _update_accumulator_for_run(acc_by_type, run_records[run_key])
+    return acc_by_type
+
+
 def make_group_plots_meg_qc(
     dataset_path: str,
     derivatives_base: Optional[str] = None,
+    n_jobs: int = 1,
 ) -> Dict[str, Path]:
     """Build dataset-level QA reports from saved per-run derivatives.
 
@@ -5360,6 +5757,9 @@ def make_group_plots_meg_qc(
     derivatives_base : str, optional
         Optional external parent directory for derivatives, matching the
         behavior of the main MEGqc plotting pipeline.
+    n_jobs : int
+        Number of parallel workers for subject-level run processing. Use ``1``
+        for sequential mode, or ``-1`` to use all available cores.
 
     Returns
     -------
@@ -5383,10 +5783,7 @@ def make_group_plots_meg_qc(
         print(f"___MEGqc___: Group QA: no run-level TSV derivatives found under {calculation_dir}")
         return {}
 
-    acc_by_type: Dict[str, ChTypeAccumulator] = {ch: ChTypeAccumulator() for ch in CH_TYPES}
-
-    for run_key in sorted(run_records):
-        _update_accumulator_for_run(acc_by_type, run_records[run_key])
+    acc_by_type = _build_accumulators_for_runs(run_records, n_jobs=n_jobs)
 
     settings_snapshot = _load_settings_snapshot(derivatives_root)
     combined_acc = _combine_accumulators(acc_by_type)

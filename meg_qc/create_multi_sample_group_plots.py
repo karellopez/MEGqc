@@ -37,6 +37,14 @@ def get_multi_sample_group_plots() -> None:
         required=False,
         help="Optional explicit output HTML path for the multi-sample report",
     )
+    parser.add_argument(
+        "-njobs",
+        "--njobs",
+        type=int,
+        default=1,
+        required=False,
+        help="Number of parallel workers for subject-level loading (1=sequential, -1=all cores).",
+    )
     args = parser.parse_args()
 
     dataset_paths = args.inputdata
@@ -47,6 +55,7 @@ def get_multi_sample_group_plots() -> None:
         dataset_paths=dataset_paths,
         derivatives_bases=derivatives_bases,
         output_report_path=args.output_report,
+        n_jobs=args.njobs,
     )
     if not out:
         print("___MEGqc___: No multi-sample QA report was generated.")
@@ -54,4 +63,3 @@ def get_multi_sample_group_plots() -> None:
 
 if __name__ == "__main__":
     get_multi_sample_group_plots()
-

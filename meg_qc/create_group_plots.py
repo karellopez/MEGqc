@@ -28,6 +28,14 @@ def get_group_plots() -> None:
             "A subfolder named after the dataset will be used automatically."
         ),
     )
+    parser.add_argument(
+        "-njobs",
+        "--njobs",
+        type=int,
+        default=1,
+        required=False,
+        help="Number of parallel workers for subject-level loading (1=sequential, -1=all cores).",
+    )
     args = parser.parse_args()
 
     data_directory = args.inputdata
@@ -36,11 +44,14 @@ def get_group_plots() -> None:
     _, derivatives_root = resolve_output_roots(data_directory, derivatives_base)
     print(f"___MEGqc___: Reading derivatives from: {derivatives_root}")
 
-    out = make_group_plots_meg_qc(data_directory, derivatives_base=derivatives_base)
+    out = make_group_plots_meg_qc(
+        data_directory,
+        derivatives_base=derivatives_base,
+        n_jobs=args.njobs,
+    )
     if not out:
         print("___MEGqc___: No group QA reports were generated.")
 
 
 if __name__ == "__main__":
     get_group_plots()
-

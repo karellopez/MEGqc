@@ -30,9 +30,9 @@ import plotly.graph_objects as go
 import meg_qc
 from meg_qc.calculation.meg_qc_pipeline import resolve_output_roots
 from meg_qc.plotting.meg_qc_group_plots import (
-    CH_TYPES,
     ChTypeAccumulator,
     TopomapPayload,
+    _build_accumulators_for_runs,
     _build_cohort_overview_section,
     _build_condition_effect_section,
     _build_subtabs_html,
@@ -47,7 +47,6 @@ from meg_qc.plotting.meg_qc_group_plots import (
     _mean_matrices_by_condition,
     _reset_lazy_figure_store,
     _run_rows_dataframe,
-    _update_accumulator_for_run,
     plot_density_distribution,
     plot_heatmap_sorted_channels_windows,
     plot_histogram_distribution,
@@ -91,6 +90,7 @@ def _strip_outer_section(html: str) -> str:
 def _collect_sample_bundle(
     dataset_path: str,
     derivatives_base: Optional[str] = None,
+    n_jobs: int = 1,
 ) -> Optional[SampleBundle]:
     """Load one dataset into MAG/GRAD/combined accumulators."""
     _, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
@@ -108,9 +108,7 @@ def _collect_sample_bundle(
         print(f"___MEGqc___: Multi-sample QA: skipping {sample_id}, no run TSV derivatives found.")
         return None
 
-    acc_by_type: Dict[str, ChTypeAccumulator] = {ch: ChTypeAccumulator() for ch in CH_TYPES}
-    for run_key in sorted(run_records):
-        _update_accumulator_for_run(acc_by_type, run_records[run_key])
+    acc_by_type = _build_accumulators_for_runs(run_records, n_jobs=n_jobs)
 
     combined_acc = _combine_accumulators(acc_by_type)
     tab_accumulators: Dict[str, ChTypeAccumulator] = {
@@ -1628,6 +1626,7 @@ def make_multi_sample_group_plots_meg_qc(
     dataset_paths: Sequence[str],
     derivatives_bases: Optional[Sequence[Optional[str]]] = None,
     output_report_path: Optional[str] = None,
+    n_jobs: int = 1,
 ) -> Dict[str, Path]:
     """Build one HTML report comparing multiple MEGqc datasets.
 
@@ -1640,6 +1639,9 @@ def make_multi_sample_group_plots_meg_qc(
         parent folders. Use ``None`` for default in-dataset derivatives.
     output_report_path
         Optional explicit output path for the final HTML report.
+    n_jobs
+        Number of parallel workers used for subject-level run loading within
+        each dataset. Use ``1`` for sequential mode, or ``-1`` for all cores.
 
     Returns
     -------
@@ -1660,7 +1662,7 @@ def make_multi_sample_group_plots_meg_qc(
 
     bundles: List[SampleBundle] = []
     for ds_path, der_base in zip(dataset_paths, derivatives_bases):
-        bundle = _collect_sample_bundle(ds_path, der_base)
+        bundle = _collect_sample_bundle(ds_path, der_base, n_jobs=n_jobs)
         if bundle is not None:
             bundles.append(bundle)
 
