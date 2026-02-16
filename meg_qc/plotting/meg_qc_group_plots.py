@@ -44,6 +44,7 @@ MAX_HEATMAP_CHANNELS = 350
 MAX_RECORDINGS_OVERVIEW = 2200
 MAX_SUBJECT_LINES = 160
 _FIG_TOGGLE_COUNTER = count(1)
+TESLA_TO_PICO = 1e12
 
 
 @dataclass
@@ -90,10 +91,12 @@ class RunMetricRow:
     recording: str
     processing: str
     channel_type: str
+    std_mean: float = np.nan
     std_median: float = np.nan
     std_upper_tail: float = np.nan
     std_median_norm: float = np.nan
     std_upper_tail_norm: float = np.nan
+    ptp_mean: float = np.nan
     ptp_median: float = np.nan
     ptp_upper_tail: float = np.nan
     ptp_median_norm: float = np.nan
@@ -117,14 +120,19 @@ class ChTypeAccumulator:
     module_missing: Counter = field(default_factory=Counter)
 
     std_dist_by_condition: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    std_dist_mean_by_condition: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    std_dist_upper_by_condition: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
     std_window_profiles: List[Dict[str, np.ndarray]] = field(default_factory=list)
     std_window_profiles_by_condition: Dict[str, List[Dict[str, np.ndarray]]] = field(default_factory=lambda: defaultdict(list))
 
     ptp_dist_by_condition: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    ptp_dist_mean_by_condition: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    ptp_dist_upper_by_condition: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
     ptp_window_profiles: List[Dict[str, np.ndarray]] = field(default_factory=list)
     ptp_window_profiles_by_condition: Dict[str, List[Dict[str, np.ndarray]]] = field(default_factory=lambda: defaultdict(list))
 
     psd_ratio_by_condition: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    psd_harmonics_ratio_by_condition: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
     psd_profiles: List[Dict[str, np.ndarray]] = field(default_factory=list)
     psd_profiles_by_condition: Dict[str, List[Dict[str, np.ndarray]]] = field(default_factory=lambda: defaultdict(list))
 
@@ -132,6 +140,7 @@ class ChTypeAccumulator:
     eog_corr_by_condition: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
 
     muscle_scalar_by_condition: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    muscle_mean_by_condition: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
     muscle_profiles: List[np.ndarray] = field(default_factory=list)
     muscle_profiles_by_condition: Dict[str, List[np.ndarray]] = field(default_factory=lambda: defaultdict(list))
 
@@ -576,6 +585,7 @@ def _condition_label(meta: RunMeta) -> str:
 
 def _profile_quantiles(matrix: np.ndarray) -> Dict[str, np.ndarray]:
     q = np.nanquantile(matrix, [0.05, 0.25, 0.50, 0.75, 0.95], axis=0)
+    mean = np.nanmean(matrix, axis=0)
     top5 = np.full(matrix.shape[1], np.nan, dtype=float)
     for idx in range(matrix.shape[1]):
         col = _finite_array(matrix[:, idx])
@@ -583,7 +593,7 @@ def _profile_quantiles(matrix: np.ndarray) -> Dict[str, np.ndarray]:
             continue
         k = min(5, col.size)
         top5[idx] = float(np.mean(np.sort(col)[-k:]))
-    return {"q05": q[0], "q25": q[1], "q50": q[2], "q75": q[3], "q95": q[4], "top5": top5}
+    return {"q05": q[0], "q25": q[1], "q50": q[2], "q75": q[3], "q95": q[4], "mean": mean, "top5": top5}
 
 
 def _compute_mains_ratio(psd_matrix: np.ndarray, freqs: np.ndarray, dropna: bool = True) -> np.ndarray:
@@ -693,6 +703,8 @@ def _aggregate_window_profiles(profiles: List[Dict[str, np.ndarray]]) -> Optiona
         "q75": _stack("q75"),
         "q95": _stack("q95"),
     }
+    if any("mean" in p for p in profiles):
+        agg["mean"] = _stack("mean")
     if any("top5" in p for p in profiles):
         agg["top5"] = _stack("top5")
     return agg
@@ -1772,8 +1784,8 @@ def _run_rows_dataframe(rows: List[RunMetricRow]) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame([row.__dict__ for row in rows])
     numeric_cols = [
-        "std_median", "std_upper_tail", "std_median_norm", "std_upper_tail_norm",
-        "ptp_median", "ptp_upper_tail", "ptp_median_norm", "ptp_upper_tail_norm",
+        "std_mean", "std_median", "std_upper_tail", "std_median_norm", "std_upper_tail_norm",
+        "ptp_mean", "ptp_median", "ptp_upper_tail", "ptp_median_norm", "ptp_upper_tail_norm",
         "mains_ratio", "mains_harmonics_ratio", "ecg_mean_abs_corr", "ecg_p95_abs_corr",
         "eog_mean_abs_corr", "eog_p95_abs_corr", "muscle_median", "muscle_p95",
     ]
@@ -2137,13 +2149,16 @@ def _run_values_by_condition(df: pd.DataFrame, value_col: str) -> Dict[str, List
     return dict(out)
 
 
-def _epoch_values_from_profiles(profiles_by_condition: Dict[str, List[Dict[str, np.ndarray]]]) -> Dict[str, List[float]]:
+def _epoch_values_from_profiles(
+    profiles_by_condition: Dict[str, List[Dict[str, np.ndarray]]],
+    field: str = "q50",
+) -> Dict[str, List[float]]:
     out: Dict[str, List[float]] = defaultdict(list)
     for cond, profiles in profiles_by_condition.items():
         for prof in profiles:
-            if "q50" not in prof:
+            if field not in prof:
                 continue
-            out[cond].extend(_finite_array(prof["q50"]).tolist())
+            out[cond].extend(_finite_array(prof[field]).tolist())
     return dict(out)
 
 
@@ -2777,8 +2792,16 @@ def _combine_accumulators(acc_by_type: Dict[str, ChTypeAccumulator]) -> ChTypeAc
 
         for cond, vals in acc.std_dist_by_condition.items():
             combined.std_dist_by_condition[cond].extend(_finite_array(vals).tolist())
+        for cond, vals in acc.std_dist_mean_by_condition.items():
+            combined.std_dist_mean_by_condition[cond].extend(_finite_array(vals).tolist())
+        for cond, vals in acc.std_dist_upper_by_condition.items():
+            combined.std_dist_upper_by_condition[cond].extend(_finite_array(vals).tolist())
         for cond, vals in acc.ptp_dist_by_condition.items():
             combined.ptp_dist_by_condition[cond].extend(_finite_array(vals).tolist())
+        for cond, vals in acc.ptp_dist_mean_by_condition.items():
+            combined.ptp_dist_mean_by_condition[cond].extend(_finite_array(vals).tolist())
+        for cond, vals in acc.ptp_dist_upper_by_condition.items():
+            combined.ptp_dist_upper_by_condition[cond].extend(_finite_array(vals).tolist())
 
         for profile in acc.std_window_profiles:
             combined.std_window_profiles.append(profile)
@@ -2860,6 +2883,8 @@ def _combine_accumulators(acc_by_type: Dict[str, ChTypeAccumulator]) -> ChTypeAc
 
         for cond, vals in acc.psd_ratio_by_condition.items():
             combined.psd_ratio_by_condition[cond].extend(vals)
+        for cond, vals in acc.psd_harmonics_ratio_by_condition.items():
+            combined.psd_harmonics_ratio_by_condition[cond].extend(vals)
         combined.psd_profiles.extend(acc.psd_profiles)
         for cond, profiles in acc.psd_profiles_by_condition.items():
             combined.psd_profiles_by_condition[cond].extend(profiles)
@@ -2869,6 +2894,8 @@ def _combine_accumulators(acc_by_type: Dict[str, ChTypeAccumulator]) -> ChTypeAc
             combined.eog_corr_by_condition[cond].extend(vals)
         for cond, vals in acc.muscle_scalar_by_condition.items():
             combined.muscle_scalar_by_condition[cond].extend(vals)
+        for cond, vals in acc.muscle_mean_by_condition.items():
+            combined.muscle_mean_by_condition[cond].extend(vals)
         combined.muscle_profiles.extend(acc.muscle_profiles)
         for cond, profiles in acc.muscle_profiles_by_condition.items():
             combined.muscle_profiles_by_condition[cond].extend(profiles)
@@ -3435,7 +3462,39 @@ def _build_condition_effect_section(acc: ChTypeAccumulator, amplitude_unit: str,
 def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, is_combined: bool) -> str:
     suffix = " (all channels)" if is_combined else ""
     df = _run_rows_dataframe(acc.run_rows)
-    tab_token = "combined" if is_combined else ("mag" if amplitude_unit.startswith("Tesla (T)") else "grad")
+    tab_token = "combined" if is_combined else ("grad" if "/m" in amplitude_unit else "mag")
+
+    def _count_map_values(values_map: Dict[str, List[float]]) -> int:
+        return int(sum(_finite_array(vals).size for vals in values_map.values()))
+
+    def _panel_counts_html(
+        point_col: str,
+        rec_values: Dict[str, List[float]],
+        ch_values: Dict[str, List[float]],
+        epoch_values: Dict[str, List[float]],
+    ) -> str:
+        if point_col in df.columns:
+            finite_mask = np.isfinite(pd.to_numeric(df[point_col], errors="coerce").to_numpy(dtype=float))
+            dff = df.loc[finite_mask].copy()
+        else:
+            dff = df.copy()
+        n_subjects = int(dff["subject"].nunique()) if ("subject" in dff.columns and not dff.empty) else 0
+        n_runs = int(dff["run_key"].nunique()) if ("run_key" in dff.columns and not dff.empty) else 0
+        n_channels = _count_map_values(ch_values)
+        n_epochs = _count_map_values(epoch_values)
+        n_recording_values = _count_map_values(rec_values)
+        return (
+            f"<strong>Counts:</strong> N subjects={n_subjects}, N runs={n_runs}, "
+            f"N recording values={n_recording_values}, N channels={n_channels}, N epochs={n_epochs}."
+        )
+
+    def _panel_subtitle(panel_label: str, formula_text: str, counts_html: str) -> str:
+        return (
+            "<div class='fig-note'>"
+            f"<strong>{panel_label} summary definition:</strong> {formula_text}<br>"
+            f"{counts_html}"
+            "</div>"
+        )
 
     def _variant_tabs(
         group_id: str,
@@ -3445,6 +3504,8 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
         value_label: str,
     ) -> str:
         vals = _values_with_task_agnostic(values_map)
+        if not vals:
+            return "<p>No values are available for this variant.</p>"
         violin = plot_violin_with_subject_jitter(
             vals,
             df,
@@ -3465,30 +3526,130 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
         return _build_subtabs_html(
             group_id,
             [
-                ("Violin", _figure_block(violin, f"Distribution by task/condition (plus all-tasks aggregate) with subject jitter points. Units: {value_label}.", normalized_variant=True, norm_mode="y")),
-                ("Histogram", _figure_block(hist, f"Histogram variant for the same distribution with overlaid density curves. Units: {value_label}.", normalized_variant=True, norm_mode="x")),
-                ("Density", _figure_block(dens, f"Density-curve variant for the same distribution. Units: {value_label}.", normalized_variant=True, norm_mode="x")),
+                (
+                    "Violin",
+                    _figure_block(
+                        violin,
+                        (
+                            "Each violin is the pooled distribution for the selected group. "
+                            "Jittered dots show one robust value per subject (median over available runs for the selected summary). "
+                            f"Units: {value_label}."
+                        ),
+                        normalized_variant=True,
+                        norm_mode="y",
+                    ),
+                ),
+                (
+                    "Histogram",
+                    _figure_block(
+                        hist,
+                        f"Histogram variant of the same summary values. Units: {value_label}.",
+                        normalized_variant=True,
+                        norm_mode="x",
+                    ),
+                ),
+                (
+                    "Density",
+                    _figure_block(
+                        dens,
+                        f"Kernel-density variant of the same summary values. Units: {value_label}.",
+                        normalized_variant=True,
+                        norm_mode="x",
+                    ),
+                ),
             ],
             level=4,
         )
 
+    def _summary_variants(
+        default_values: Dict[str, List[float]],
+        mean_values: Optional[Dict[str, List[float]]] = None,
+        upper_values: Optional[Dict[str, List[float]]] = None,
+    ) -> List[Tuple[str, Dict[str, List[float]]]]:
+        return [
+            ("Default", default_values),
+            ("Mean", default_values if mean_values is None else mean_values),
+            ("Upper tail", default_values if upper_values is None else upper_values),
+        ]
+
+    def _summary_variant_tabs(
+        group_id: str,
+        variants: List[Tuple[str, Dict[str, List[float]]]],
+        point_col: str,
+        title_prefix: str,
+        value_label: str,
+    ) -> str:
+        items: List[Tuple[str, str]] = []
+        for idx, (variant_label, values_map) in enumerate(variants):
+            items.append(
+                (
+                    variant_label,
+                    _variant_tabs(
+                        f"{group_id}-variant-{idx}",
+                        values_map,
+                        point_col=point_col,
+                        title_prefix=f"{title_prefix} [{variant_label}]",
+                        value_label=value_label,
+                    ),
+                )
+            )
+        return _build_subtabs_html(group_id, items, level=4)
+
     def _metric_panel(
         metric_name: str,
-        rec_values: Dict[str, List[float]],
-        ch_values: Dict[str, List[float]],
-        epoch_values: Dict[str, List[float]],
+        rec_variants: List[Tuple[str, Dict[str, List[float]]]],
+        ch_variants: List[Tuple[str, Dict[str, List[float]]]],
+        epoch_variants: List[Tuple[str, Dict[str, List[float]]]],
         point_col: str,
         unit_label: str,
+        formula_a: str,
+        formula_b: str,
+        formula_c: str,
         mean_sum_map: Optional[Dict[str, np.ndarray]] = None,
         mean_count_map: Optional[Dict[str, np.ndarray]] = None,
         topomap_payloads: Optional[Dict[str, TopomapPayload]] = None,
     ) -> str:
+        rec_default = rec_variants[0][1] if rec_variants else {}
+        ch_default = ch_variants[0][1] if ch_variants else {}
+        epoch_default = epoch_variants[0][1] if epoch_variants else {}
+        counts_html = _panel_counts_html(point_col, rec_default, ch_default, epoch_default)
+
         dist_tabs = _build_subtabs_html(
             f"dist-{metric_name.lower()}-{tab_token}",
             [
-                ("A: Recording distributions", _variant_tabs(f"var-{metric_name.lower()}-a-{tab_token}", rec_values, point_col, f"{metric_name} recording distribution{suffix}", unit_label)),
-                ("B: Epochs per channel", _variant_tabs(f"var-{metric_name.lower()}-b-{tab_token}", ch_values, point_col, f"{metric_name} epochs-per-channel distribution{suffix}", unit_label)),
-                ("C: Channels per epoch", _variant_tabs(f"var-{metric_name.lower()}-c-{tab_token}", epoch_values, point_col, f"{metric_name} channels-per-epoch distribution{suffix}", unit_label)),
+                (
+                    "A: Recording distributions",
+                    _panel_subtitle("A", formula_a, counts_html)
+                    + _summary_variant_tabs(
+                        f"var-{metric_name.lower()}-a-{tab_token}",
+                        rec_variants,
+                        point_col=point_col,
+                        title_prefix=f"{metric_name} recording distribution{suffix}",
+                        value_label=unit_label,
+                    ),
+                ),
+                (
+                    "B: Epochs per channel",
+                    _panel_subtitle("B", formula_b, counts_html)
+                    + _summary_variant_tabs(
+                        f"var-{metric_name.lower()}-b-{tab_token}",
+                        ch_variants,
+                        point_col=point_col,
+                        title_prefix=f"{metric_name} epochs-per-channel distribution{suffix}",
+                        value_label=unit_label,
+                    ),
+                ),
+                (
+                    "C: Channels per epoch",
+                    _panel_subtitle("C", formula_c, counts_html)
+                    + _summary_variant_tabs(
+                        f"var-{metric_name.lower()}-c-{tab_token}",
+                        epoch_variants,
+                        point_col=point_col,
+                        title_prefix=f"{metric_name} channels-per-epoch distribution{suffix}",
+                        value_label=unit_label,
+                    ),
+                ),
             ],
             level=3,
         )
@@ -3537,33 +3698,76 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
 
     std_panel = _metric_panel(
         metric_name="STD",
-        rec_values=_run_values_by_condition(df, "std_median"),
-        ch_values=acc.std_dist_by_condition,
-        epoch_values=_epoch_values_from_profiles(acc.std_window_profiles_by_condition),
+        rec_variants=_summary_variants(
+            _run_values_by_condition(df, "std_median"),
+            _run_values_by_condition(df, "std_mean"),
+            _run_values_by_condition(df, "std_upper_tail"),
+        ),
+        ch_variants=_summary_variants(
+            acc.std_dist_by_condition,
+            acc.std_dist_mean_by_condition,
+            acc.std_dist_upper_by_condition,
+        ),
+        epoch_variants=_summary_variants(
+            _epoch_values_from_profiles(acc.std_window_profiles_by_condition, field="q50"),
+            _epoch_values_from_profiles(acc.std_window_profiles_by_condition, field="mean"),
+            _epoch_values_from_profiles(acc.std_window_profiles_by_condition, field="q95"),
+        ),
         point_col="std_median",
         unit_label=f"STD ({amplitude_unit})",
+        formula_a="Default: median_c(median_t STD[c,t]); Mean: mean_c(mean_t STD[c,t]); Upper tail: q95_c(q95_t STD[c,t]).",
+        formula_b="Default: median_t STD[c,t] per channel c; Mean: mean_t STD[c,t] per channel c; Upper tail: q95_t STD[c,t] per channel c.",
+        formula_c="Default: median_c STD[c,t] per epoch t; Mean: mean_c STD[c,t] per epoch t; Upper tail: q95_c STD[c,t] per epoch t.",
         mean_sum_map=acc.std_heatmap_sum_by_condition,
         mean_count_map=acc.std_heatmap_count_by_condition,
         topomap_payloads=acc.std_topomap_by_condition,
     )
+
     ptp_panel = _metric_panel(
         metric_name="PtP",
-        rec_values=_run_values_by_condition(df, "ptp_upper_tail"),
-        ch_values=acc.ptp_dist_by_condition,
-        epoch_values=_epoch_values_from_profiles(acc.ptp_window_profiles_by_condition),
+        rec_variants=_summary_variants(
+            _run_values_by_condition(df, "ptp_upper_tail"),
+            _run_values_by_condition(df, "ptp_mean"),
+            _run_values_by_condition(df, "ptp_upper_tail"),
+        ),
+        ch_variants=_summary_variants(
+            acc.ptp_dist_by_condition,
+            acc.ptp_dist_mean_by_condition,
+            acc.ptp_dist_upper_by_condition,
+        ),
+        epoch_variants=_summary_variants(
+            _epoch_values_from_profiles(acc.ptp_window_profiles_by_condition, field="q50"),
+            _epoch_values_from_profiles(acc.ptp_window_profiles_by_condition, field="mean"),
+            _epoch_values_from_profiles(acc.ptp_window_profiles_by_condition, field="q95"),
+        ),
         point_col="ptp_upper_tail",
         unit_label=f"PtP ({amplitude_unit})",
+        formula_a="Default: q95_c(q95_t PtP[c,t]); Mean: mean_c(mean_t PtP[c,t]); Upper tail: q95_c(q99_t PtP[c,t]).",
+        formula_b="Default: q95_t PtP[c,t] per channel c; Mean: mean_t PtP[c,t] per channel c; Upper tail: q99_t PtP[c,t] per channel c.",
+        formula_c="Default: median_c PtP[c,t] per epoch t; Mean: mean_c PtP[c,t] per epoch t; Upper tail: q95_c PtP[c,t] per epoch t.",
         mean_sum_map=acc.ptp_heatmap_sum_by_condition,
         mean_count_map=acc.ptp_heatmap_count_by_condition,
         topomap_payloads=acc.ptp_topomap_by_condition,
     )
+
     psd_panel = _metric_panel(
         metric_name="PSD mains ratio",
-        rec_values=_run_values_by_condition(df, "mains_ratio"),
-        ch_values=acc.psd_ratio_by_condition,
-        epoch_values={},
+        rec_variants=_summary_variants(
+            _run_values_by_condition(df, "mains_ratio"),
+            _run_values_by_condition(df, "mains_ratio"),
+            _run_values_by_condition(df, "mains_harmonics_ratio"),
+        ),
+        ch_variants=_summary_variants(
+            acc.psd_ratio_by_condition,
+            acc.psd_ratio_by_condition,
+            acc.psd_harmonics_ratio_by_condition,
+        ),
+        epoch_variants=_summary_variants({}, {}, {}),
         point_col="mains_ratio",
-        unit_label="Mains relative power (unitless)",
+        unit_label="Relative power (unitless)",
+        formula_a="Default/Mean: mean_c mains_ratio[c]; Upper tail: mean_c harmonics_ratio[c].",
+        formula_b="Default/Mean: mains_ratio[c] per channel c; Upper tail: harmonics_ratio[c] per channel c.",
+        formula_c="Not available: epoch-wise PSD summaries are not stored in run derivatives.",
         topomap_payloads=acc.psd_topomap_by_condition,
     ) + _condition_figure_blocks(
         {
@@ -3574,33 +3778,67 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
         normalized_variant=True,
         norm_mode="y",
     )
+
     ecg_panel = _metric_panel(
         metric_name="ECG correlation",
-        rec_values=_run_values_by_condition(df, "ecg_mean_abs_corr"),
-        ch_values=acc.ecg_corr_by_condition,
-        epoch_values={},
+        rec_variants=_summary_variants(
+            _run_values_by_condition(df, "ecg_mean_abs_corr"),
+            _run_values_by_condition(df, "ecg_mean_abs_corr"),
+            _run_values_by_condition(df, "ecg_p95_abs_corr"),
+        ),
+        ch_variants=_summary_variants(acc.ecg_corr_by_condition, acc.ecg_corr_by_condition, acc.ecg_corr_by_condition),
+        epoch_variants=_summary_variants({}, {}, {}),
         point_col="ecg_mean_abs_corr",
         unit_label="|r| (unitless)",
+        formula_a="Default/Mean: mean_c |r[c]|; Upper tail: q95_c |r[c]|.",
+        formula_b="Channel values are |r[c]|. Mean and upper-tail variants coincide with the same channel-level distribution in stored outputs.",
+        formula_c="Not available: epoch-wise ECG channel summaries are not stored in run derivatives.",
         topomap_payloads=acc.ecg_topomap_by_condition,
     )
+
     eog_panel = _metric_panel(
         metric_name="EOG correlation",
-        rec_values=_run_values_by_condition(df, "eog_mean_abs_corr"),
-        ch_values=acc.eog_corr_by_condition,
-        epoch_values={},
+        rec_variants=_summary_variants(
+            _run_values_by_condition(df, "eog_mean_abs_corr"),
+            _run_values_by_condition(df, "eog_mean_abs_corr"),
+            _run_values_by_condition(df, "eog_p95_abs_corr"),
+        ),
+        ch_variants=_summary_variants(acc.eog_corr_by_condition, acc.eog_corr_by_condition, acc.eog_corr_by_condition),
+        epoch_variants=_summary_variants({}, {}, {}),
         point_col="eog_mean_abs_corr",
         unit_label="|r| (unitless)",
+        formula_a="Default/Mean: mean_c |r[c]|; Upper tail: q95_c |r[c]|.",
+        formula_b="Channel values are |r[c]|. Mean and upper-tail variants coincide with the same channel-level distribution in stored outputs.",
+        formula_c="Not available: epoch-wise EOG channel summaries are not stored in run derivatives.",
         topomap_payloads=acc.eog_topomap_by_condition,
     )
+
+    muscle_epoch_profiles = {
+        cond: [{"q50": np.asarray(v, dtype=float), "mean": np.asarray(v, dtype=float), "q95": np.asarray(v, dtype=float)} for v in vals]
+        for cond, vals in acc.muscle_profiles_by_condition.items()
+    }
     muscle_panel = _metric_panel(
         metric_name="Muscle score",
-        rec_values=_run_values_by_condition(df, "muscle_p95"),
-        ch_values=acc.muscle_scalar_by_condition,
-        epoch_values=_epoch_values_from_profiles(
-            {k: [{"q50": np.asarray(v, dtype=float)} for v in vals] for k, vals in acc.muscle_profiles_by_condition.items()}
+        rec_variants=_summary_variants(
+            _run_values_by_condition(df, "muscle_p95"),
+            _run_values_by_condition(df, "muscle_median"),
+            _run_values_by_condition(df, "muscle_p95"),
+        ),
+        ch_variants=_summary_variants(
+            acc.muscle_scalar_by_condition,
+            acc.muscle_mean_by_condition,
+            acc.muscle_scalar_by_condition,
+        ),
+        epoch_variants=_summary_variants(
+            _epoch_values_from_profiles(muscle_epoch_profiles, field="q50"),
+            _epoch_values_from_profiles(muscle_epoch_profiles, field="mean"),
+            _epoch_values_from_profiles(muscle_epoch_profiles, field="q95"),
         ),
         point_col="muscle_p95",
         unit_label="Muscle score (z-score)",
+        formula_a="Default/Upper tail: q95_t score[t] per run; Mean: mean_t score[t] per run.",
+        formula_b="Default/Upper tail: q95_t score[t] per run; Mean: mean_t score[t] per run.",
+        formula_c="Epoch values are score[t] (single stored muscle profile per run). Mean and upper-tail variants use the same stored epoch sequence.",
     ) + _condition_figure_blocks(
         {
             cond: plot_quantile_band_timecourse(
@@ -3776,11 +4014,26 @@ def _build_statistical_appendix_section(acc: ChTypeAccumulator, amplitude_unit: 
 
 def _build_tab_content(tab_name: str, acc: ChTypeAccumulator, is_combined: bool) -> str:
     if is_combined:
-        amplitude_unit = "mixed MEG units (all channels)"
+        amplitude_unit = "mixed pT-based MEG units (all channels)"
     elif tab_name.upper() == "MAG":
-        amplitude_unit = "Tesla (T)"
+        amplitude_unit = "picoTesla (pT)"
     else:
-        amplitude_unit = "Tesla/m (T/m)"
+        amplitude_unit = "picoTesla/m (pT/m)"
+
+    combined_notice = ""
+    if is_combined:
+        df = _run_rows_dataframe(acc.run_rows)
+        mag_rows = int(df.loc[df["channel_type"] == "mag", "run_key"].nunique()) if (not df.empty and "channel_type" in df.columns and "run_key" in df.columns) else 0
+        grad_rows = int(df.loc[df["channel_type"] == "grad", "run_key"].nunique()) if (not df.empty and "channel_type" in df.columns and "run_key" in df.columns) else 0
+        n_subjects = int(df["subject"].nunique()) if (not df.empty and "subject" in df.columns) else 0
+        combined_notice = (
+            "<section>"
+            "<h2>Combined Channel-Type Context</h2>"
+            f"<p><strong>Per-type run counts:</strong> MAG={mag_rows}, GRAD={grad_rows}; <strong>N subjects:</strong> {n_subjects}.</p>"
+            "<p><strong>Unit warning:</strong> The combined tab is cumulative across channel types (MAG + GRAD). "
+            "Amplitude metrics therefore mix pT and pT/m footprints. Use MAG and GRAD tabs for strict unit-specific interpretation.</p>"
+            "</section>"
+        )
 
     sections = [
         ("Cohort Overview", _build_cohort_overview_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
@@ -3798,7 +4051,7 @@ def _build_tab_content(tab_name: str, acc: ChTypeAccumulator, is_combined: bool)
         ),
     ]
     group_id = f"main-{re.sub(r'[^a-z0-9]+', '-', tab_name.lower())}"
-    return _build_subtabs_html(group_id, sections, level=1)
+    return combined_notice + _build_subtabs_html(group_id, sections, level=1)
 
 
 def _build_report_html(
@@ -4227,15 +4480,19 @@ def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], recor
         )
 
         if ch_type in std_data:
-            matrix = std_data[ch_type]
+            matrix = np.asarray(std_data[ch_type], dtype=float) * TESLA_TO_PICO
             # Channel scalar summaries are used for distribution views.
-            ch_summary_all = np.nanmedian(matrix, axis=1)
-            ch_summary_norm = _robust_normalize_array(ch_summary_all)
-            ch_summary = _finite_array(ch_summary_all)
-            if ch_summary.size:
-                acc.std_dist_by_condition[condition_label].extend(ch_summary.tolist())
-                std_central_score = float(np.nanmedian(ch_summary))
-                std_upper_score = float(np.nanquantile(ch_summary, 0.95))
+            ch_summary_default_all = np.nanmedian(matrix, axis=1)
+            ch_summary_mean_all = np.nanmean(matrix, axis=1)
+            ch_summary_upper_all = np.nanquantile(matrix, 0.95, axis=1)
+            ch_summary_norm = _robust_normalize_array(ch_summary_default_all)
+            ch_summary_default = _finite_array(ch_summary_default_all)
+            ch_summary_mean = _finite_array(ch_summary_mean_all)
+            ch_summary_upper = _finite_array(ch_summary_upper_all)
+            if ch_summary_default.size:
+                acc.std_dist_by_condition[condition_label].extend(ch_summary_default.tolist())
+                std_central_score = float(np.nanmedian(ch_summary_default))
+                std_upper_score = float(np.nanquantile(ch_summary_upper if ch_summary_upper.size else ch_summary_default, 0.95))
                 _update_representative_matrix(
                     acc.std_heatmap_by_condition,
                     acc.std_heatmap_score_by_condition,
@@ -4253,6 +4510,11 @@ def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], recor
                 )
                 row.std_median = _as_float(std_central_score)
                 row.std_upper_tail = _as_float(std_upper_score)
+            if ch_summary_mean.size:
+                acc.std_dist_mean_by_condition[condition_label].extend(ch_summary_mean.tolist())
+                row.std_mean = _as_float(np.nanmean(ch_summary_mean))
+            if ch_summary_upper.size:
+                acc.std_dist_upper_by_condition[condition_label].extend(ch_summary_upper.tolist())
             ch_summary_norm_finite = _finite_array(ch_summary_norm)
             if ch_summary_norm_finite.size:
                 row.std_median_norm = _as_float(np.nanmedian(ch_summary_norm_finite))
@@ -4274,20 +4536,24 @@ def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], recor
                 acc.std_topomap_count_by_condition,
                 condition_label,
                 _layout_by_desc("STDs").get(ch_type),
-                ch_summary_all,
+                ch_summary_default_all,
             )
             acc.source_paths.add(str(files["STDs"]))
             module_seen["STD"] = True
 
         if ch_type in ptp_data:
-            matrix = ptp_data[ch_type]
-            ch_summary_all = np.nanquantile(matrix, 0.95, axis=1)
-            ch_summary_norm = _robust_normalize_array(ch_summary_all)
-            ch_summary = _finite_array(ch_summary_all)
-            if ch_summary.size:
-                acc.ptp_dist_by_condition[condition_label].extend(ch_summary.tolist())
-                ptp_central_score = float(np.nanmedian(ch_summary))
-                ptp_upper_score = float(np.nanquantile(ch_summary, 0.95))
+            matrix = np.asarray(ptp_data[ch_type], dtype=float) * TESLA_TO_PICO
+            ch_summary_default_all = np.nanquantile(matrix, 0.95, axis=1)
+            ch_summary_mean_all = np.nanmean(matrix, axis=1)
+            ch_summary_upper_all = np.nanquantile(matrix, 0.99, axis=1)
+            ch_summary_norm = _robust_normalize_array(ch_summary_default_all)
+            ch_summary_default = _finite_array(ch_summary_default_all)
+            ch_summary_mean = _finite_array(ch_summary_mean_all)
+            ch_summary_upper = _finite_array(ch_summary_upper_all)
+            if ch_summary_default.size:
+                acc.ptp_dist_by_condition[condition_label].extend(ch_summary_default.tolist())
+                ptp_central_score = float(np.nanmedian(ch_summary_default))
+                ptp_upper_score = float(np.nanquantile(ch_summary_upper if ch_summary_upper.size else ch_summary_default, 0.95))
                 _update_representative_matrix(
                     acc.ptp_heatmap_by_condition,
                     acc.ptp_heatmap_score_by_condition,
@@ -4305,6 +4571,11 @@ def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], recor
                 )
                 row.ptp_median = _as_float(ptp_central_score)
                 row.ptp_upper_tail = _as_float(ptp_upper_score)
+            if ch_summary_mean.size:
+                acc.ptp_dist_mean_by_condition[condition_label].extend(ch_summary_mean.tolist())
+                row.ptp_mean = _as_float(np.nanmean(ch_summary_mean))
+            if ch_summary_upper.size:
+                acc.ptp_dist_upper_by_condition[condition_label].extend(ch_summary_upper.tolist())
             ch_summary_norm_finite = _finite_array(ch_summary_norm)
             if ch_summary_norm_finite.size:
                 row.ptp_median_norm = _as_float(np.nanmedian(ch_summary_norm_finite))
@@ -4326,7 +4597,7 @@ def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], recor
                     acc.ptp_topomap_count_by_condition,
                     condition_label,
                     _layout_by_desc(ptp_desc).get(ch_type),
-                    ch_summary_all,
+                    ch_summary_default_all,
                 )
             if "PtPsManual" in files:
                 acc.source_paths.add(str(files["PtPsManual"]))
@@ -4343,6 +4614,7 @@ def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], recor
                 row.mains_ratio = _as_float(np.nanmean(ratios))
             harmonics = _finite_array(harmonics_all)
             if harmonics.size:
+                acc.psd_harmonics_ratio_by_condition[condition_label].extend(harmonics.tolist())
                 row.mains_harmonics_ratio = _as_float(np.nanmean(harmonics))
             quant = _profile_quantiles(matrix)
             quant["freqs"] = freqs
@@ -4397,6 +4669,7 @@ def _update_accumulator_for_run(acc_by_type: Dict[str, ChTypeAccumulator], recor
             if scores.size:
                 acc.muscle_profiles.append(scores)
                 acc.muscle_profiles_by_condition[condition_label].append(scores)
+                acc.muscle_mean_by_condition[condition_label].append(float(np.nanmean(scores)))
                 acc.muscle_scalar_by_condition[condition_label].append(
                     float(np.nanquantile(scores, 0.95))
                 )
