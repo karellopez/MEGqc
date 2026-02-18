@@ -51,7 +51,8 @@ MAX_RECORDINGS_OVERVIEW = 2200
 MAX_SUBJECT_LINES = 160
 _FIG_TOGGLE_COUNTER = count(1)
 _LAZY_PLOT_COUNTER = count(1)
-_LAZY_FIGURE_STORE: Dict[str, Dict[str, object]] = {}
+_LAZY_PAYLOAD_COUNTER = count(1)
+_LAZY_PLOT_PAYLOADS: Dict[str, str] = {}
 TESLA_TO_PICO = 1e12
 
 
@@ -1394,23 +1395,36 @@ def plot_topomap_if_available(
 
 def _reset_lazy_figure_store() -> None:
     """Reset per-report lazy plot storage before composing HTML."""
-    global _LAZY_PLOT_COUNTER
-    _LAZY_FIGURE_STORE.clear()
+    global _LAZY_PLOT_COUNTER, _LAZY_PAYLOAD_COUNTER
+    _LAZY_PLOT_PAYLOADS.clear()
     _LAZY_PLOT_COUNTER = count(1)
+    _LAZY_PAYLOAD_COUNTER = count(1)
 
 
-def _lazy_figure_store_json() -> str:
-    """Serialize lazy figure store to JSON for client-side rendering."""
-    return json.dumps(_LAZY_FIGURE_STORE, cls=PlotlyJSONEncoder, separators=(",", ":"))
+def _lazy_payload_script_tags_html() -> str:
+    """Return inline JSON script tags for lazily rendered Plotly payloads."""
+    return "".join(
+        f"<script id='{payload_id}' type='application/json'>{payload_json}</script>"
+        for payload_id, payload_json in _LAZY_PLOT_PAYLOADS.items()
+    )
 
 
 def _register_lazy_figure(fig: go.Figure, *, height_px: str) -> str:
     fig_id = f"lazy-plot-{next(_LAZY_PLOT_COUNTER)}"
-    _LAZY_FIGURE_STORE[fig_id] = {
-        "figure": fig.to_plotly_json(),
-        "config": {"responsive": True, "displaylogo": False},
-    }
-    return f"<div id='{fig_id}' class='js-lazy-plot' data-fig-id='{fig_id}' style='height:{height_px}; width:100%;'></div>"
+    payload_id = f"lazy-payload-{next(_LAZY_PAYLOAD_COUNTER)}"
+    payload_json = json.dumps(
+        {
+            "figure": fig.to_plotly_json(),
+            "config": {"responsive": True, "displaylogo": False},
+        },
+        cls=PlotlyJSONEncoder,
+        separators=(",", ":"),
+    ).replace("</", "<\\/")
+    _LAZY_PLOT_PAYLOADS[payload_id] = payload_json
+    return (
+        f"<div id='{fig_id}' class='js-lazy-plot' data-payload-id='{payload_id}' "
+        f"style='height:{height_px}; width:100%;'></div>"
+    )
 
 
 def _figure_to_div(fig: Optional[go.Figure]) -> str:
@@ -4544,7 +4558,7 @@ def _build_report_html(
         tab_buttons.append(f"<button class='tab-btn{active_class}' data-target='{tab_id}'>{tab}</button>")
         content = _build_tab_content(tab, tab_accumulators[tab], is_combined=(tab == "Combined (mag+grad)"))
         tab_divs.append(f"<div id='{tab_id}' class='tab-content{active_class}'>{content}</div>")
-    lazy_figure_store_json = _lazy_figure_store_json()
+    lazy_payload_scripts = _lazy_payload_script_tags_html()
 
     return f"""
 <!DOCTYPE html>
@@ -4856,7 +4870,7 @@ def _build_report_html(
       {"".join(tab_divs)}
     </section>
   </main>
-  <script id="lazy-plot-store" type="application/json">{lazy_figure_store_json}</script>
+  {lazy_payload_scripts}
   <script>
     (function() {{
       // Top-level tab activation and responsive plot resizing.
@@ -4864,16 +4878,33 @@ def _build_report_html(
       const tabs = Array.from(document.querySelectorAll('.tab-content'));
       const gridToggleBtn = document.getElementById('grid-toggle-btn');
       const loadingOverlay = document.getElementById('report-loading-overlay');
-      const lazyStoreEl = document.getElementById('lazy-plot-store');
-      let lazyFigureStore = {{}};
-      if (lazyStoreEl && lazyStoreEl.textContent) {{
+      const lazyPayloadCache = {{}};
+      let gridsVisible = true;
+
+      function getPayloadFromScript(payloadId) {{
+        if (!payloadId) {{
+          return null;
+        }}
+        if (lazyPayloadCache[payloadId]) {{
+          return lazyPayloadCache[payloadId];
+        }}
+        const payloadEl = document.getElementById(payloadId);
+        if (!payloadEl || !payloadEl.textContent) {{
+          return null;
+        }}
         try {{
-          lazyFigureStore = JSON.parse(lazyStoreEl.textContent);
+          const payload = JSON.parse(payloadEl.textContent);
+          lazyPayloadCache[payloadId] = payload;
+          // Release parsed JSON text from DOM memory after first use.
+          payloadEl.textContent = '';
+          if (payloadEl.parentNode) {{
+            payloadEl.parentNode.removeChild(payloadEl);
+          }}
+          return payload;
         }} catch (err) {{
-          lazyFigureStore = {{}};
+          return null;
         }}
       }}
-      let gridsVisible = true;
 
       function hideLoadingOverlay() {{
         if (!loadingOverlay || loadingOverlay.dataset.hidden === '1') {{
@@ -4902,8 +4933,8 @@ def _build_report_html(
           if (el.offsetParent === null) {{
             return;
           }}
-          const figId = el.dataset.figId;
-          const payload = lazyFigureStore[figId];
+          const payloadId = el.dataset.payloadId;
+          const payload = getPayloadFromScript(payloadId);
           if (!payload || !payload.figure) {{
             return;
           }}

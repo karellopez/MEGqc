@@ -22,6 +22,7 @@ import tempfile
 
 import plotly.graph_objects as go
 from plotly.utils import PlotlyJSONEncoder
+from plotly.offline import get_plotlyjs
 import mne
 
 # Get the absolute path of the parent directory of the current script
@@ -86,14 +87,23 @@ def _load_plotting_backend():
 _load_plotting_backend()
 
 
-def resolve_output_roots(dataset_path: str, external_derivatives_root: Optional[str]) -> Tuple[str, str]:
-    """Return dataset output root and derivatives folder respecting overrides."""
+def resolve_output_roots(
+    dataset_path: str,
+    external_derivatives_root: Optional[str],
+) -> Tuple[str, str, str]:
+    """Return output root plus read/write derivatives roots.
+
+    ``dataset_derivatives_root`` always points to the derivatives under the
+    input dataset. ``output_derivatives_root`` points to where new reports will
+    be written (dataset root by default, external root when provided).
+    """
 
     ds_name = os.path.basename(os.path.normpath(dataset_path))
     output_root = dataset_path if external_derivatives_root is None else os.path.join(external_derivatives_root, ds_name)
-    derivatives_root = os.path.join(output_root, 'derivatives')
-    os.makedirs(derivatives_root, exist_ok=True)
-    return output_root, derivatives_root
+    dataset_derivatives_root = os.path.join(dataset_path, 'derivatives')
+    output_derivatives_root = os.path.join(output_root, 'derivatives')
+    os.makedirs(output_derivatives_root, exist_ok=True)
+    return output_root, dataset_derivatives_root, output_derivatives_root
 
 
 def build_overlay_dataset(dataset_path: str, derivatives_root: str):
@@ -135,6 +145,39 @@ def temporary_dataset_base(dataset, base_dir: str):
         yield
     finally:
         dataset.base_dir_ = original_base
+
+
+def _ensure_megqc_output_layout(output_derivatives_root: str) -> Path:
+    """Create minimal output folders/metadata for MEGqc reports.
+
+    We keep ANCPBIDS for input discovery/querying but write consolidated subject
+    reports as plain HTML files. This helper guarantees the target derivative
+    layout exists (``derivatives/Meg_QC/reports``) and creates a lightweight
+    ``dataset_description.json`` when missing.
+    """
+
+    megqc_root = Path(output_derivatives_root) / "Meg_QC"
+    reports_root = megqc_root / "reports"
+    reports_root.mkdir(parents=True, exist_ok=True)
+
+    dataset_desc_path = megqc_root / "dataset_description.json"
+    if not dataset_desc_path.exists():
+        dataset_description = {
+            "Name": "MEG QC Pipeline",
+            "BIDSVersion": "1.0.1",
+            "DatasetType": "derivative",
+            "GeneratedBy": [
+                {
+                    "Name": "MEG QC Pipeline",
+                }
+            ],
+        }
+        dataset_desc_path.write_text(
+            json.dumps(dataset_description, indent=2),
+            encoding="utf-8",
+        )
+
+    return reports_root
 
 # IMPORTANT: keep this order of imports, first need to add parent dir to sys.path, then import from it.
 
@@ -602,20 +645,45 @@ def _collect_run_sensor_derivatives(derivs_for_this_raw: Sequence["Deriv_to_plot
 
 
 # Lazy Plotly storage kept in-memory per report build.
-_LAZY_FIGURE_STORE: Dict[str, Dict[str, Any]] = {}
+# We keep one serialized payload per figure and parse it on-demand in the
+# browser when that placeholder becomes visible. This avoids one giant
+# ``JSON.parse`` over hundreds of MB.
+_LAZY_PLOT_PAYLOADS: Dict[str, str] = {}
 _LAZY_PLOT_COUNTER = count(1)
+_LAZY_PAYLOAD_COUNTER = count(1)
+_PLOTLY_JS_BUNDLE: Optional[str] = None
 
 
 def _reset_lazy_figure_store() -> None:
     """Clear lazy figure registry before creating a new subject report."""
-    global _LAZY_PLOT_COUNTER
-    _LAZY_FIGURE_STORE.clear()
+    global _LAZY_PLOT_COUNTER, _LAZY_PAYLOAD_COUNTER
+    _LAZY_PLOT_PAYLOADS.clear()
     _LAZY_PLOT_COUNTER = count(1)
+    _LAZY_PAYLOAD_COUNTER = count(1)
 
 
-def _lazy_figure_store_json() -> str:
-    """Serialize all pending Plotly figures to one inline JSON payload."""
-    return json.dumps(_LAZY_FIGURE_STORE, cls=PlotlyJSONEncoder, separators=(",", ":"))
+def _inline_plotly_bundle_script() -> str:
+    """Return an inline Plotly JS bundle script tag.
+
+    Subject reports must stay fully standalone/offline. Embedding Plotly avoids
+    reliance on a CDN, which otherwise results in empty placeholders when the
+    browser cannot fetch external scripts.
+    """
+
+    global _PLOTLY_JS_BUNDLE
+    if _PLOTLY_JS_BUNDLE is None:
+        # Escape closing tags defensively so the HTML parser keeps the bundle
+        # inside this script element.
+        _PLOTLY_JS_BUNDLE = get_plotlyjs().replace("</", "<\\/")
+    return f"<script>{_PLOTLY_JS_BUNDLE}</script>"
+
+
+def _lazy_payload_script_tags_html() -> str:
+    """Return inline JSON script tags for lazily-rendered Plotly payloads."""
+    return "".join(
+        f"<script id='{payload_id}' type='application/json'>{payload_json}</script>"
+        for payload_id, payload_json in _LAZY_PLOT_PAYLOADS.items()
+    )
 
 
 def _register_lazy_plotly_figure(fig: go.Figure, *, min_height_px: int = 520) -> str:
@@ -625,6 +693,7 @@ def _register_lazy_plotly_figure(fig: go.Figure, *, min_height_px: int = 520) ->
     initial page load responsive even when a subject has many heavy figures.
     """
     fig_id = f"lazy-plot-{next(_LAZY_PLOT_COUNTER)}"
+    payload_id = f"lazy-payload-{next(_LAZY_PAYLOAD_COUNTER)}"
     fig_out = go.Figure(fig)
 
     # Reserve extra top margin and title padding to prevent overlaps with the
@@ -648,12 +717,17 @@ def _register_lazy_plotly_figure(fig: go.Figure, *, min_height_px: int = 520) ->
         height = 640
     height = max(int(height), int(min_height_px))
 
-    _LAZY_FIGURE_STORE[fig_id] = {
-        "figure": fig_out.to_plotly_json(),
-        "config": {"responsive": True, "displaylogo": False},
-    }
+    payload_json = json.dumps(
+        {
+            "figure": fig_out.to_plotly_json(),
+            "config": {"responsive": True, "displaylogo": False},
+        },
+        cls=PlotlyJSONEncoder,
+        separators=(",", ":"),
+    ).replace("</", "<\\/")
+    _LAZY_PLOT_PAYLOADS[payload_id] = payload_json
     return (
-        f"<div id='{fig_id}' class='js-lazy-plot' data-fig-id='{fig_id}' "
+        f"<div id='{fig_id}' class='js-lazy-plot' data-payload-id='{payload_id}' "
         f"style='height:{height}px; width:100%;'></div>"
     )
 
@@ -1056,7 +1130,8 @@ def _build_subject_report_html(
         )
         tab_panels.append(f"<div id='{tab_id}' class='tab-content{active}'>{panel_html}</div>")
 
-    lazy_json = _lazy_figure_store_json().replace("</", "<\\/")
+    plotly_bundle_script = _inline_plotly_bundle_script()
+    lazy_payload_scripts = _lazy_payload_script_tags_html()
 
     return f"""
 <!DOCTYPE html>
@@ -1065,7 +1140,7 @@ def _build_subject_report_html(
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Subject QA report sub-{html.escape(subject)}</title>
-  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  {plotly_bundle_script}
   <style>
     body {{
       font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
@@ -1284,20 +1359,30 @@ def _build_subject_report_html(
       {''.join(tab_panels)}
     </section>
   </main>
-  <script id="lazy-plot-store" type="application/json">{lazy_json}</script>
+  {lazy_payload_scripts}
   <script>
     (function() {{
       const loadingOverlay = document.getElementById('report-loading-overlay');
       const topButtons = Array.from(document.querySelectorAll('.tab-btn'));
       const topPanels = Array.from(document.querySelectorAll('.tab-content'));
-      const lazyStoreEl = document.getElementById('lazy-plot-store');
-      let lazyFigureStore = {{}};
+      const lazyPayloadCache = {{}};
 
-      if (lazyStoreEl && lazyStoreEl.textContent) {{
+      function getPayloadFromScript(payloadId) {{
+        if (!payloadId) return null;
+        if (lazyPayloadCache[payloadId]) return lazyPayloadCache[payloadId];
+        const payloadEl = document.getElementById(payloadId);
+        if (!payloadEl || !payloadEl.textContent) return null;
         try {{
-          lazyFigureStore = JSON.parse(lazyStoreEl.textContent);
+          const payload = JSON.parse(payloadEl.textContent);
+          lazyPayloadCache[payloadId] = payload;
+          // Free the original JSON blob from the DOM after first parse.
+          payloadEl.textContent = '';
+          if (payloadEl.parentNode) {{
+            payloadEl.parentNode.removeChild(payloadEl);
+          }}
+          return payload;
         }} catch (err) {{
-          lazyFigureStore = {{}};
+          return null;
         }}
       }}
 
@@ -1313,15 +1398,22 @@ def _build_subject_report_html(
       }}
 
       function renderLazyInScope(scopeRoot) {{
-        if (typeof Plotly === 'undefined') return Promise.resolve();
         const scope = scopeRoot || document;
+        if (typeof Plotly === 'undefined') {{
+          Array.from(scope.querySelectorAll('.js-lazy-plot')).forEach((el) => {{
+            if (el.dataset.rendered === '1') return;
+            el.dataset.rendered = '1';
+            el.innerHTML = "<div style='border:1px solid #f5c2c7;background:#fff5f5;color:#8a1c1c;border-radius:8px;padding:10px;font-size:13px;'>Plotly JavaScript did not load. Open this report in a browser with JavaScript enabled.</div>";
+          }});
+          return Promise.resolve();
+        }}
         const placeholders = Array.from(scope.querySelectorAll('.js-lazy-plot'));
         const promises = [];
         placeholders.forEach((el) => {{
           if (el.dataset.rendered === '1') return;
           if (el.offsetParent === null) return;
-          const figId = el.dataset.figId;
-          const payload = lazyFigureStore[figId];
+          const payloadId = el.dataset.payloadId;
+          const payload = getPayloadFromScript(payloadId);
           if (!payload || !payload.figure) return;
           try {{
             const rendered = Plotly.newPlot(
@@ -1662,11 +1754,11 @@ from joblib import Parallel, delayed
 
 def process_subject(
         sub: str,
-        dataset,
         derivs_to_plot: list,
         chosen_entities: dict,
         plot_settings: dict,
-        output_root: str,
+        output_derivatives_root: str,
+        dataset_name: str,
 ):
     """Build one consolidated HTML report for a single subject.
 
@@ -1675,134 +1767,122 @@ def process_subject(
     subject-level report with nested tabs and inline lazy Plotly rendering.
     """
 
-    with temporary_dataset_base(dataset, output_root):
-        derivative = dataset.create_derivative(name="Meg_QC")
-        derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
-        reports_folder = derivative.create_folder(name='reports')
-        subject_folder = reports_folder.create_folder(name='sub-' + sub)
+    reports_root = _ensure_megqc_output_layout(output_derivatives_root)
 
-        # Sort run keys for deterministic tab ordering.
-        existing_raws_per_sub = sorted(set(
-            d.raw_entity_name for d in derivs_to_plot if d.subject == sub
-        ))
-        run_tab_labels = _build_run_tab_labels(existing_raws_per_sub)
+    # Sort run keys for deterministic tab ordering.
+    existing_raws_per_sub = sorted(set(
+        d.raw_entity_name for d in derivs_to_plot if d.subject == sub
+    ))
+    run_tab_labels = _build_run_tab_labels(existing_raws_per_sub)
 
-        metrics_to_plot = [
-            m for m in chosen_entities['METRIC']
-            if m not in ['RawInfo', 'ReportStrings', 'SimpleMetrics']
+    metrics_to_plot = [
+        m for m in chosen_entities['METRIC']
+        if m not in ['RawInfo', 'ReportStrings', 'SimpleMetrics']
+    ]
+    # ``metrics_payload`` drives the nested tab hierarchy:
+    # metric -> list of run entries with derivatives.
+    metrics_payload: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    overview_payload: List[Dict[str, Any]] = []
+
+    # ``summary_payload`` stores run-level metadata and JSON references used
+    # by the "Summary" tab.
+    summary_payload: List[Dict[str, Any]] = []
+
+    for raw_entity_name in existing_raws_per_sub:
+        derivs_for_this_raw = [
+            d for d in derivs_to_plot if d.raw_entity_name == raw_entity_name
         ]
-        dataset_name = os.path.basename(os.path.normpath(output_root))
+        if not derivs_for_this_raw:
+            continue
 
-        # ``metrics_payload`` drives the nested tab hierarchy:
-        # metric -> list of run entries with derivatives.
-        metrics_payload: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        overview_payload: List[Dict[str, Any]] = []
+        raw_info_path = None
+        report_str_path = None
+        simple_metrics_path = None
+        for d in derivs_for_this_raw:
+            if d.metric == 'RawInfo':
+                raw_info_path = d.path
+            elif d.metric == 'ReportStrings':
+                report_str_path = d.path
+            elif d.metric == 'SimpleMetrics':
+                simple_metrics_path = d.path
 
-        # ``summary_payload`` stores run-level metadata and JSON references used
-        # by the "Summary" tab.
-        summary_payload: List[Dict[str, Any]] = []
+        run_label = run_tab_labels.get(raw_entity_name, _human_run_label(raw_entity_name))
+        run_source_paths = [
+            d.path
+            for d in derivs_for_this_raw
+            if d.metric not in ['RawInfo', 'ReportStrings', 'SimpleMetrics']
+        ]
+        raw_info_html = _safe_load_raw_info_html(raw_info_path)
+        sensor_derivs, sensor_paths = _collect_run_sensor_derivatives(derivs_for_this_raw)
+        overview_payload.append(
+            {
+                "run_label": run_label,
+                "sensor_derivatives": sensor_derivs,
+                "source_paths": sensor_paths,
+            }
+        )
+        summary_payload.append(
+            {
+                "run_label": run_label,
+                "raw_info_path": raw_info_path,
+                "raw_info_html": raw_info_html,
+                "report_strings_path": report_str_path,
+                "simple_metrics_path": simple_metrics_path,
+                "source_paths": run_source_paths,
+            }
+        )
 
-        for raw_entity_name in existing_raws_per_sub:
-            derivs_for_this_raw = [
-                d for d in derivs_to_plot if d.raw_entity_name == raw_entity_name
-            ]
-            if not derivs_for_this_raw:
+        for metric in metrics_to_plot:
+            tsv_paths = [d.path for d in derivs_for_this_raw if d.metric == metric]
+            if not tsv_paths:
                 continue
 
-            raw_info_path = None
-            report_str_path = None
-            simple_metrics_path = None
-            for d in derivs_for_this_raw:
-                if d.metric == 'RawInfo':
-                    raw_info_path = d.path
-                elif d.metric == 'ReportStrings':
-                    report_str_path = d.path
-                elif d.metric == 'SimpleMetrics':
-                    simple_metrics_path = d.path
-
-            run_label = run_tab_labels.get(raw_entity_name, _human_run_label(raw_entity_name))
-            run_source_paths = [
-                d.path
-                for d in derivs_for_this_raw
-                if d.metric not in ['RawInfo', 'ReportStrings', 'SimpleMetrics']
-            ]
-            raw_info_html = _safe_load_raw_info_html(raw_info_path)
-            sensor_derivs, sensor_paths = _collect_run_sensor_derivatives(derivs_for_this_raw)
-            overview_payload.append(
-                {
-                    "run_label": run_label,
-                    "sensor_derivatives": sensor_derivs,
-                    "source_paths": sensor_paths,
-                }
-            )
-            summary_payload.append(
-                {
-                    "run_label": run_label,
-                    "raw_info_path": raw_info_path,
-                    "raw_info_html": raw_info_html,
-                    "report_strings_path": report_str_path,
-                    "simple_metrics_path": simple_metrics_path,
-                    "source_paths": run_source_paths,
-                }
-            )
-
-            for metric in metrics_to_plot:
-                tsv_paths = [d.path for d in derivs_for_this_raw if d.metric == metric]
-                if not tsv_paths:
-                    continue
-
-                try:
-                    qc_derivs, report_strings = _build_metric_derivatives(
-                        raw_info_path=raw_info_path,
-                        metric=metric,
-                        tsv_paths=tsv_paths,
-                        report_str_path=report_str_path,
-                        plot_settings=plot_settings,
-                        include_sensor_plots=False,
-                    )
-                except Exception as exc:
-                    print(
-                        f"___MEGqc___: Failed to build derivatives for "
-                        f"sub-{sub} / {run_label} / {metric}: {exc}"
-                    )
-                    continue
-
-                section_key = _metric_to_report_section(metric)
-                if not section_key:
-                    continue
-                derivatives = qc_derivs.get(section_key, [])
-                metric_note = str(report_strings.get(section_key, "") or "")
-                if (not derivatives) and (not metric_note):
-                    continue
-
-                metrics_payload[metric].append(
-                    {
-                        "run_label": run_label,
-                        "derivatives": derivatives,
-                        "metric_note": metric_note,
-                        "source_paths": tsv_paths,
-                    }
+            try:
+                qc_derivs, report_strings = _build_metric_derivatives(
+                    raw_info_path=raw_info_path,
+                    metric=metric,
+                    tsv_paths=tsv_paths,
+                    report_str_path=report_str_path,
+                    plot_settings=plot_settings,
+                    include_sensor_plots=False,
                 )
+            except Exception as exc:
+                print(
+                    f"___MEGqc___: Failed to build derivatives for "
+                    f"sub-{sub} / {run_label} / {metric}: {exc}"
+                )
+                continue
 
-        # Emit one subject-level HTML report.
-        report_html = _build_subject_report_html(
-            subject=sub,
-            dataset_name=dataset_name,
-            metrics_payload=metrics_payload,
-            overview_payload=overview_payload,
-            summary_payload=summary_payload,
-        )
+            section_key = _metric_to_report_section(metric)
+            if not section_key:
+                continue
+            derivatives = qc_derivs.get(section_key, [])
+            metric_note = str(report_strings.get(section_key, "") or "")
+            if (not derivatives) and (not metric_note):
+                continue
 
-        meg_artifact = subject_folder.create_artifact()
-        meg_artifact.add_entity('sub', sub)
-        meg_artifact.add_entity('desc', 'subject_qa_report')
-        meg_artifact.suffix = 'meg'
-        meg_artifact.extension = '.html'
-        meg_artifact.content = (
-            lambda file_path, cont=report_html: open(file_path, "w", encoding="utf-8").write(cont)
-        )
+            metrics_payload[metric].append(
+                {
+                    "run_label": run_label,
+                    "derivatives": derivatives,
+                    "metric_note": metric_note,
+                    "source_paths": tsv_paths,
+                }
+            )
 
-        ancpbids.write_derivative(dataset, derivative)
+    # Emit one subject-level HTML report.
+    report_html = _build_subject_report_html(
+        subject=sub,
+        dataset_name=dataset_name,
+        metrics_payload=metrics_payload,
+        overview_payload=overview_payload,
+        summary_payload=summary_payload,
+    )
+
+    subject_folder = reports_root / f"sub-{sub}"
+    subject_folder.mkdir(parents=True, exist_ok=True)
+    report_path = subject_folder / f"sub-{sub}_desc-subject_qa_report_meg.html"
+    report_path.write_text(report_html, encoding="utf-8")
     return
 
 
@@ -1826,24 +1906,36 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
               'No data found in the given directory path! \nCheck directory path in config file and presence of data.')
         return
 
-    output_root, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
-    print(f"___MEGqc___: Reading derivatives from: {derivatives_root}")
+    output_root, dataset_derivatives_root, output_derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
+
+    # Query derivatives source:
+    # - Prefer external derivatives tree when it already contains Meg_QC
+    #   calculations (useful for fully external pipelines).
+    # - Otherwise fall back to derivatives inside the input dataset, while
+    #   still writing reports into ``output_root``.
+    source_derivatives_root = output_derivatives_root
+    calc_rel = os.path.join('Meg_QC', 'calculation')
+    if not os.path.isdir(os.path.join(source_derivatives_root, calc_rel)):
+        source_derivatives_root = dataset_derivatives_root
+
+    print(f"___MEGqc___: Reading derivatives from: {source_derivatives_root}")
 
     query_dataset = dataset
-    query_base = output_root
+    query_base = dataset_path
     overlay_tmp = None
 
-    # If derivatives live outside the original dataset, build a lightweight
-    # overlay tree that symlinks the read-only BIDS dataset alongside the
-    # external derivatives. This keeps ancpbids happy without touching the
-    # original dataset on disk.
-    if os.path.abspath(output_root) != os.path.abspath(dataset_path):
-        overlay_tmp, overlay_root = build_overlay_dataset(dataset_path, derivatives_root)
+    # If query derivatives are not the dataset-local derivatives, build a
+    # lightweight overlay so ANCPBIDS can resolve scope='derivatives/...'.
+    if os.path.abspath(source_derivatives_root) != os.path.abspath(dataset_derivatives_root):
+        overlay_tmp, overlay_root = build_overlay_dataset(dataset_path, source_derivatives_root)
         query_base = overlay_root
         query_dataset = ancpbids.load_dataset(overlay_root, DatasetOptions(lazy_loading=True))
         print(f"___MEGqc___: Using overlay dataset for queries at: {overlay_root}")
 
     calculated_derivs_folder = os.path.join('derivatives', 'Meg_QC', 'calculation')
+
+    # Create output derivative folders once before subject-parallel processing.
+    _ensure_megqc_output_layout(output_derivatives_root)
 
     # --------------------------------------------------------------------------------
     # REPLACE THE SELECTOR WITH A HARDCODED "ALL" CHOICE
@@ -1981,11 +2073,11 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
         Parallel(n_jobs=n_jobs)(
             delayed(process_subject)(
                 sub=sub,
-                dataset=dataset,
                 derivs_to_plot=derivs_to_plot,
                 chosen_entities=chosen_entities,
                 plot_settings=plot_settings,
-                output_root=output_root,
+                output_derivatives_root=output_derivatives_root,
+                dataset_name=os.path.basename(os.path.normpath(dataset_path)),
             )
             for sub in chosen_entities['subject']
         )

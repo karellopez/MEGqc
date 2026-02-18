@@ -41,7 +41,7 @@ from meg_qc.plotting.meg_qc_group_plots import (
     _epoch_values_from_profiles,
     _figure_block,
     _finite_array,
-    _lazy_figure_store_json,
+    _lazy_payload_script_tags_html,
     _load_settings_snapshot,
     _make_ecdf_figure,
     _mean_matrices_by_condition,
@@ -1084,7 +1084,7 @@ def _build_multi_sample_report_html(
         tab_buttons.append(f"<button class='tab-btn{active_class}' data-target='{tab_id}'>{tab}</button>")
         content = _build_tab_content(bundles, tab)
         tab_divs.append(f"<div id='{tab_id}' class='tab-content{active_class}'>{content}</div>")
-    lazy_figure_store_json = _lazy_figure_store_json()
+    lazy_payload_scripts = _lazy_payload_script_tags_html()
 
     sample_rows = "".join(
         "<li>"
@@ -1394,23 +1394,39 @@ def _build_multi_sample_report_html(
       {"".join(tab_divs)}
     </section>
   </main>
-  <script id=\"lazy-plot-store\" type=\"application/json\">{lazy_figure_store_json}</script>
+  {lazy_payload_scripts}
   <script>
     (function() {{
       const buttons = Array.from(document.querySelectorAll('.tab-btn'));
       const tabs = Array.from(document.querySelectorAll('.tab-content'));
       const gridToggleBtn = document.getElementById('grid-toggle-btn');
       const loadingOverlay = document.getElementById('report-loading-overlay');
-      const lazyStoreEl = document.getElementById('lazy-plot-store');
-      let lazyFigureStore = {{}};
-      if (lazyStoreEl && lazyStoreEl.textContent) {{
+      const lazyPayloadCache = {{}};
+      let gridsVisible = true;
+
+      function getPayloadFromScript(payloadId) {{
+        if (!payloadId) {{
+          return null;
+        }}
+        if (lazyPayloadCache[payloadId]) {{
+          return lazyPayloadCache[payloadId];
+        }}
+        const payloadEl = document.getElementById(payloadId);
+        if (!payloadEl || !payloadEl.textContent) {{
+          return null;
+        }}
         try {{
-          lazyFigureStore = JSON.parse(lazyStoreEl.textContent);
+          const payload = JSON.parse(payloadEl.textContent);
+          lazyPayloadCache[payloadId] = payload;
+          payloadEl.textContent = '';
+          if (payloadEl.parentNode) {{
+            payloadEl.parentNode.removeChild(payloadEl);
+          }}
+          return payload;
         }} catch (err) {{
-          lazyFigureStore = {{}};
+          return null;
         }}
       }}
-      let gridsVisible = true;
 
       function hideLoadingOverlay() {{
         if (!loadingOverlay || loadingOverlay.dataset.hidden === '1') {{
@@ -1439,8 +1455,8 @@ def _build_multi_sample_report_html(
           if (el.offsetParent === null) {{
             return;
           }}
-          const figId = el.dataset.figId;
-          const payload = lazyFigureStore[figId];
+          const payloadId = el.dataset.payloadId;
+          const payload = getPayloadFromScript(payloadId);
           if (!payload || !payload.figure) {{
             return;
           }}
