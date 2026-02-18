@@ -19,6 +19,139 @@ import matplotlib #this is in case we will need to suppress mne matplotlib plots
 #this command will suppress showing matplotlib figures produced by mne. They will still be saved for use in report but not shown when running the pipeline
 
 
+def _add_solid_cap_toggle_to_3d_figure(fig: go.Figure, x_vals, y_vals, z_vals) -> None:
+
+    """
+    Add an optional solid-cap overlay to a 3D channel topomap.
+
+    The cap is off by default and can be toggled on to improve spatial depth
+    perception and channel occlusion, similar to an EEG-cap shell.
+    """
+    if fig is None:
+        return
+
+    xyz = np.column_stack([
+        np.asarray(x_vals, dtype=float).reshape(-1),
+        np.asarray(y_vals, dtype=float).reshape(-1),
+        np.asarray(z_vals, dtype=float).reshape(-1),
+    ])
+    mask = np.all(np.isfinite(xyz), axis=1)
+    xyz = xyz[mask]
+    if xyz.shape[0] < 4:
+        return
+
+    point_trace_idx = len(fig.data) - 1
+    # Inset the shell slightly so markers remain visually outside the cap.
+    center = np.nanmean(xyz, axis=0, keepdims=True)
+    inset_factor = 0.965
+    cap_xyz = center + (xyz - center) * inset_factor
+
+    fig.add_trace(
+        go.Mesh3d(
+            x=cap_xyz[:, 0],
+            y=cap_xyz[:, 1],
+            z=cap_xyz[:, 2],
+            alphahull=0,
+            color='#B0BEC5',
+            opacity=1.0,
+            hoverinfo='skip',
+            showscale=False,
+            name='Solid cap',
+            visible=False,
+            flatshading=True,
+            lighting=dict(ambient=0.45, diffuse=0.55, specular=0.08, roughness=0.85, fresnel=0.03),
+            lightposition=dict(x=100, y=120, z=220),
+        )
+    )
+    cap_trace_idx = len(fig.data) - 1
+    menus = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    menus.append(
+        dict(
+            type='buttons',
+            direction='right',
+            x=0.02,
+            y=1.03,
+            xanchor='left',
+            yanchor='bottom',
+            showactive=True,
+            bgcolor='#F7FBFF',
+            bordercolor='#2B6CB0',
+            borderwidth=1.2,
+            font=dict(size=12, color='#0F3D6E'),
+            pad=dict(r=8, t=4, l=8, b=4),
+            buttons=[
+                dict(
+                    label='Cap: Off',
+                    method='restyle',
+                    args=[{'visible': [True, False]}, [point_trace_idx, cap_trace_idx]],
+                ),
+                dict(
+                    label='Cap: On',
+                    method='restyle',
+                    args=[{'visible': [True, True]}, [point_trace_idx, cap_trace_idx]],
+                ),
+            ],
+        )
+    )
+    fig.update_layout(updatemenus=menus)
+
+
+def _norm_colname(name: str) -> str:
+    """Normalize a column name for resilient matching across datasets."""
+    return re.sub(r'[^a-z0-9]+', '', str(name).lower())
+
+
+def _metric_epoch_columns(df: pd.DataFrame, what_data: str) -> List[str]:
+    """Return epoch columns for STD/PtP with robust name matching."""
+    if what_data == 'stds':
+        prefix = 'stdepoch'
+    elif what_data == 'peaks':
+        prefix = 'ptpepoch'
+    else:
+        return []
+
+    cols = [col for col in df.columns if _norm_colname(col).startswith(prefix)]
+
+    def _col_order(name: str) -> tuple:
+        match = re.search(r'(\d+)$', str(name))
+        return (int(match.group(1)) if match else 10**9, str(name))
+
+    return sorted(cols, key=_col_order)
+
+
+def _metric_scalar_series(df: pd.DataFrame, what_data: str) -> pd.Series:
+    """Return one per-channel scalar for STD/PtP, deriving it if needed.
+
+    Priority:
+    1) Existing '* all' scalar column (robust name match).
+    2) Median over available epoch columns for the same metric.
+    """
+    if what_data == 'stds':
+        target = 'stdall'
+    elif what_data == 'peaks':
+        target = 'ptpall'
+    else:
+        return pd.Series(dtype=float)
+
+    scalar_col = None
+    for col in df.columns:
+        if _norm_colname(col) == target:
+            scalar_col = col
+            break
+
+    if scalar_col is not None:
+        return pd.to_numeric(df[scalar_col], errors='coerce')
+
+    epoch_cols = _metric_epoch_columns(df, what_data)
+    if not epoch_cols:
+        return pd.Series(dtype=float)
+    matrix = df[epoch_cols].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+    if matrix.size == 0:
+        return pd.Series(dtype=float)
+    values = np.nanmedian(matrix, axis=1)
+    return pd.Series(values, index=df.index, dtype=float)
+
+
 def get_tit_and_unit(m_or_g: str, psd: bool = False):
 
     """
@@ -868,8 +1001,10 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
         print('what_data should be either peaks or stds')
         return []
 
+    if 'Type' not in df.columns:
+        return []
     filtered_df = df[df['Type'] == ch_type].copy()
-    epoch_columns = [col for col in filtered_df.columns if col.startswith(data_prefix)]
+    epoch_columns = _metric_epoch_columns(filtered_df, what_data)
     if not epoch_columns:
         return []
 
@@ -882,7 +1017,10 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
         match = re.search(r'(\d+)$', col)
         epoch_labels.append(int(match.group(1)) if match else idx)
 
-    channel_labels = filtered_df['Name'].astype(str).tolist()
+    if 'Name' in filtered_df.columns:
+        channel_labels = filtered_df['Name'].astype(str).tolist()
+    else:
+        channel_labels = [f"{ch_type}_{idx}" for idx in range(data_matrix.shape[0])]
     n_channels = data_matrix.shape[0]
 
     # Match group-level style: sort channels by robust channel summary.
@@ -1201,7 +1339,12 @@ def plot_topomap_std_ptp_csv(std_csv_path: str, ch_type: str, what_data: str):
 
     #First, convert scv back into dict with MEG_channel objects:
 
-    df = pd.read_csv(std_csv_path, sep='\t')  
+    df = pd.read_csv(std_csv_path, sep='\t')
+    if 'Type' not in df.columns:
+        return []
+    df = df[df['Type'] == ch_type].copy()
+    if df.empty:
+        return []
 
     ch_tit, unit = get_tit_and_unit(ch_type)
 
@@ -1215,33 +1358,27 @@ def plot_topomap_std_ptp_csv(std_csv_path: str, ch_type: str, what_data: str):
         raise ValueError('what_data must be set to "stds" or "peaks"')
 
     
-    data = []
-    names = []
-    pos = np.empty((0, 2))
+    sensor_location_cols = [col for col in df.columns if 'Sensor_location' in col]
+    if len(sensor_location_cols) < 2:
+        return []
 
-    for index, row in df.iterrows():
+    scalars = _metric_scalar_series(df, what_data)
+    if scalars.empty:
+        return []
 
-        if row['Type'] == ch_type: #plot only mag/grad
-
-            if what_data == 'stds':
-                data += [row['STD all']]
-            elif what_data == 'peaks':
-                data += [row['PtP all']]
-                # data: array, shape (n_chan,) The data values to plot.
-
-
-            # Filter columns containing 'Sensor_location'
-            sensor_location_cols = [col for col in df.columns if 'Sensor_location' in col]
-            #pos = np.array([[float(row[col]) for col in sensor_location_cols[:2]] for _, row in df.iterrows()])
-            new_pos = np.array([[float(row[col]) for col in sensor_location_cols[:2]]])  # Ensure 2D shape
-            # Append the new row to pos
-            pos = np.vstack([pos, new_pos])
-
-            names += [row['Name']]
+    data = pd.to_numeric(scalars, errors='coerce').to_numpy(dtype=float)
+    pos = df[sensor_location_cols[:2]].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+    if 'Name' in df.columns:
+        names = df['Name'].fillna('').astype(str).tolist()
+    else:
+        names = [f"{ch_type}_{idx}" for idx in range(len(df))]
 
     # convert to arrays
     data = np.asarray(data, dtype=float)
     pos = np.asarray(pos, dtype=float)
+    valid = np.isfinite(data) & np.isfinite(pos).all(axis=1)
+    data = data[valid]
+    pos = pos[valid]
     if data.size == 0 or pos.size == 0:
         return []
 
@@ -1306,9 +1443,12 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
     """
     
     df = pd.read_csv(sensors_csv_path, sep='\t')
-
-    #take only those channels that are of right type:
-    df = df[df['Type'] == ch_type]
+    if 'Type' not in df.columns:
+        return []
+    # take only those channels that are of right type
+    df = df[df['Type'] == ch_type].copy()
+    if df.empty:
+        return []
 
     ch_tit, unit = get_tit_and_unit(ch_type)
 
@@ -1316,17 +1456,25 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
     if what_data=='peaks':
         fig_name='PP_manual_all_data_Topomap_'+ch_tit
         metric = 'PtP'
-        metric_column = 'PtP all'
     elif what_data=='stds':
         fig_name='STD_epoch_all_data_Topomap_'+ch_tit
         metric = 'STD'
-        metric_column = 'STD all'
     else:
         raise ValueError('what_data must be set to "stds" or "peaks"')
     
+    required = {'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'}
+    if not required.issubset(set(df.columns)):
+        return []
+    scalar = _metric_scalar_series(df, what_data)
+    if scalar.empty:
+        return []
+    df['__metric_value__'] = pd.to_numeric(scalar, errors='coerce')
+    df = df.dropna(subset=['__metric_value__', 'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'])
+    if df.empty:
+        return []
 
     # Create a DataFrame with sensor locations as columns
-    sensor_df = df[['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2', metric_column, 'Name']]
+    sensor_df = df[['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2', '__metric_value__', 'Name']]
 
     # Group by sensor locations, this is done in case we got GRADIOMETERS,
     # cos they have 2 sensors located in the same spot.
@@ -1335,13 +1483,15 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
     # We assume that means std/ptp of physically close to each other gardiomeeters is also close in value.
     # Here also create groupped names, later used in hover 
     grouped = sensor_df.groupby(['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2']).agg({
-        metric_column: 'mean',
-        'Name': lambda x: ', '.join([f"{name} - {metric}: {std:.2e} {unit}" for name, std in zip(x, sensor_df.loc[x.index, metric_column])])
+        '__metric_value__': 'mean',
+        'Name': lambda x: ', '.join([f"{name} - {metric}: {std:.2e} {unit}" for name, std in zip(x, sensor_df.loc[x.index, '__metric_value__'])])
     }).reset_index()
+    if grouped.empty:
+        return []
 
     # Extract the grouped sensor locations and mean metric values
     grouped_sensor_locations = grouped[['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2']].values
-    mean_metric_values = grouped[metric_column].values
+    mean_metric_values = grouped['__metric_value__'].values
     grouped_names = grouped['Name'].values
 
     # Create the 3D scatter plot
@@ -1369,6 +1519,12 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
         text=grouped_names,  # Use channel names and formatted mean metric values as hover text
         hoverinfo='text'
     ))
+    _add_solid_cap_toggle_to_3d_figure(
+        fig,
+        grouped_sensor_locations[:, 0],
+        grouped_sensor_locations[:, 1],
+        grouped_sensor_locations[:, 2],
+    )
 
     # Set plot layout
     fig.update_layout(
@@ -1458,6 +1614,7 @@ def _plot_3d_channel_metric_csv(
             showlegend=False,
         )
     )
+    _add_solid_cap_toggle_to_3d_figure(fig, x_vals, y_vals, z_vals)
     fig.update_layout(
         height=860,
         margin=dict(t=20, r=24, b=16, l=20),
@@ -2070,7 +2227,12 @@ def boxplot_all_time_csv(std_csv_path: str, ch_type: str, what_data: str):
 
     #First, convert scv back into dict with MEG_channel objects:
 
-    df = pd.read_csv(std_csv_path, sep='\t')  
+    df = pd.read_csv(std_csv_path, sep='\t')
+    if 'Type' not in df.columns:
+        return []
+    df = df[df['Type'] == ch_type].copy()
+    if df.empty:
+        return []
 
     ch_tit, unit = get_tit_and_unit(ch_type)
 
@@ -2095,22 +2257,38 @@ def boxplot_all_time_csv(std_csv_path: str, ch_type: str, what_data: str):
     values_all=[]
     traces = []
 
-    for index, row in df.iterrows():
+    scalars = _metric_scalar_series(df, what_data)
+    if scalars.empty:
+        return []
 
-        if row['Type'] == ch_type: #plot only mag/grad
+    default_color = '#2B6CB0'
+    for idx, row in df.iterrows():
+        data = float(scalars.get(idx, np.nan))
+        if not np.isfinite(data):
+            continue
 
-            if what_data == 'stds':
-                data = row['STD all']
-            elif what_data == 'peaks':
-                data = row['PtP all']
+        values_all += [data]
 
-            values_all += [data]
+        y = random.uniform(-0.2 * boxwidth, 0.2 * boxwidth)
+        # Here random Y is visualization-only to spread points around the box.
+        lobe = str(row.get('Lobe', 'channels'))
+        lobe_color = row.get('Lobe Color', default_color)
+        ch_name = str(row.get('Name', f'{ch_type}_{idx}'))
+        traces += [
+            go.Scatter(
+                x=[data],
+                y=[y],
+                mode='markers',
+                marker=dict(size=5, color=lobe_color),
+                name=ch_name,
+                legendgroup=lobe,
+                legendgrouptitle=dict(text=lobe.upper()),
+            )
+        ]
 
-            y = random.uniform(-0.2*boxwidth, 0.2*boxwidth) 
-            #here create random y values for data dots, they dont have a meaning, just used so that dots are scattered around the box plot and not in 1 line.
-            
-            traces += [go.Scatter(x=[data], y=[y], mode='markers', marker=dict(size=5, color=row['Lobe Color']), name=row['Name'], legendgroup=row['Lobe'], legendgrouptitle=dict(text=row['Lobe'].upper()))]
 
+    if not values_all:
+        return []
 
     # create box plot trace
     box_trace = go.Box(x=values_all, y0=0, orientation='h', name='box', line_width=1, opacity=0.7, boxpoints=False, width=boxwidth, showlegend=False)
@@ -2968,59 +3146,74 @@ def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_
 
     for tsv_path in tsv_paths:
         basename = os.path.basename(tsv_path)
+
+        def _extend_safe(target: list, func, *args, **kwargs) -> None:
+            """Run one plotting builder safely; keep other figures on failure."""
+            try:
+                out = func(*args, **kwargs)
+            except Exception as exc:
+                print(f"___MEGqc___: Skipping plot '{func.__name__}' for '{basename}': {exc}")
+                return
+            if out:
+                target += out
+
         if 'desc-stimulus' in basename:
-            stim_derivs = plot_stim_csv(tsv_path)
+            _extend_safe(stim_derivs, plot_stim_csv, tsv_path)
 
         if 'STD' in metric.upper():
             if include_sensor_plots:
-                std_derivs += plot_sensors_3d_csv(tsv_path)
+                _extend_safe(std_derivs, plot_sensors_3d_csv, tsv_path)
             for m_or_g in m_or_g_chosen:
-                std_derivs += plot_3d_topomap_std_ptp_csv(tsv_path, ch_type=m_or_g, what_data='stds')
-                std_derivs += boxplot_all_time_csv(tsv_path, ch_type=m_or_g, what_data='stds')
-                std_derivs += boxplot_epoched_xaxis_channels_csv(tsv_path, ch_type=m_or_g, what_data='stds')
+                _extend_safe(std_derivs, plot_3d_topomap_std_ptp_csv, tsv_path, ch_type=m_or_g, what_data='stds')
+                _extend_safe(std_derivs, boxplot_all_time_csv, tsv_path, ch_type=m_or_g, what_data='stds')
+                _extend_safe(std_derivs, boxplot_epoched_xaxis_channels_csv, tsv_path, ch_type=m_or_g, what_data='stds')
 
         if 'PTP' in metric.upper():
             if include_sensor_plots:
-                ptp_manual_derivs += plot_sensors_3d_csv(tsv_path)
+                _extend_safe(ptp_manual_derivs, plot_sensors_3d_csv, tsv_path)
             for m_or_g in m_or_g_chosen:
-                ptp_manual_derivs += plot_3d_topomap_std_ptp_csv(tsv_path, ch_type=m_or_g, what_data='peaks')
-                ptp_manual_derivs += boxplot_all_time_csv(tsv_path, ch_type=m_or_g, what_data='peaks')
-                ptp_manual_derivs += boxplot_epoched_xaxis_channels_csv(tsv_path, ch_type=m_or_g, what_data='peaks')
+                _extend_safe(ptp_manual_derivs, plot_3d_topomap_std_ptp_csv, tsv_path, ch_type=m_or_g, what_data='peaks')
+                _extend_safe(ptp_manual_derivs, boxplot_all_time_csv, tsv_path, ch_type=m_or_g, what_data='peaks')
+                _extend_safe(ptp_manual_derivs, boxplot_epoched_xaxis_channels_csv, tsv_path, ch_type=m_or_g, what_data='peaks')
 
         elif 'PSD' in metric.upper():
             method = 'welch'
             if include_sensor_plots:
-                psd_derivs += plot_sensors_3d_csv(tsv_path)
+                _extend_safe(psd_derivs, plot_sensors_3d_csv, tsv_path)
             for m_or_g in m_or_g_chosen:
-                psd_derivs += Plot_psd_csv(m_or_g, tsv_path, method)
-                psd_derivs += plot_pie_chart_freq_csv(tsv_path, m_or_g=m_or_g, noise_or_waves='noise')
-                psd_derivs += plot_pie_chart_freq_csv(tsv_path, m_or_g=m_or_g, noise_or_waves='waves')
-                psd_derivs += plot_3d_topomap_psd_csv(tsv_path, ch_type=m_or_g)
+                _extend_safe(psd_derivs, Plot_psd_csv, m_or_g, tsv_path, method)
+                _extend_safe(psd_derivs, plot_pie_chart_freq_csv, tsv_path, m_or_g=m_or_g, noise_or_waves='noise')
+                _extend_safe(psd_derivs, plot_pie_chart_freq_csv, tsv_path, m_or_g=m_or_g, noise_or_waves='waves')
+                _extend_safe(psd_derivs, plot_3d_topomap_psd_csv, tsv_path, ch_type=m_or_g)
 
         elif 'ECG' in metric.upper():
             if include_sensor_plots:
-                ecg_derivs += plot_sensors_3d_csv(tsv_path)
-            ecg_derivs += plot_ECG_EOG_channel_csv(tsv_path)
-            ecg_derivs += plot_mean_rwave_csv(tsv_path, 'ECG')
+                _extend_safe(ecg_derivs, plot_sensors_3d_csv, tsv_path)
+            _extend_safe(ecg_derivs, plot_ECG_EOG_channel_csv, tsv_path)
+            _extend_safe(ecg_derivs, plot_mean_rwave_csv, tsv_path, 'ECG')
             for m_or_g in m_or_g_chosen:
-                ecg_derivs += plot_artif_per_ch_3_groups(tsv_path, m_or_g, 'ECG', flip_data=False)
-                ecg_derivs += plot_3d_topomap_ecg_eog_csv(tsv_path, m_or_g, 'ECG')
+                _extend_safe(ecg_derivs, plot_artif_per_ch_3_groups, tsv_path, m_or_g, 'ECG', flip_data=False)
+                _extend_safe(ecg_derivs, plot_3d_topomap_ecg_eog_csv, tsv_path, m_or_g, 'ECG')
 
         elif 'EOG' in metric.upper():
             if include_sensor_plots:
-                eog_derivs += plot_sensors_3d_csv(tsv_path)
-            eog_derivs += plot_ECG_EOG_channel_csv(tsv_path)
-            eog_derivs += plot_mean_rwave_csv(tsv_path, 'EOG')
+                _extend_safe(eog_derivs, plot_sensors_3d_csv, tsv_path)
+            _extend_safe(eog_derivs, plot_ECG_EOG_channel_csv, tsv_path)
+            _extend_safe(eog_derivs, plot_mean_rwave_csv, tsv_path, 'EOG')
             for m_or_g in m_or_g_chosen:
-                eog_derivs += plot_artif_per_ch_3_groups(tsv_path, m_or_g, 'EOG', flip_data=False)
-                eog_derivs += plot_3d_topomap_ecg_eog_csv(tsv_path, m_or_g, 'EOG')
+                _extend_safe(eog_derivs, plot_artif_per_ch_3_groups, tsv_path, m_or_g, 'EOG', flip_data=False)
+                _extend_safe(eog_derivs, plot_3d_topomap_ecg_eog_csv, tsv_path, m_or_g, 'EOG')
 
         elif 'MUSCLE' in metric.upper():
-            muscle_derivs += plot_muscle_csv(tsv_path)
+            _extend_safe(muscle_derivs, plot_muscle_csv, tsv_path)
 
         elif 'HEAD' in metric.upper():
-            head_pos_derivs, _ = plot_head_pos_csv(tsv_path)
-            head_derivs += head_pos_derivs
+            try:
+                head_pos_derivs, _ = plot_head_pos_csv(tsv_path)
+                if head_pos_derivs:
+                    head_derivs += head_pos_derivs
+            except Exception as exc:
+                print(f"___MEGqc___: Skipping plot 'plot_head_pos_csv' for '{basename}': {exc}")
 
     qc_derivs = {
         'TIME_SERIES': time_series_derivs,

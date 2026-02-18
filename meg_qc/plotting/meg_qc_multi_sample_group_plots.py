@@ -38,17 +38,19 @@ from meg_qc.plotting.meg_qc_group_plots import (
     _build_subtabs_html,
     _combine_accumulators,
     _discover_run_records,
+    _epoch_consistency_notes,
     _epoch_values_from_profiles,
     _figure_block,
     _finite_array,
+    _heatmap_variants_by_condition_from_acc,
     _lazy_payload_script_tags_html,
     _load_settings_snapshot,
     _make_ecdf_figure,
-    _mean_matrices_by_condition,
     _reset_lazy_figure_store,
     _run_rows_dataframe,
     plot_density_distribution,
     plot_heatmap_sorted_channels_windows,
+    plot_topomap_3d_if_available,
     plot_histogram_distribution,
     plot_topomap_if_available,
     plot_violin_with_subject_jitter,
@@ -451,6 +453,7 @@ def _condition_figure_blocks_local(
     figures_by_condition: Dict[str, Optional[go.Figure]],
     interpretation: str,
     *,
+    interpretation_by_condition: Optional[Dict[str, str]] = None,
     normalized_variant: bool = False,
     norm_mode: str = "y",
 ) -> str:
@@ -460,10 +463,13 @@ def _condition_figure_blocks_local(
         if fig is None:
             continue
         chunks.append(f"<h4>{condition}</h4>")
+        note = interpretation
+        if interpretation_by_condition is not None and condition in interpretation_by_condition:
+            note = f"{interpretation} {interpretation_by_condition[condition]}"
         chunks.append(
             _figure_block(
                 fig,
-                interpretation,
+                note,
                 normalized_variant=normalized_variant,
                 norm_mode=norm_mode,
             )
@@ -508,8 +514,8 @@ def _build_metric_panel(
     formula_b: str,
     formula_c: str,
     fingerprint_spec: Optional[Tuple[str, str, str, str]] = None,
-    heatmap_matrix_getter_by_variant: Optional[Dict[str, Callable[[ChTypeAccumulator], Dict[str, np.ndarray]]]] = None,
-    heatmap_summary_mode_by_variant: Optional[Dict[str, str]] = None,
+    heatmap_variants_getter: Optional[Callable[[ChTypeAccumulator], Dict[str, Dict[str, np.ndarray]]]] = None,
+    heatmap_epoch_notes_getter: Optional[Callable[[ChTypeAccumulator], Dict[str, str]]] = None,
     topomap_attr: Optional[str] = None,
     tab_token: str = "tab",
 ) -> str:
@@ -615,52 +621,46 @@ def _build_metric_panel(
             )
         )
 
-    if heatmap_matrix_getter_by_variant is not None and heatmap_summary_mode_by_variant is not None:
+    if heatmap_variants_getter is not None:
         sample_tabs: List[Tuple[str, str]] = []
         for bundle in bundles:
             acc = bundle.tab_accumulators.get(tab_name)
             if acc is None:
                 continue
-            variant_tabs: List[Tuple[str, str]] = []
-            for variant in ordered:
-                getter = heatmap_matrix_getter_by_variant.get(variant)
-                if getter is None:
-                    continue
-                matrices = getter(acc)
-                figures = {
-                    cond: plot_heatmap_sorted_channels_windows(
-                        matrix,
-                        title=f"{metric_name} channel-epoch map ({variant}) ({cond})",
-                        color_title=value_label,
-                        summary_mode=heatmap_summary_mode_by_variant.get(variant, "median"),
-                    )
-                    for cond, matrix in sorted(matrices.items())
-                }
-                variant_tabs.append(
-                    (
-                        variant,
-                        _condition_figure_blocks_local(
-                            figures,
-                            (
-                                "Heatmap cell = one channel-by-epoch value. Top strip is the epoch profile with channel quantile bands; "
-                                "side strip is sorted channel summary."
-                            ),
-                            normalized_variant=True,
-                            norm_mode="z",
-                        ),
-                    )
+            matrices_by_condition = heatmap_variants_getter(acc)
+            if not matrices_by_condition:
+                continue
+            notes = heatmap_epoch_notes_getter(acc) if heatmap_epoch_notes_getter is not None else None
+            figures = {
+                cond: plot_heatmap_sorted_channels_windows(
+                    variants,
+                    title=f"{metric_name} channel-epoch map ({cond})",
+                    color_title=value_label,
+                    summary_mode=("upper_tail" if metric_name.lower().startswith("ptp") else "median"),
+                    channel_names=(
+                        getattr(acc, topomap_attr, {}).get(cond).layout.names
+                        if (topomap_attr is not None and getattr(acc, topomap_attr, {}).get(cond) is not None)
+                        else None
+                    ),
                 )
-            if variant_tabs:
-                sample_tabs.append(
-                    (
-                        bundle.sample_id,
-                        _build_subtabs_html(
-                            f"{tab_token}-{_sanitize_token(metric_name)}-heatmap-{bundle.sample_id}",
-                            variant_tabs,
-                            level=4,
+                for cond, variants in sorted(matrices_by_condition.items())
+            }
+            sample_tabs.append(
+                (
+                    bundle.sample_id,
+                    _condition_figure_blocks_local(
+                        figures,
+                        (
+                            "Heatmap cell = one channel-by-epoch value. "
+                            "Bottom buttons switch heatmap variant (median/mean/upper tail) and "
+                            "independently switch top/right profile central summaries."
                         ),
-                    )
+                        interpretation_by_condition=notes,
+                        normalized_variant=True,
+                        norm_mode="z",
+                    ),
                 )
+            )
         if sample_tabs:
             chunks.append("<h4>Heatmaps by dataset</h4>" + _build_subtabs_html(
                 f"{tab_token}-{_sanitize_token(metric_name)}-heatmaps-by-dataset",
@@ -675,22 +675,66 @@ def _build_metric_panel(
             if acc is None:
                 continue
             payloads: Dict[str, TopomapPayload] = getattr(acc, topomap_attr, {})
-            figures = {
-                cond: plot_topomap_if_available(
+            cond_tabs: List[Tuple[str, str]] = []
+            for idx, (cond, payload) in enumerate(sorted(payloads.items())):
+                fig_2d = plot_topomap_if_available(
                     payload,
                     title=f"{metric_name} topographic footprint ({cond})",
                     color_title=value_label,
                 )
-                for cond, payload in sorted(payloads.items())
-            }
-            html = _condition_figure_blocks_local(
-                figures,
-                (
-                    "Each marker is one channel summary value. For Elekta triplets, overlapping points are spread to preserve one MAG and two GRAD channel values."
-                ),
-                normalized_variant=True,
-                norm_mode="color",
-            )
+                fig_3d = plot_topomap_3d_if_available(
+                    payload,
+                    title=f"{metric_name} topographic footprint (3D) ({cond})",
+                    color_title=value_label,
+                )
+                view_tabs: List[Tuple[str, str]] = []
+                if fig_2d is not None:
+                    view_tabs.append(
+                        (
+                            "2D",
+                            _figure_block(
+                                fig_2d,
+                                (
+                                    "Each marker is one channel summary value. For Elekta triplets, overlapping points are spread "
+                                    "to preserve one MAG and two GRAD channel values."
+                                ),
+                                normalized_variant=True,
+                                norm_mode="color",
+                            ),
+                        )
+                    )
+                if fig_3d is not None:
+                    view_tabs.append(
+                        (
+                            "3D",
+                            _figure_block(
+                                fig_3d,
+                                (
+                                    "3D view of the same channel summaries. Rotate to inspect spatial clustering while keeping "
+                                    "the same value scale as the 2D map."
+                                ),
+                                normalized_variant=True,
+                                norm_mode="color",
+                            ),
+                        )
+                    )
+                if not view_tabs:
+                    continue
+                cond_tabs.append(
+                    (
+                        cond,
+                        _build_subtabs_html(
+                            f"{tab_token}-{_sanitize_token(metric_name)}-topo-{bundle.sample_id}-{idx}",
+                            view_tabs,
+                            level=4,
+                        ),
+                    )
+                )
+            html = _build_subtabs_html(
+                f"{tab_token}-{_sanitize_token(metric_name)}-topo-conds-{bundle.sample_id}",
+                cond_tabs,
+                level=3,
+            ) if cond_tabs else "<p>Topographic maps not shown: channel positions not available in stored outputs.</p>"
             sample_tabs.append((bundle.sample_id, html))
         if sample_tabs:
             chunks.append("<h4>Topographic maps by dataset</h4>" + _build_subtabs_html(
@@ -750,16 +794,14 @@ def _build_multi_metric_details_section(
             f"Median channel STD per recording ({amplitude_unit})",
             f"Upper-tail channel STD per recording ({amplitude_unit})",
         ),
-        heatmap_matrix_getter_by_variant={
-            "Median": lambda acc: dict(acc.std_heatmap_by_condition),
-            "Mean": lambda acc: _mean_matrices_by_condition(
-                acc.std_heatmap_sum_by_condition,
-                acc.std_heatmap_count_by_condition,
-                include_all_tasks=True,
-            ),
-            "Upper tail": lambda acc: dict(acc.std_heatmap_upper_by_condition),
-        },
-        heatmap_summary_mode_by_variant={"Median": "median", "Mean": "median", "Upper tail": "upper_tail"},
+        heatmap_variants_getter=lambda acc: _heatmap_variants_by_condition_from_acc(
+            acc.std_heatmap_runs_by_condition,
+            acc.std_heatmap_by_condition,
+            acc.std_heatmap_sum_by_condition,
+            acc.std_heatmap_count_by_condition,
+            acc.std_heatmap_upper_by_condition,
+        ),
+        heatmap_epoch_notes_getter=lambda acc: _epoch_consistency_notes(acc.std_heatmap_runs_by_condition),
         topomap_attr="std_topomap_by_condition",
         tab_token=tab_token,
     )
@@ -791,16 +833,14 @@ def _build_multi_metric_details_section(
             f"Median channel PtP per recording ({amplitude_unit})",
             f"Upper-tail channel PtP per recording ({amplitude_unit})",
         ),
-        heatmap_matrix_getter_by_variant={
-            "Median": lambda acc: dict(acc.ptp_heatmap_by_condition),
-            "Mean": lambda acc: _mean_matrices_by_condition(
-                acc.ptp_heatmap_sum_by_condition,
-                acc.ptp_heatmap_count_by_condition,
-                include_all_tasks=True,
-            ),
-            "Upper tail": lambda acc: dict(acc.ptp_heatmap_upper_by_condition),
-        },
-        heatmap_summary_mode_by_variant={"Median": "median", "Mean": "median", "Upper tail": "upper_tail"},
+        heatmap_variants_getter=lambda acc: _heatmap_variants_by_condition_from_acc(
+            acc.ptp_heatmap_runs_by_condition,
+            acc.ptp_heatmap_by_condition,
+            acc.ptp_heatmap_sum_by_condition,
+            acc.ptp_heatmap_count_by_condition,
+            acc.ptp_heatmap_upper_by_condition,
+        ),
+        heatmap_epoch_notes_getter=lambda acc: _epoch_consistency_notes(acc.ptp_heatmap_runs_by_condition),
         topomap_attr="ptp_topomap_by_condition",
         tab_token=tab_token,
     )
@@ -1462,10 +1502,18 @@ def _build_multi_sample_report_html(
           }}
           try {{
             const renderResult = Plotly.newPlot(el, payload.figure.data || [], payload.figure.layout || {{}}, payload.config || {{responsive: true, displaylogo: false}});
+            const postRender = (renderResult && typeof renderResult.then === 'function')
+              ? renderResult
+              : Promise.resolve(renderResult);
+            const withFrames = postRender.then(() => {{
+              const frames = (payload.figure && payload.figure.frames) ? payload.figure.frames : [];
+              if (frames && frames.length > 0 && typeof Plotly.addFrames === 'function') {{
+                return Plotly.addFrames(el, frames).catch(() => undefined);
+              }}
+              return undefined;
+            }});
             el.dataset.rendered = '1';
-            if (renderResult && typeof renderResult.then === 'function') {{
-              renderPromises.push(renderResult.catch(() => undefined));
-            }}
+            renderPromises.push(withFrames.catch(() => undefined));
           }} catch (err) {{
             // no-op
           }}

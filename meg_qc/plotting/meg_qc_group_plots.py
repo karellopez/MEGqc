@@ -92,6 +92,7 @@ class SensorLayout:
     x: np.ndarray
     y: np.ndarray
     names: List[str]
+    z: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -177,6 +178,8 @@ class ChTypeAccumulator:
     std_heatmap_upper_score_by_condition: Dict[str, float] = field(default_factory=dict)
     std_heatmap_sum_by_condition: Dict[str, np.ndarray] = field(default_factory=dict)
     std_heatmap_count_by_condition: Dict[str, np.ndarray] = field(default_factory=dict)
+    std_heatmap_runs_by_condition: Dict[str, List[np.ndarray]] = field(default_factory=lambda: defaultdict(list))
+    std_epoch_counts_by_condition: Dict[str, List[int]] = field(default_factory=lambda: defaultdict(list))
 
     ptp_heatmap_by_condition: Dict[str, np.ndarray] = field(default_factory=dict)
     ptp_heatmap_score_by_condition: Dict[str, float] = field(default_factory=dict)
@@ -185,6 +188,8 @@ class ChTypeAccumulator:
     ptp_heatmap_upper_score_by_condition: Dict[str, float] = field(default_factory=dict)
     ptp_heatmap_sum_by_condition: Dict[str, np.ndarray] = field(default_factory=dict)
     ptp_heatmap_count_by_condition: Dict[str, np.ndarray] = field(default_factory=dict)
+    ptp_heatmap_runs_by_condition: Dict[str, List[np.ndarray]] = field(default_factory=lambda: defaultdict(list))
+    ptp_epoch_counts_by_condition: Dict[str, List[int]] = field(default_factory=lambda: defaultdict(list))
 
     std_topomap_by_condition: Dict[str, TopomapPayload] = field(default_factory=dict)
     ptp_topomap_by_condition: Dict[str, TopomapPayload] = field(default_factory=dict)
@@ -365,6 +370,7 @@ def _load_sensor_layout(path: Path) -> Dict[str, SensorLayout]:
 
     x_col = _find_column(df, ["Sensor_location_0", "sensor_location_0", "loc_x", "x"])
     y_col = _find_column(df, ["Sensor_location_1", "sensor_location_1", "loc_y", "y"])
+    z_col = _find_column(df, ["Sensor_location_2", "sensor_location_2", "loc_z", "z"])
     name_col = _find_column(df, ["Name", "name", "Channel", "channel"])
     if x_col is None or y_col is None:
         return {}
@@ -376,11 +382,12 @@ def _load_sensor_layout(path: Path) -> Dict[str, SensorLayout]:
             continue
         x = pd.to_numeric(df_ch[x_col], errors="coerce").to_numpy(dtype=float)
         y = pd.to_numeric(df_ch[y_col], errors="coerce").to_numpy(dtype=float)
+        z = pd.to_numeric(df_ch[z_col], errors="coerce").to_numpy(dtype=float) if z_col is not None else None
         if name_col is not None:
             names = df_ch[name_col].fillna("").astype(str).tolist()
         else:
             names = [f"{ch_type}_{idx}" for idx in range(len(df_ch))]
-        out[ch_type] = SensorLayout(x=x, y=y, names=names)
+        out[ch_type] = SensorLayout(x=x, y=y, names=names, z=z)
     return out
 
 
@@ -401,6 +408,7 @@ def _store_topomap_payload_if_missing(
             x=np.asarray(layout.x[:n], dtype=float),
             y=np.asarray(layout.y[:n], dtype=float),
             names=list(layout.names[:n]),
+            z=(np.asarray(layout.z[:n], dtype=float) if layout.z is not None else None),
         ),
         values=vals[:n],
     )
@@ -434,6 +442,7 @@ def _update_topomap_payload_mean(
                 x=np.asarray(layout.x[:n], dtype=float),
                 y=np.asarray(layout.y[:n], dtype=float),
                 names=list(layout.names[:n]),
+                z=(np.asarray(layout.z[:n], dtype=float) if layout.z is not None else None),
             ),
             values=init_vals,
         )
@@ -461,6 +470,7 @@ def _update_topomap_payload_mean(
             x=np.asarray(payload.layout.x[:m], dtype=float),
             y=np.asarray(payload.layout.y[:m], dtype=float),
             names=list(payload.layout.names[:m]),
+            z=(np.asarray(payload.layout.z[:m], dtype=float) if payload.layout.z is not None else None),
         ),
         values=out,
     )
@@ -898,6 +908,69 @@ def _mean_matrix_from_sum_count(sum_matrix: np.ndarray, count_matrix: np.ndarray
     return out
 
 
+def _pad_matrix_with_nan(matrix: np.ndarray, n_rows: int, n_cols: int) -> np.ndarray:
+    arr = np.asarray(matrix, dtype=float)
+    if arr.ndim != 2:
+        return np.full((n_rows, n_cols), np.nan, dtype=float)
+    out = np.full((n_rows, n_cols), np.nan, dtype=float)
+    r = min(n_rows, arr.shape[0])
+    c = min(n_cols, arr.shape[1])
+    out[:r, :c] = arr[:r, :c]
+    return out
+
+
+def _aggregate_heatmap_variants_from_runs(
+    run_matrices_by_condition: Dict[str, List[np.ndarray]],
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """Aggregate one condition-level matrix per summary variant.
+
+    Output structure is:
+    ``{condition: {"Median": matrix, "Mean": matrix, "Upper tail": matrix}}``.
+    All variants for a condition share the same shape, so epoch axis stays
+    stable while users switch between variants.
+    """
+    out: Dict[str, Dict[str, np.ndarray]] = {}
+    for cond, matrices in run_matrices_by_condition.items():
+        mats = [np.asarray(m, dtype=float) for m in matrices if np.asarray(m).ndim == 2 and np.asarray(m).size > 0]
+        if not mats:
+            continue
+        n_rows = max(m.shape[0] for m in mats)
+        n_cols = max(m.shape[1] for m in mats)
+        stack = np.full((len(mats), n_rows, n_cols), np.nan, dtype=float)
+        for idx, mat in enumerate(mats):
+            stack[idx, :, :] = _pad_matrix_with_nan(mat, n_rows, n_cols)
+        out[cond] = {
+            "Median": np.nanmedian(stack, axis=0),
+            "Mean": np.nanmean(stack, axis=0),
+            "Upper tail": np.nanquantile(stack, 0.95, axis=0),
+        }
+    return out
+
+
+def _epoch_consistency_notes(
+    run_matrices_by_condition: Dict[str, List[np.ndarray]],
+) -> Dict[str, str]:
+    """Build per-condition note describing whether epoch counts are aligned."""
+    notes: Dict[str, str] = {}
+    for cond, matrices in run_matrices_by_condition.items():
+        counts = sorted({int(np.asarray(m).shape[1]) for m in matrices if np.asarray(m).ndim == 2 and np.asarray(m).size > 0})
+        if not counts:
+            continue
+        if len(counts) == 1:
+            notes[cond] = (
+                f"Epoch counts are aligned across recordings in this task/condition "
+                f"(n_epochs={counts[0]})."
+            )
+        else:
+            span = ", ".join(str(c) for c in counts)
+            notes[cond] = (
+                f"Epoch counts vary across recordings in this task/condition ({span}). "
+                "Matrices are padded during aggregation; padded cells are excluded "
+                "from matrix statistics."
+            )
+    return notes
+
+
 def _ecdf(values: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
     arr = _finite_array(values)
     if arr.size == 0:
@@ -1161,163 +1234,341 @@ def _robust_bounds(values: np.ndarray) -> Optional[Tuple[float, float]]:
 
 
 def plot_heatmap_sorted_channels_windows(
-    matrix: np.ndarray,
+    matrix: np.ndarray | Dict[str, np.ndarray],
     title: str,
     color_title: str,
     summary_mode: str = "median",
+    channel_names: Optional[Sequence[str]] = None,
 ) -> Optional[go.Figure]:
-    """Render channel-by-epoch heatmap with compact summaries in one panel.
+    """Render a channel-by-epoch heatmap with top/right summary controls.
 
-    Layout:
-    - Top-left: epoch profile with median + quantile bands across channels.
-    - Bottom-left: channel x epoch heatmap (channels sorted by summary burden).
-    - Bottom-right: per-channel summary strip for quick ranking context.
+    Parameters
+    ----------
+    matrix
+        Either one matrix (``channels x epochs``) or a dict with multiple
+        condition-level variants keyed by labels such as ``Median``, ``Mean``,
+        ``Upper tail``.
     """
-    arr = np.asarray(matrix, dtype=float)
-    if arr.ndim != 2 or arr.size == 0:
+    if isinstance(matrix, dict):
+        raw_variants = {
+            str(label): np.asarray(arr, dtype=float)
+            for label, arr in matrix.items()
+            if np.asarray(arr).ndim == 2 and np.asarray(arr).size > 0
+        }
+    else:
+        arr = np.asarray(matrix, dtype=float)
+        raw_variants = {"Median": arr} if arr.ndim == 2 and arr.size > 0 else {}
+    if not raw_variants:
         return None
 
-    if summary_mode == "upper_tail":
-        ch_summary = np.nanquantile(arr, 0.95, axis=1)
+    ordered_labels = [lbl for lbl in ("Median", "Mean", "Upper tail") if lbl in raw_variants]
+    ordered_labels.extend([lbl for lbl in raw_variants.keys() if lbl not in ordered_labels])
+    base_label = "Median" if "Median" in raw_variants else ordered_labels[0]
+
+    n_rows = max(arr.shape[0] for arr in raw_variants.values())
+    n_cols = max(arr.shape[1] for arr in raw_variants.values())
+    padded = {label: _pad_matrix_with_nan(arr, n_rows, n_cols) for label, arr in raw_variants.items()}
+    if channel_names is not None:
+        supplied = [str(n) for n in channel_names]
     else:
-        ch_summary = np.nanmedian(arr, axis=1)
-    order = np.argsort(np.nan_to_num(ch_summary, nan=-np.inf))[::-1]
-    arr = arr[order, :]
-    ch_summary = ch_summary[order]
+        supplied = []
+    if len(supplied) < n_rows:
+        supplied = supplied + [f"channel-{idx:04d}" for idx in range(len(supplied), n_rows)]
+    base_channel_names = np.asarray(supplied[:n_rows], dtype=object)
 
-    row_keep = _downsample_indices(arr.shape[0], MAX_HEATMAP_CHANNELS)
-    col_keep = _downsample_indices(arr.shape[1], MAX_HEATMAP_WINDOWS)
+    base = padded[base_label]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        if summary_mode == "upper_tail":
+            base_summary = np.nanquantile(base, 0.95, axis=1)
+        else:
+            base_summary = np.nanmedian(base, axis=1)
+    order = np.argsort(np.nan_to_num(base_summary, nan=-np.inf))[::-1]
 
-    z = arr[row_keep][:, col_keep]
-    x = np.arange(arr.shape[1], dtype=int)[col_keep]
-    y = np.arange(arr.shape[0], dtype=int)[row_keep]
-    top_q05 = np.nanquantile(arr[:, col_keep], 0.05, axis=0)
-    top_q25 = np.nanquantile(arr[:, col_keep], 0.25, axis=0)
-    top_q50 = np.nanmedian(arr[:, col_keep], axis=0)
-    top_q75 = np.nanquantile(arr[:, col_keep], 0.75, axis=0)
-    top_q95 = np.nanquantile(arr[:, col_keep], 0.95, axis=0)
-    side_strip = ch_summary[row_keep]
+    row_keep = _downsample_indices(n_rows, MAX_HEATMAP_CHANNELS)
+    col_keep = _downsample_indices(n_cols, MAX_HEATMAP_WINDOWS)
 
-    bounds = _robust_bounds(z)
+    def _payload_for(arr: np.ndarray) -> Dict[str, np.ndarray]:
+        arr_sorted = arr[order, :]
+        z = arr_sorted[row_keep][:, col_keep]
+        x = np.arange(n_cols, dtype=int)[col_keep]
+        y = np.arange(n_rows, dtype=int)[row_keep]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            top_q05 = np.nanquantile(arr_sorted[:, col_keep], 0.05, axis=0)
+            top_q25 = np.nanquantile(arr_sorted[:, col_keep], 0.25, axis=0)
+            top_q50 = np.nanmedian(arr_sorted[:, col_keep], axis=0)
+            top_q75 = np.nanquantile(arr_sorted[:, col_keep], 0.75, axis=0)
+            top_q95 = np.nanquantile(arr_sorted[:, col_keep], 0.95, axis=0)
+            top_mean = np.nanmean(arr_sorted[:, col_keep], axis=0)
+
+            right_q05 = np.nanquantile(arr_sorted[row_keep, :], 0.05, axis=1)
+            right_q25 = np.nanquantile(arr_sorted[row_keep, :], 0.25, axis=1)
+            right_q50 = np.nanmedian(arr_sorted[row_keep, :], axis=1)
+            right_q75 = np.nanquantile(arr_sorted[row_keep, :], 0.75, axis=1)
+            right_q95 = np.nanquantile(arr_sorted[row_keep, :], 0.95, axis=1)
+            right_mean = np.nanmean(arr_sorted[row_keep, :], axis=1)
+
+        sorted_names = base_channel_names[order]
+        row_names = sorted_names[row_keep]
+        heat_custom = np.tile(np.asarray(row_names, dtype=object)[:, None], (1, x.size))
+
+        return {
+            "x": x,
+            "y": y,
+            "z": z,
+            "heat_custom": heat_custom,
+            "right_custom": np.asarray(row_names, dtype=object),
+            "top_q05": top_q05,
+            "top_q25": top_q25,
+            "top_q50": top_q50,
+            "top_q75": top_q75,
+            "top_q95": top_q95,
+            "top_mean": top_mean,
+            "right_q05": right_q05,
+            "right_q25": right_q25,
+            "right_q50": right_q50,
+            "right_q75": right_q75,
+            "right_q95": right_q95,
+            "right_mean": right_mean,
+        }
+
+    payload_by_label = {label: _payload_for(padded[label]) for label in ordered_labels}
+    z_all = np.concatenate(
+        [vals["z"][np.isfinite(vals["z"])] for vals in payload_by_label.values() if np.any(np.isfinite(vals["z"]))],
+        axis=0,
+    ) if any(np.any(np.isfinite(vals["z"])) for vals in payload_by_label.values()) else np.array([], dtype=float)
+    bounds = _robust_bounds(z_all)
     if bounds is None:
         return None
     zmin, zmax = bounds
 
+    first = payload_by_label[ordered_labels[0]]
     fig = make_subplots(
         rows=2,
         cols=2,
-        row_heights=[0.30, 0.70],
-        column_widths=[0.84, 0.16],
-        specs=[
-            [{"type": "xy"}, {"type": "xy"}],
-            [{"type": "heatmap"}, {"type": "xy"}],
-        ],
-        horizontal_spacing=0.05,
-        vertical_spacing=0.08,
+        row_heights=[0.24, 0.76],
+        column_widths=[0.86, 0.14],
+        specs=[[{"type": "xy"}, {"type": "xy"}], [{"type": "heatmap"}, {"type": "xy"}]],
+        vertical_spacing=0.18,
+        horizontal_spacing=0.04,
     )
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=top_q95,
-            mode="lines",
-            line={"width": 0.0, "color": "rgba(0,0,0,0)"},
-            hoverinfo="skip",
-            showlegend=False,
-        ),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=top_q05,
-            mode="lines",
-            line={"width": 0.0, "color": "rgba(0,0,0,0)"},
-            fill="tonexty",
-            fillcolor="rgba(88,166,255,0.16)",
-            name="Middle 90% of channels",
-        ),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=top_q75,
-            mode="lines",
-            line={"width": 0.0, "color": "rgba(0,0,0,0)"},
-            hoverinfo="skip",
-            showlegend=False,
-        ),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=top_q25,
-            mode="lines",
-            line={"width": 0.0, "color": "rgba(0,0,0,0)"},
-            fill="tonexty",
-            fillcolor="rgba(30,136,229,0.22)",
-            name="Middle 50% of channels (IQR)",
-        ),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=top_q50,
-            mode="lines",
-            line={"width": 2.1, "color": "#184E77"},
-            name="Median across channels",
-            hovertemplate="epoch=%{x}<br>median=%{y:.3g}<extra></extra>",
-        ),
-        row=1,
-        col=1,
-    )
+
+    # Top panel (epoch profile with quantile bands).
+    fig.add_trace(go.Scatter(x=first["x"], y=first["top_q95"], mode="lines", line=dict(width=0), name="Middle 90% of channels", hoverinfo="skip"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=first["x"], y=first["top_q05"], mode="lines", line=dict(width=0), fill="tonexty", fillcolor="rgba(31,119,180,0.15)", name="Middle 90% of channels", hoverinfo="skip", showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=first["x"], y=first["top_q75"], mode="lines", line=dict(width=0), name="Middle 50% of channels", hoverinfo="skip"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=first["x"], y=first["top_q25"], mode="lines", line=dict(width=0), fill="tonexty", fillcolor="rgba(31,119,180,0.34)", name="Middle 50% of channels", hoverinfo="skip", showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=first["x"], y=first["top_q50"], mode="lines", line=dict(color="#0B3D91", width=2.4), name="Median across channels", hovertemplate="Epoch: %{x}<br>Median: %{y:.3g}<extra></extra>", visible=True), row=1, col=1)
+    fig.add_trace(go.Scatter(x=first["x"], y=first["top_mean"], mode="lines", line=dict(color="#D35400", width=2.4), name="Mean across channels", hovertemplate="Epoch: %{x}<br>Mean: %{y:.3g}<extra></extra>", visible=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=first["x"], y=first["top_q95"], mode="lines", line=dict(color="#8E44AD", width=2.4), name="Upper tail (q95) across channels", hovertemplate="Epoch: %{x}<br>Upper tail: %{y:.3g}<extra></extra>", visible=False), row=1, col=1)
+
+    # Heatmap panel.
     fig.add_trace(
         go.Heatmap(
-            x=x,
-            y=y,
-            z=z,
-            zmin=zmin,
-            zmax=zmax,
-            colorscale="Viridis",
-            colorbar={"title": color_title},
-            hovertemplate="epoch=%{x}<br>channel=%{y}<br>value=%{z:.3g}<extra></extra>",
-            showscale=True,
+            z=first["z"],
+            x=first["x"],
+            y=first["y"],
+            customdata=first["heat_custom"],
+            coloraxis="coloraxis",
+            hovertemplate="Channel: %{customdata}<br>Epoch: %{x}<br>Value: %{z:.3g}<extra></extra>",
+            name="Channel x epoch heatmap",
+            showscale=False,
         ),
         row=2,
         col=1,
     )
-    fig.add_trace(
-        go.Scatter(
-            x=side_strip,
-            y=y,
-            mode="lines",
-            line={"width": 2.0, "color": "#2A9D8F"},
-            name="Channel summary",
-        ),
-        row=2,
-        col=2,
+
+    # Right panel (channel profile with quantile bands).
+    fig.add_trace(go.Scatter(x=first["right_q95"], y=first["y"], mode="lines", line=dict(width=0), name="Middle 90% of epochs", showlegend=False, hoverinfo="skip"), row=2, col=2)
+    fig.add_trace(go.Scatter(x=first["right_q05"], y=first["y"], mode="lines", line=dict(width=0), fill="tonextx", fillcolor="rgba(31,119,180,0.15)", name="Middle 90% of epochs", showlegend=False, hoverinfo="skip"), row=2, col=2)
+    fig.add_trace(go.Scatter(x=first["right_q75"], y=first["y"], mode="lines", line=dict(width=0), name="Middle 50% of epochs", showlegend=False, hoverinfo="skip"), row=2, col=2)
+    fig.add_trace(go.Scatter(x=first["right_q25"], y=first["y"], mode="lines", line=dict(width=0), fill="tonextx", fillcolor="rgba(31,119,180,0.34)", name="Middle 50% of epochs", showlegend=False, hoverinfo="skip"), row=2, col=2)
+    fig.add_trace(go.Scatter(x=first["right_q50"], y=first["y"], customdata=first["right_custom"], mode="lines", line=dict(color="#17A589", width=2.1), hovertemplate="Channel: %{customdata}<br>Median across epochs: %{x:.3g}<extra></extra>", showlegend=False, visible=True), row=2, col=2)
+    fig.add_trace(go.Scatter(x=first["right_mean"], y=first["y"], customdata=first["right_custom"], mode="lines", line=dict(color="#D35400", width=2.1), hovertemplate="Channel: %{customdata}<br>Mean across epochs: %{x:.3g}<extra></extra>", showlegend=False, visible=False), row=2, col=2)
+    fig.add_trace(go.Scatter(x=first["right_q95"], y=first["y"], customdata=first["right_custom"], mode="lines", line=dict(color="#8E44AD", width=2.1), hovertemplate="Channel: %{customdata}<br>Upper tail (q95) across epochs: %{x:.3g}<extra></extra>", showlegend=False, visible=False), row=2, col=2)
+
+    trace_indices = list(range(15))
+
+    def _variant_restyle_args(payload: Dict[str, np.ndarray]) -> Dict[str, List[object]]:
+        """Build one restyle payload for all heatmap/top/right traces.
+
+        Using direct restyle updates avoids intermittent redraw issues from
+        frame animation in very large HTML reports.
+        """
+        none = None
+        return {
+            "x": [
+                payload["x"],  # top q95
+                payload["x"],  # top q05
+                payload["x"],  # top q75
+                payload["x"],  # top q25
+                payload["x"],  # top median
+                payload["x"],  # top mean
+                payload["x"],  # top upper-tail
+                payload["x"],  # heatmap
+                payload["right_q95"],  # right q95
+                payload["right_q05"],  # right q05
+                payload["right_q75"],  # right q75
+                payload["right_q25"],  # right q25
+                payload["right_q50"],  # right median
+                payload["right_mean"],  # right mean
+                payload["right_q95"],  # right upper-tail
+            ],
+            "y": [
+                payload["top_q95"],
+                payload["top_q05"],
+                payload["top_q75"],
+                payload["top_q25"],
+                payload["top_q50"],
+                payload["top_mean"],
+                payload["top_q95"],
+                payload["y"],
+                payload["y"],
+                payload["y"],
+                payload["y"],
+                payload["y"],
+                payload["y"],
+                payload["y"],
+                payload["y"],
+            ],
+            "z": [
+                none,
+                none,
+                none,
+                none,
+                none,
+                none,
+                none,
+                payload["z"],
+                none,
+                none,
+                none,
+                none,
+                none,
+                none,
+                none,
+            ],
+            "customdata": [
+                none,
+                none,
+                none,
+                none,
+                none,
+                none,
+                none,
+                payload["heat_custom"],
+                none,
+                none,
+                none,
+                none,
+                payload["right_custom"],
+                payload["right_custom"],
+                payload["right_custom"],
+            ],
+        }
+
+    metric_short = "STD" if "std" in color_title.lower() else ("PtP" if "ptp" in color_title.lower() else color_title)
+    unit_short = "mixed pT" if "mixed" in color_title.lower() else ("pT" if "pt" in color_title.lower() else "")
+    side_title = f"{metric_short} ({unit_short})" if unit_short else str(metric_short)
+    colorbar_title = str(metric_short)
+
+    menus = []
+    if len(ordered_labels) > 1:
+        menus.append(
+            dict(
+                type="buttons",
+                direction="right",
+                x=0.00,
+                y=-0.18,
+                xanchor="left",
+                yanchor="top",
+                showactive=True,
+                bgcolor="#EAF4FF",
+                bordercolor="#1F5D9C",
+                borderwidth=2.0,
+                font=dict(size=14, color="#0F3D6E"),
+                pad=dict(r=16, t=10, l=14, b=10),
+                buttons=[
+                    dict(
+                        label=f"   Heat: {label}   ",
+                        method="restyle",
+                        args=[
+                            _variant_restyle_args(payload_by_label[label]),
+                            trace_indices,
+                        ],
+                    )
+                    for label in ordered_labels
+                ],
+            )
+        )
+
+    menus.append(
+        dict(
+            type="buttons",
+            direction="right",
+            x=0.00,
+            y=-0.32,
+            xanchor="left",
+            yanchor="top",
+            showactive=True,
+            bgcolor="#F3F8FE",
+            bordercolor="#2B6CB0",
+            borderwidth=1.8,
+            font=dict(size=14, color="#0F3D6E"),
+            pad=dict(r=16, t=10, l=14, b=10),
+            buttons=[
+                dict(label="   Top: Median   ", method="restyle", args=[{"visible": [True, False, False]}, [4, 5, 6]]),
+                dict(label="   Top: Mean   ", method="restyle", args=[{"visible": [False, True, False]}, [4, 5, 6]]),
+                dict(label="   Top: Upper tail   ", method="restyle", args=[{"visible": [False, False, True]}, [4, 5, 6]]),
+            ],
+        )
+    )
+    menus.append(
+        dict(
+            type="buttons",
+            direction="right",
+            x=0.00,
+            y=-0.46,
+            xanchor="left",
+            yanchor="top",
+            showactive=True,
+            bgcolor="#F3F8FE",
+            bordercolor="#2B6CB0",
+            borderwidth=1.8,
+            font=dict(size=14, color="#0F3D6E"),
+            pad=dict(r=16, t=10, l=14, b=10),
+            buttons=[
+                dict(label="   Right: Median   ", method="restyle", args=[{"visible": [True, False, False]}, [12, 13, 14]]),
+                dict(label="   Right: Mean   ", method="restyle", args=[{"visible": [False, True, False]}, [12, 13, 14]]),
+                dict(label="   Right: Upper tail   ", method="restyle", args=[{"visible": [False, False, True]}, [12, 13, 14]]),
+            ],
+        )
     )
 
     fig.update_xaxes(showticklabels=False, row=1, col=1)
-    fig.update_yaxes(title_text="Channel quantile bands", row=1, col=1)
+    fig.update_yaxes(title_text=side_title, row=1, col=1, automargin=True, title_standoff=10)
     fig.update_xaxes(title_text="Epoch index", row=2, col=1)
-    fig.update_yaxes(title_text="Sorted channel index", autorange="reversed", row=2, col=1)
-    fig.update_xaxes(title_text="Channel summary", row=2, col=2)
-    fig.update_yaxes(showticklabels=False, autorange="reversed", row=2, col=2)
+    fig.update_yaxes(title_text="Sorted channel index", row=2, col=1, autorange="reversed", automargin=True, title_standoff=10)
     fig.update_xaxes(visible=False, row=1, col=2)
     fig.update_yaxes(visible=False, row=1, col=2)
+    fig.update_xaxes(title_text=side_title, row=2, col=2)
+    fig.update_yaxes(showticklabels=False, row=2, col=2, autorange="reversed")
 
     fig.update_layout(
-        title={"text": title, "x": 0.5},
+        title={"text": title, "x": 0.5, "y": 0.97, "xanchor": "center", "yanchor": "top"},
         template="plotly_white",
-        margin={"l": 55, "r": 30, "t": 74, "b": 55},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.03, "xanchor": "left", "x": 0},
+        margin={"l": 70, "r": 55, "t": 165, "b": 300},
+        height=980,
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.06, "xanchor": "left", "x": 0},
+        coloraxis={
+            "colorscale": "Viridis",
+            "cmin": float(zmin),
+            "cmax": float(zmax),
+            "colorbar": {"title": colorbar_title, "x": 1.02, "len": 0.86},
+        },
+        updatemenus=menus,
     )
     return fig
 
@@ -1376,7 +1627,7 @@ def plot_topomap_if_available(
             marker={
                 "size": 11,
                 "color": v_plot,
-                "colorscale": "Turbo",
+                "colorscale": "Viridis",
                 "showscale": True,
                 "colorbar": {"title": color_title},
                 "line": {"width": 0.5, "color": "#2F3E46"},
@@ -1390,6 +1641,211 @@ def plot_topomap_if_available(
         yaxis={"visible": False},
         margin={"l": 40, "r": 40, "t": 70, "b": 35},
     )
+    return fig
+
+
+def _add_solid_cap_toggle_to_topomap_3d(
+    fig: go.Figure,
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+) -> None:
+    """Attach an optional solid-cap overlay (Mesh3d) to a 3D topomap figure.
+
+    The cap is hidden by default and can be enabled with a button so users can
+    inspect channel occlusion similar to an EEG-cap-like shell.
+    """
+    if fig is None:
+        return
+    xyz = np.column_stack(
+        [np.asarray(x, dtype=float).reshape(-1), np.asarray(y, dtype=float).reshape(-1), np.asarray(z, dtype=float).reshape(-1)]
+    )
+    mask = np.all(np.isfinite(xyz), axis=1)
+    xyz = xyz[mask]
+    if xyz.shape[0] < 4:
+        return
+
+    point_trace_idx = len(fig.data) - 1
+    # Inset the shell slightly so markers remain visually outside the cap.
+    center = np.nanmean(xyz, axis=0, keepdims=True)
+    inset_factor = 0.965
+    cap_xyz = center + (xyz - center) * inset_factor
+
+    fig.add_trace(
+        go.Mesh3d(
+            x=cap_xyz[:, 0],
+            y=cap_xyz[:, 1],
+            z=cap_xyz[:, 2],
+            alphahull=0,
+            color="#B0BEC5",
+            opacity=1.0,
+            hoverinfo="skip",
+            showscale=False,
+            name="Solid cap",
+            visible=False,
+            flatshading=True,
+            lighting=dict(ambient=0.45, diffuse=0.55, specular=0.08, roughness=0.85, fresnel=0.03),
+            lightposition=dict(x=100, y=120, z=220),
+        )
+    )
+    cap_trace_idx = len(fig.data) - 1
+    existing_menus = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    existing_menus.append(
+        dict(
+            type="buttons",
+            direction="right",
+            x=0.02,
+            y=1.03,
+            xanchor="left",
+            yanchor="bottom",
+            showactive=True,
+            bgcolor="#F7FBFF",
+            bordercolor="#2B6CB0",
+            borderwidth=1.2,
+            font=dict(size=12, color="#0F3D6E"),
+            pad=dict(r=8, t=4, l=8, b=4),
+            buttons=[
+                dict(
+                    label="Cap: Off",
+                    method="restyle",
+                    args=[{"visible": [True, False]}, [point_trace_idx, cap_trace_idx]],
+                ),
+                dict(
+                    label="Cap: On",
+                    method="restyle",
+                    args=[{"visible": [True, True]}, [point_trace_idx, cap_trace_idx]],
+                ),
+            ],
+        )
+    )
+    fig.update_layout(updatemenus=existing_menus)
+
+
+def plot_topomap_3d_if_available(
+    payload: Optional[TopomapPayload],
+    title: str,
+    color_title: str,
+) -> Optional[go.Figure]:
+    """Render a 3D channel-position topomap aligned to sensor geometry.
+
+    The rendering mirrors the single-run MEGqc 3D convention:
+    - preserve the physical point-cloud geometry (centered only),
+    - group exact same sensor coordinates into one marker (common for Elekta
+      grad pairs), averaging values per location,
+    - keep channel identities in hover text.
+    """
+    if payload is None:
+        return None
+    x = np.asarray(payload.layout.x, dtype=float).reshape(-1)
+    y = np.asarray(payload.layout.y, dtype=float).reshape(-1)
+    z_raw = np.asarray(payload.layout.z, dtype=float).reshape(-1) if payload.layout.z is not None else None
+    values = np.asarray(payload.values, dtype=float).reshape(-1)
+    if z_raw is not None:
+        n = min(x.size, y.size, z_raw.size, values.size, len(payload.layout.names))
+    else:
+        n = min(x.size, y.size, values.size, len(payload.layout.names))
+    if n < 3:
+        return None
+
+    x = x[:n]
+    y = y[:n]
+    values = values[:n]
+    names = np.asarray(payload.layout.names[:n], dtype=object)
+    if z_raw is not None:
+        z_raw = z_raw[:n]
+        mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(z_raw) & np.isfinite(values)
+    else:
+        mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(values)
+    if np.sum(mask) < 3:
+        return None
+
+    x = x[mask]
+    y = y[mask]
+    values = values[mask]
+    names = names[mask]
+
+    if z_raw is not None:
+        z = z_raw[mask]
+    else:
+        # Fallback pseudo-depth if true z is unavailable.
+        xr = x - float(np.nanmean(x))
+        yr = y - float(np.nanmean(y))
+        scale = float(np.nanmax(np.sqrt(xr ** 2 + yr ** 2)))
+        if (not np.isfinite(scale)) or scale <= np.finfo(float).eps:
+            scale = 1.0
+        xn = xr / scale
+        yn = yr / scale
+        radial2 = np.clip(xn ** 2 + yn ** 2, 0.0, 1.0)
+        z = np.sqrt(1.0 - radial2)
+
+    # Group identical locations (Elekta grad pairs) and average per-location value.
+    coords = np.column_stack([x, y, z])
+    rounded = np.round(coords, decimals=6)
+    _, inv = np.unique(rounded, axis=0, return_inverse=True)
+    xg: List[float] = []
+    yg: List[float] = []
+    zg: List[float] = []
+    vg: List[float] = []
+    hover: List[str] = []
+    for key in np.unique(inv):
+        idx = np.where(inv == key)[0]
+        if idx.size == 0:
+            continue
+        xg.append(float(np.nanmean(x[idx])))
+        yg.append(float(np.nanmean(y[idx])))
+        zg.append(float(np.nanmean(z[idx])))
+        vg.append(float(np.nanmean(values[idx])))
+        hover_lines = [f"{names[i]}: {values[i]:.3g}" for i in idx]
+        hover.append("<br>".join(hover_lines))
+
+    if len(xg) < 3:
+        return None
+
+    xg_arr = np.asarray(xg, dtype=float)
+    yg_arr = np.asarray(yg, dtype=float)
+    zg_arr = np.asarray(zg, dtype=float)
+    vg_arr = np.asarray(vg, dtype=float)
+
+    # Center the cloud while keeping physical geometry and orientation.
+    xg_arr = xg_arr - float(np.nanmean(xg_arr))
+    yg_arr = yg_arr - float(np.nanmean(yg_arr))
+    zg_arr = zg_arr - float(np.nanmean(zg_arr))
+
+    fig = go.Figure(
+        go.Scatter3d(
+            x=xg_arr,
+            y=yg_arr,
+            z=zg_arr,
+            mode="markers",
+            text=hover,
+            hovertemplate="%{text}<br>Grouped value: %{marker.color:.3g}<extra></extra>",
+            marker={
+                "size": 9.5,
+                "color": vg_arr,
+                "colorscale": "Viridis",
+                "showscale": True,
+                "colorbar": {"title": color_title, "x": 0.95, "len": 0.82},
+                "line": {"width": 0.3, "color": "#2F3E46"},
+                "opacity": 0.90,
+            },
+            showlegend=False,
+        )
+    )
+    fig.update_layout(
+        height=860,
+        title={"text": title, "x": 0.5, "y": 0.98, "xanchor": "center", "yanchor": "top"},
+        template="plotly_white",
+        margin={"l": 24, "r": 24, "t": 38, "b": 16},
+        scene={
+            "domain": {"x": [0.02, 0.90], "y": [0.0, 1.0]},
+            "xaxis": {"visible": False},
+            "yaxis": {"visible": False},
+            "zaxis": {"visible": False},
+            "aspectmode": "data",
+            "camera": {"eye": {"x": 1.35, "y": 1.25, "z": 0.78}},
+        },
+    )
+    _add_solid_cap_toggle_to_topomap_3d(fig, xg_arr, yg_arr, zg_arr)
     return fig
 
 
@@ -1696,6 +2152,7 @@ def _condition_figure_blocks(
     figures_by_condition: Dict[str, Optional[go.Figure]],
     interpretation: str,
     *,
+    interpretation_by_condition: Optional[Dict[str, str]] = None,
     normalized_variant: bool = False,
     norm_mode: str = "y",
 ) -> str:
@@ -1705,10 +2162,13 @@ def _condition_figure_blocks(
         if fig is None:
             continue
         chunks.append(f"<h4>{condition}</h4>")
+        note = interpretation
+        if interpretation_by_condition is not None and condition in interpretation_by_condition:
+            note = f"{interpretation} {interpretation_by_condition[condition]}"
         chunks.append(
             _figure_block(
                 fig,
-                interpretation,
+                note,
                 normalized_variant=normalized_variant,
                 norm_mode=norm_mode,
             )
@@ -1747,21 +2207,51 @@ def _topomap_blocks(
     *,
     normalized_variant: bool = False,
 ) -> str:
-    figures: Dict[str, Optional[go.Figure]] = {}
-    for cond, payload in payloads_by_condition.items():
-        figures[cond] = plot_topomap_if_available(
+    chunks: List[str] = []
+    for idx, (cond, payload) in enumerate(sorted(payloads_by_condition.items())):
+        fig_2d = plot_topomap_if_available(
             payload,
             title=f"{title_prefix} ({cond})",
             color_title=color_title,
         )
-    if not any(fig is not None for fig in figures.values()):
+        fig_3d = plot_topomap_3d_if_available(
+            payload,
+            title=f"{title_prefix} (3D) ({cond})",
+            color_title=color_title,
+        )
+        tabs: List[Tuple[str, str]] = []
+        if fig_2d is not None:
+            tabs.append(
+                (
+                    "2D",
+                    _figure_block(
+                        fig_2d,
+                        interpretation,
+                        normalized_variant=normalized_variant,
+                        norm_mode="color",
+                    ),
+                )
+            )
+        if fig_3d is not None:
+            tabs.append(
+                (
+                    "3D",
+                    _figure_block(
+                        fig_3d,
+                        interpretation,
+                        normalized_variant=normalized_variant,
+                        norm_mode="color",
+                    ),
+                )
+            )
+        if not tabs:
+            continue
+        chunks.append(f"<h4>{cond}</h4>")
+        chunks.append(_build_subtabs_html(f"topomap-view-{idx}-{re.sub(r'[^a-z0-9]+','-',cond.lower())}", tabs, level=4))
+
+    if not chunks:
         return "<p>Topographic maps not shown: channel positions not available in stored outputs.</p>"
-    return _condition_figure_blocks(
-        figures,
-        interpretation,
-        normalized_variant=normalized_variant,
-        norm_mode="color",
-    )
+    return "".join(chunks)
 
 
 def _load_settings_snapshot(derivatives_root: str) -> str:
@@ -2279,6 +2769,38 @@ def _mean_matrices_by_condition(
             all_mean = _mean_matrix_from_sum_count(sum_total, cnt_total)
             if all_mean.size:
                 out = {"all tasks": all_mean, **out}
+    return out
+
+
+def _heatmap_variants_by_condition_from_acc(
+    run_matrices_by_condition: Dict[str, List[np.ndarray]],
+    representative_by_condition: Dict[str, np.ndarray],
+    sum_by_condition: Dict[str, np.ndarray],
+    count_by_condition: Dict[str, np.ndarray],
+    upper_by_condition: Dict[str, np.ndarray],
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """Return per-condition matrix variants without creating an all-tasks matrix."""
+    variants = _aggregate_heatmap_variants_from_runs(run_matrices_by_condition)
+    if variants:
+        return variants
+
+    mean_mats = _mean_matrices_by_condition(sum_by_condition, count_by_condition, include_all_tasks=False)
+    conditions = sorted(
+        set(representative_by_condition.keys())
+        | set(mean_mats.keys())
+        | set(upper_by_condition.keys())
+    )
+    out: Dict[str, Dict[str, np.ndarray]] = {}
+    for cond in conditions:
+        by_variant: Dict[str, np.ndarray] = {}
+        if cond in representative_by_condition:
+            by_variant["Median"] = np.asarray(representative_by_condition[cond], dtype=float)
+        if cond in mean_mats:
+            by_variant["Mean"] = np.asarray(mean_mats[cond], dtype=float)
+        if cond in upper_by_condition:
+            by_variant["Upper tail"] = np.asarray(upper_by_condition[cond], dtype=float)
+        if by_variant:
+            out[cond] = by_variant
     return out
 
 
@@ -2923,14 +3445,18 @@ def _concat_topomap_payload(
                 x=np.asarray(incoming.layout.x, dtype=float),
                 y=np.asarray(incoming.layout.y, dtype=float),
                 names=in_names,
+                z=(np.asarray(incoming.layout.z, dtype=float) if incoming.layout.z is not None else None),
             ),
             values=np.asarray(incoming.values, dtype=float),
         )
+    z_left = np.asarray(existing.layout.z, dtype=float) if existing.layout.z is not None else np.full(existing.layout.x.shape, np.nan, dtype=float)
+    z_right = np.asarray(incoming.layout.z, dtype=float) if incoming.layout.z is not None else np.full(np.asarray(incoming.layout.x, dtype=float).shape, np.nan, dtype=float)
     return TopomapPayload(
         layout=SensorLayout(
             x=np.concatenate([np.asarray(existing.layout.x, dtype=float), np.asarray(incoming.layout.x, dtype=float)]),
             y=np.concatenate([np.asarray(existing.layout.y, dtype=float), np.asarray(incoming.layout.y, dtype=float)]),
             names=list(existing.layout.names) + in_names,
+            z=np.concatenate([z_left, z_right]),
         ),
         values=np.concatenate([np.asarray(existing.values, dtype=float), np.asarray(incoming.values, dtype=float)]),
     )
@@ -2963,6 +3489,12 @@ def _combine_accumulators(acc_by_type: Dict[str, ChTypeAccumulator]) -> ChTypeAc
     combined tabs can preserve all available channels from each type.
     """
     combined = ChTypeAccumulator()
+    std_runs_by_cond_by_type: Dict[str, Dict[str, List[np.ndarray]]] = {
+        ch: defaultdict(list) for ch in CH_TYPES
+    }
+    ptp_runs_by_cond_by_type: Dict[str, Dict[str, List[np.ndarray]]] = {
+        ch: defaultdict(list) for ch in CH_TYPES
+    }
     for ch_type in CH_TYPES:
         if ch_type not in acc_by_type:
             continue
@@ -2978,12 +3510,18 @@ def _combine_accumulators(acc_by_type: Dict[str, ChTypeAccumulator]) -> ChTypeAc
             combined.std_dist_mean_by_condition[cond].extend(_finite_array(vals).tolist())
         for cond, vals in acc.std_dist_upper_by_condition.items():
             combined.std_dist_upper_by_condition[cond].extend(_finite_array(vals).tolist())
+        for cond, mats in acc.std_heatmap_runs_by_condition.items():
+            for mat in mats:
+                std_runs_by_cond_by_type[ch_type][cond].append(np.asarray(mat, dtype=float))
         for cond, vals in acc.ptp_dist_by_condition.items():
             combined.ptp_dist_by_condition[cond].extend(_finite_array(vals).tolist())
         for cond, vals in acc.ptp_dist_mean_by_condition.items():
             combined.ptp_dist_mean_by_condition[cond].extend(_finite_array(vals).tolist())
         for cond, vals in acc.ptp_dist_upper_by_condition.items():
             combined.ptp_dist_upper_by_condition[cond].extend(_finite_array(vals).tolist())
+        for cond, mats in acc.ptp_heatmap_runs_by_condition.items():
+            for mat in mats:
+                ptp_runs_by_cond_by_type[ch_type][cond].append(np.asarray(mat, dtype=float))
 
         for profile in acc.std_window_profiles:
             combined.std_window_profiles.append(profile)
@@ -3100,6 +3638,35 @@ def _combine_accumulators(acc_by_type: Dict[str, ChTypeAccumulator]) -> ChTypeAc
             for cond, payload in src.items():
                 dst[cond] = _concat_topomap_payload(dst.get(cond), payload, name_prefix=f"{ch_type}_")
 
+    def _merge_type_run_matrices(
+        by_type: Dict[str, Dict[str, List[np.ndarray]]],
+    ) -> Dict[str, List[np.ndarray]]:
+        out: Dict[str, List[np.ndarray]] = defaultdict(list)
+        conditions = set(by_type.get("mag", {}).keys()) | set(by_type.get("grad", {}).keys())
+        for cond in sorted(conditions):
+            mag_runs = list(by_type.get("mag", {}).get(cond, []))
+            grad_runs = list(by_type.get("grad", {}).get(cond, []))
+            if mag_runs and grad_runs:
+                pair_n = min(len(mag_runs), len(grad_runs))
+                for idx in range(pair_n):
+                    out[cond].append(_vstack_nan_padded(mag_runs[idx], grad_runs[idx]))
+                for idx in range(pair_n, len(mag_runs)):
+                    out[cond].append(np.asarray(mag_runs[idx], dtype=float))
+                for idx in range(pair_n, len(grad_runs)):
+                    out[cond].append(np.asarray(grad_runs[idx], dtype=float))
+            elif mag_runs:
+                out[cond].extend(np.asarray(m, dtype=float) for m in mag_runs)
+            elif grad_runs:
+                out[cond].extend(np.asarray(m, dtype=float) for m in grad_runs)
+        return out
+
+    combined.std_heatmap_runs_by_condition = defaultdict(list, _merge_type_run_matrices(std_runs_by_cond_by_type))
+    combined.ptp_heatmap_runs_by_condition = defaultdict(list, _merge_type_run_matrices(ptp_runs_by_cond_by_type))
+    for cond, mats in combined.std_heatmap_runs_by_condition.items():
+        combined.std_epoch_counts_by_condition[cond].extend([int(np.asarray(m).shape[1]) for m in mats if np.asarray(m).ndim == 2])
+    for cond, mats in combined.ptp_heatmap_runs_by_condition.items():
+        combined.ptp_epoch_counts_by_condition[cond].extend([int(np.asarray(m).shape[1]) for m in mats if np.asarray(m).ndim == 2])
+
     rows = []
     for ch_type in CH_TYPES:
         rows.extend(acc_by_type[ch_type].run_rows)
@@ -3131,14 +3698,27 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
         "Global pooled epoch index",
         f"STD ({amplitude_unit})",
     )
+    std_heatmap_variants = _heatmap_variants_by_condition_from_acc(
+        acc.std_heatmap_runs_by_condition,
+        acc.std_heatmap_by_condition,
+        acc.std_heatmap_sum_by_condition,
+        acc.std_heatmap_count_by_condition,
+        acc.std_heatmap_upper_by_condition,
+    )
+    std_epoch_notes = _epoch_consistency_notes(acc.std_heatmap_runs_by_condition)
     std_heatmaps = {
         cond: plot_heatmap_sorted_channels_windows(
-            matrix,
+            variants,
             title=f"STD channel-by-epoch footprint ({cond}){suffix}",
             color_title=f"STD ({amplitude_unit})",
             summary_mode="median",
+            channel_names=(
+                acc.std_topomap_by_condition[cond].layout.names
+                if cond in acc.std_topomap_by_condition
+                else None
+            ),
         )
-        for cond, matrix in sorted(acc.std_heatmap_by_condition.items())
+        for cond, variants in sorted(std_heatmap_variants.items())
     }
     std_topomaps = _topomap_blocks(
         payloads_by_condition=acc.std_topomap_by_condition,
@@ -3163,14 +3743,27 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
         "Global pooled epoch index",
         f"PtP amplitude ({amplitude_unit})",
     )
+    ptp_heatmap_variants = _heatmap_variants_by_condition_from_acc(
+        acc.ptp_heatmap_runs_by_condition,
+        acc.ptp_heatmap_by_condition,
+        acc.ptp_heatmap_sum_by_condition,
+        acc.ptp_heatmap_count_by_condition,
+        acc.ptp_heatmap_upper_by_condition,
+    )
+    ptp_epoch_notes = _epoch_consistency_notes(acc.ptp_heatmap_runs_by_condition)
     ptp_heatmaps = {
         cond: plot_heatmap_sorted_channels_windows(
-            matrix,
+            variants,
             title=f"PtP channel-by-epoch footprint ({cond}){suffix}",
             color_title=f"PtP ({amplitude_unit})",
             summary_mode="upper_tail",
+            channel_names=(
+                acc.ptp_topomap_by_condition[cond].layout.names
+                if cond in acc.ptp_topomap_by_condition
+                else None
+            ),
         )
-        for cond, matrix in sorted(acc.ptp_heatmap_by_condition.items())
+        for cond, variants in sorted(ptp_heatmap_variants.items())
     }
     ptp_topomaps = _topomap_blocks(
         payloads_by_condition=acc.ptp_topomap_by_condition,
@@ -3243,6 +3836,7 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
             "Suspicious appearance: repeated vertical stripes and heavy upper tails. "
             "Global pooled epoch index is not aligned in time across recordings."
         ),
+        interpretation_by_condition=std_epoch_notes,
     )
     ptp_heatmap_blocks = _condition_figure_blocks(
         ptp_heatmaps,
@@ -3252,6 +3846,7 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
             "Typical appearance: moderate spread. Suspicious appearance: strong upper-tail bursts and vertical stripes. "
             "Global pooled epoch index is not aligned in time across recordings."
         ),
+        interpretation_by_condition=ptp_epoch_notes,
     )
 
     return (
@@ -3920,39 +4515,6 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
             )
         return _build_subtabs_html(group_id, items, level=4)
 
-    def _heatmap_variant_tabs(
-        metric_name: str,
-        unit_label: str,
-        variants: List[Tuple[str, Dict[str, np.ndarray], str, str]],
-    ) -> str:
-        tabs: List[Tuple[str, str]] = []
-        for idx, (variant_label, matrices_by_condition, summary_mode, interpretation) in enumerate(variants):
-            figures = {
-                cond: plot_heatmap_sorted_channels_windows(
-                    matrix,
-                    title=f"{metric_name} channel-epoch map ({variant_label}) ({cond}){suffix}",
-                    color_title=unit_label,
-                    summary_mode=summary_mode,
-                )
-                for cond, matrix in sorted(matrices_by_condition.items())
-            }
-            tabs.append(
-                (
-                    variant_label,
-                    _condition_figure_blocks(
-                        figures,
-                        interpretation,
-                        normalized_variant=True,
-                        norm_mode="z",
-                    ),
-                )
-            )
-        return _build_subtabs_html(
-            f"heatmap-{re.sub(r'[^a-z0-9]+', '-', metric_name.lower())}-{tab_token}",
-            tabs,
-            level=4,
-        )
-
     def _metric_panel(
         metric_name: str,
         rec_variants: List[VariantSpec],
@@ -3962,7 +4524,8 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
         formula_a: str,
         formula_b: str,
         formula_c: str,
-        heatmap_variants: Optional[List[Tuple[str, Dict[str, np.ndarray], str, str]]] = None,
+        heatmap_matrices_by_condition: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
+        heatmap_epoch_notes: Optional[Dict[str, str]] = None,
         topomap_payloads: Optional[Dict[str, TopomapPayload]] = None,
         fingerprint_spec: Optional[Tuple[str, str, str, str]] = None,
     ) -> str:
@@ -4011,10 +4574,34 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
 
         blocks = [f"<div class='metric-block'><h3>{metric_name}</h3>{dist_tabs}</div>"]
 
-        if heatmap_variants:
+        if heatmap_matrices_by_condition:
+            heatmap_figures = {
+                cond: plot_heatmap_sorted_channels_windows(
+                    variants,
+                    title=f"{metric_name} channel-epoch map ({cond}){suffix}",
+                    color_title=unit_label,
+                    summary_mode=("upper_tail" if metric_name.lower().startswith("ptp") else "median"),
+                    channel_names=(
+                        topomap_payloads[cond].layout.names
+                        if (topomap_payloads is not None and cond in topomap_payloads)
+                        else None
+                    ),
+                )
+                for cond, variants in sorted(heatmap_matrices_by_condition.items())
+            }
             blocks.append(
                 "<h4>Channel x epoch maps</h4>"
-                + _heatmap_variant_tabs(metric_name=metric_name, unit_label=unit_label, variants=heatmap_variants)
+                + _condition_figure_blocks(
+                    heatmap_figures,
+                    (
+                        "Heatmap cell is one channel-by-epoch value. "
+                        "Bottom buttons switch heatmap variant (median/mean/upper tail) and "
+                        "independently switch top/right profile central summaries."
+                    ),
+                    interpretation_by_condition=heatmap_epoch_notes,
+                    normalized_variant=True,
+                    norm_mode="z",
+                )
             )
 
         if topomap_payloads is not None:
@@ -4053,25 +4640,14 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
 
         return "".join(blocks)
 
-    std_mean_mats = _mean_matrices_by_condition(acc.std_heatmap_sum_by_condition, acc.std_heatmap_count_by_condition, include_all_tasks=True)
-    std_heatmaps_by_label = {
-        "Median": acc.std_heatmap_by_condition,
-        "Mean": std_mean_mats,
-        "Upper tail": acc.std_heatmap_upper_by_condition,
-    }
-    std_summary_mode = {"Median": "median", "Mean": "median", "Upper tail": "upper_tail"}
-    std_heatmap_variants = [
-        (
-            label,
-            std_heatmaps_by_label[label],
-            std_summary_mode[label],
-            (
-                "Heatmap cell is one channel-by-epoch value. "
-                "Top strip shows epoch-wise channel quantile bands, and the side strip shows sorted channel burden."
-            ),
-        )
-        for label in ["Median", "Mean", "Upper tail"]
-    ]
+    std_heatmap_by_condition = _heatmap_variants_by_condition_from_acc(
+        acc.std_heatmap_runs_by_condition,
+        acc.std_heatmap_by_condition,
+        acc.std_heatmap_sum_by_condition,
+        acc.std_heatmap_count_by_condition,
+        acc.std_heatmap_upper_by_condition,
+    )
+    std_heatmap_epoch_notes = _epoch_consistency_notes(acc.std_heatmap_runs_by_condition)
     std_panel = _metric_panel(
         metric_name="STD",
         rec_variants=_ordered_variant_specs(
@@ -4105,7 +4681,8 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
         formula_a="Median: median_c(median_t STD[c,t]); Mean: mean_c(mean_t STD[c,t]); Upper tail: q95_c(q95_t STD[c,t]).",
         formula_b="Median: median_t STD[c,t] per channel c; Mean: mean_t STD[c,t] per channel c; Upper tail: q95_t STD[c,t] per channel c.",
         formula_c="Median: median_c STD[c,t] per epoch t; Mean: mean_c STD[c,t] per epoch t; Upper tail: q95_c STD[c,t] per epoch t.",
-        heatmap_variants=std_heatmap_variants,
+        heatmap_matrices_by_condition=std_heatmap_by_condition,
+        heatmap_epoch_notes=std_heatmap_epoch_notes,
         topomap_payloads=acc.std_topomap_by_condition,
         fingerprint_spec=(
             "std_median",
@@ -4115,25 +4692,14 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
         ),
     )
 
-    ptp_mean_mats = _mean_matrices_by_condition(acc.ptp_heatmap_sum_by_condition, acc.ptp_heatmap_count_by_condition, include_all_tasks=True)
-    ptp_heatmaps_by_label = {
-        "Median": acc.ptp_heatmap_by_condition,
-        "Mean": ptp_mean_mats,
-        "Upper tail": acc.ptp_heatmap_upper_by_condition,
-    }
-    ptp_summary_mode = {"Median": "median", "Mean": "median", "Upper tail": "upper_tail"}
-    ptp_heatmap_variants = [
-        (
-            label,
-            ptp_heatmaps_by_label[label],
-            ptp_summary_mode[label],
-            (
-                "Heatmap cell is one channel-by-epoch value. "
-                "Top strip shows epoch-wise channel quantile bands, and the side strip shows sorted channel burden."
-            ),
-        )
-        for label in ["Upper tail", "Mean", "Median"]
-    ]
+    ptp_heatmap_by_condition = _heatmap_variants_by_condition_from_acc(
+        acc.ptp_heatmap_runs_by_condition,
+        acc.ptp_heatmap_by_condition,
+        acc.ptp_heatmap_sum_by_condition,
+        acc.ptp_heatmap_count_by_condition,
+        acc.ptp_heatmap_upper_by_condition,
+    )
+    ptp_heatmap_epoch_notes = _epoch_consistency_notes(acc.ptp_heatmap_runs_by_condition)
     ptp_panel = _metric_panel(
         metric_name="PtP",
         rec_variants=_ordered_variant_specs(
@@ -4167,7 +4733,8 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
         formula_a="Upper tail (default): q95_c(q99_t PtP[c,t]); Mean: mean_c(mean_t PtP[c,t]); Median: median_c(q95_t PtP[c,t]).",
         formula_b="Upper tail (default): q99_t PtP[c,t] per channel c; Mean: mean_t PtP[c,t] per channel c; Median: stored central channel summary per c.",
         formula_c="Upper tail (default): q95_c PtP[c,t] per epoch t; Mean: mean_c PtP[c,t] per epoch t; Median: median_c PtP[c,t] per epoch t.",
-        heatmap_variants=ptp_heatmap_variants,
+        heatmap_matrices_by_condition=ptp_heatmap_by_condition,
+        heatmap_epoch_notes=ptp_heatmap_epoch_notes,
         topomap_payloads=acc.ptp_topomap_by_condition,
         fingerprint_spec=(
             "ptp_median",
@@ -4940,10 +5507,18 @@ def _build_report_html(
           }}
           try {{
             const renderResult = Plotly.newPlot(el, payload.figure.data || [], payload.figure.layout || {{}}, payload.config || {{responsive: true, displaylogo: false}});
+            const postRender = (renderResult && typeof renderResult.then === 'function')
+              ? renderResult
+              : Promise.resolve(renderResult);
+            const withFrames = postRender.then(() => {{
+              const frames = (payload.figure && payload.figure.frames) ? payload.figure.frames : [];
+              if (frames && frames.length > 0 && typeof Plotly.addFrames === 'function') {{
+                return Plotly.addFrames(el, frames).catch(() => undefined);
+              }}
+              return undefined;
+            }});
             el.dataset.rendered = '1';
-            if (renderResult && typeof renderResult.then === 'function') {{
-              renderPromises.push(renderResult.catch(() => undefined));
-            }}
+            renderPromises.push(withFrames.catch(() => undefined));
           }} catch (err) {{
             // no-op
           }}
@@ -5214,6 +5789,8 @@ def _update_accumulator_for_loaded_run(
                 condition_label,
                 matrix,
             )
+            acc.std_heatmap_runs_by_condition[condition_label].append(np.asarray(matrix, dtype=float))
+            acc.std_epoch_counts_by_condition[condition_label].append(int(matrix.shape[1]))
             if record.meta.subject != "n/a":
                 acc.std_subject_profiles[record.meta.subject].append(std_profile)
             _update_topomap_payload_mean(
@@ -5274,6 +5851,8 @@ def _update_accumulator_for_loaded_run(
                 condition_label,
                 matrix,
             )
+            acc.ptp_heatmap_runs_by_condition[condition_label].append(np.asarray(matrix, dtype=float))
+            acc.ptp_epoch_counts_by_condition[condition_label].append(int(matrix.shape[1]))
             if record.meta.subject != "n/a":
                 acc.ptp_subject_profiles[record.meta.subject].append(ptp_profile)
             if ptp_desc is not None:
@@ -5502,6 +6081,7 @@ def _merge_topomap_mean_dict(
                     x=np.asarray(src_payload.layout.x, dtype=float).copy(),
                     y=np.asarray(src_payload.layout.y, dtype=float).copy(),
                     names=list(src_payload.layout.names),
+                    z=(np.asarray(src_payload.layout.z, dtype=float).copy() if src_payload.layout.z is not None else None),
                 ),
                 values=src_vals.copy(),
             )
@@ -5523,6 +6103,8 @@ def _merge_topomap_mean_dict(
             len(dst_payload.layout.names),
             dst_payload.layout.x.size,
             dst_payload.layout.y.size,
+            (dst_payload.layout.z.size if dst_payload.layout.z is not None else dst_payload.layout.x.size),
+            (src_payload.layout.z.size if src_payload.layout.z is not None else src_payload.layout.x.size),
         )
         if m < 1:
             continue
@@ -5541,6 +6123,11 @@ def _merge_topomap_mean_dict(
                 x=np.asarray(dst_payload.layout.x[:m], dtype=float),
                 y=np.asarray(dst_payload.layout.y[:m], dtype=float),
                 names=list(dst_payload.layout.names[:m]),
+                z=(
+                    np.asarray(dst_payload.layout.z[:m], dtype=float)
+                    if dst_payload.layout.z is not None
+                    else None
+                ),
             ),
             values=out,
         )
@@ -5606,6 +6193,8 @@ def _merge_single_ch_accumulator(dst: ChTypeAccumulator, src: ChTypeAccumulator)
     _merge_list_map(dst.std_dist_by_condition, src.std_dist_by_condition)
     _merge_list_map(dst.std_dist_mean_by_condition, src.std_dist_mean_by_condition)
     _merge_list_map(dst.std_dist_upper_by_condition, src.std_dist_upper_by_condition)
+    _merge_list_map(dst.std_heatmap_runs_by_condition, src.std_heatmap_runs_by_condition)
+    _merge_list_map(dst.std_epoch_counts_by_condition, src.std_epoch_counts_by_condition)
     dst.std_window_profiles.extend(src.std_window_profiles)
     for cond, profiles in src.std_window_profiles_by_condition.items():
         dst.std_window_profiles_by_condition[cond].extend(profiles)
@@ -5613,6 +6202,8 @@ def _merge_single_ch_accumulator(dst: ChTypeAccumulator, src: ChTypeAccumulator)
     _merge_list_map(dst.ptp_dist_by_condition, src.ptp_dist_by_condition)
     _merge_list_map(dst.ptp_dist_mean_by_condition, src.ptp_dist_mean_by_condition)
     _merge_list_map(dst.ptp_dist_upper_by_condition, src.ptp_dist_upper_by_condition)
+    _merge_list_map(dst.ptp_heatmap_runs_by_condition, src.ptp_heatmap_runs_by_condition)
+    _merge_list_map(dst.ptp_epoch_counts_by_condition, src.ptp_epoch_counts_by_condition)
     dst.ptp_window_profiles.extend(src.ptp_window_profiles)
     for cond, profiles in src.ptp_window_profiles_by_condition.items():
         dst.ptp_window_profiles_by_condition[cond].extend(profiles)
