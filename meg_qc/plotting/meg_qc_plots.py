@@ -686,6 +686,230 @@ def _lazy_payload_script_tags_html() -> str:
     )
 
 
+def _has_xy_or_scene_axes(fig: go.Figure) -> bool:
+    """Return True when figure layout exposes cartesian or 3D scene axes."""
+    layout_dict = fig.to_plotly_json().get("layout", {})
+    for key in layout_dict.keys():
+        k = str(key)
+        if k.startswith("xaxis") or k.startswith("yaxis") or re.fullmatch(r"scene\d*", k):
+            return True
+    return False
+
+
+def _attach_distribution_style_controls(
+    fig: go.Figure,
+    *,
+    default_line_width: float = 2.0,
+    default_marker_size: float = 8.0,
+) -> None:
+    """Attach numeric line/dot style controls when relevant traces are present."""
+    if fig is None or not getattr(fig, "data", None):
+        return
+
+    marker_level_to_size = {1: 3.0, 2: 4.0, 3: 5.5, 4: 7.0, 5: 8.5, 6: 10.0, 7: 12.0, 8: 14.0}
+
+    has_line_traces = False
+    has_marker_traces = False
+    for tr in fig.data:
+        t = str(getattr(tr, "type", "") or "").lower()
+        mode = str(getattr(tr, "mode", "") or "").lower()
+        if t in {"scatter", "scattergl"} and "lines" in mode:
+            has_line_traces = True
+        elif t in {"violin", "box", "histogram", "bar"}:
+            has_line_traces = True
+        if t in {"scatter", "scattergl"} and "markers" in mode:
+            has_marker_traces = True
+
+    if (not has_line_traces) and (not has_marker_traces):
+        return
+
+    def _line_restyle(level: int) -> Dict[str, List[Optional[float]]]:
+        line_width: List[Optional[float]] = []
+        marker_line_width: List[Optional[float]] = []
+        lw = float(level)
+        for tr in fig.data:
+            t = str(getattr(tr, "type", "") or "").lower()
+            mode = str(getattr(tr, "mode", "") or "").lower()
+            if (t in {"scatter", "scattergl"} and "lines" in mode) or (t in {"violin", "box", "histogram", "bar"}):
+                line_width.append(lw)
+            else:
+                line_width.append(None)
+
+            if t == "histogram":
+                marker_line_width.append(max(0.5, lw * 0.6))
+            elif t in {"scatter", "scattergl"} and "markers" in mode:
+                marker_line_width.append(max(0.25, lw * 0.2))
+            else:
+                marker_line_width.append(None)
+        return {"line.width": line_width, "marker.line.width": marker_line_width}
+
+    def _marker_restyle(level: int) -> Dict[str, List[Optional[float]]]:
+        size = float(marker_level_to_size.get(level, default_marker_size))
+        marker_size: List[Optional[float]] = []
+        for tr in fig.data:
+            t = str(getattr(tr, "type", "") or "").lower()
+            mode = str(getattr(tr, "mode", "") or "").lower()
+            if t in {"scatter", "scattergl"} and "markers" in mode:
+                marker_size.append(size)
+            else:
+                marker_size.append(None)
+        return {"marker.size": marker_size}
+
+    levels = list(range(1, 9))
+    line_active = max(0, min(7, int(round(default_line_width)) - 1))
+    marker_active_guess = min(levels, key=lambda lv: abs(float(marker_level_to_size[lv]) - float(default_marker_size)))
+    marker_active = max(0, min(7, int(marker_active_guess) - 1))
+
+    existing = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    menu_names = {str(getattr(m, "name", "") or "") for m in existing}
+
+    if has_line_traces and ("Line thickness level" not in menu_names):
+        existing.append(
+            dict(
+                name="Line thickness level",
+                type="buttons",
+                direction="right",
+                showactive=True,
+                active=line_active,
+                buttons=[dict(label=str(level), method="restyle", args=[_line_restyle(level)]) for level in levels],
+            )
+        )
+    if has_marker_traces and ("Dot size level" not in menu_names):
+        existing.append(
+            dict(
+                name="Dot size level",
+                type="buttons",
+                direction="right",
+                showactive=True,
+                active=marker_active,
+                buttons=[dict(label=str(level), method="restyle", args=[_marker_restyle(level)]) for level in levels],
+            )
+        )
+
+    if existing:
+        fig.update_layout(updatemenus=existing)
+
+
+def _attach_axis_label_size_controller(fig: go.Figure) -> None:
+    """Attach numeric axis-label/ticks-size controller when axes are available."""
+    if fig is None:
+        return
+    existing = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    if any(str(getattr(m, "name", "") or "") == "Axis label/ticks size level" for m in existing):
+        return
+
+    layout_dict = fig.to_plotly_json().get("layout", {})
+    axis_keys = [k for k in layout_dict.keys() if str(k).startswith("xaxis") or str(k).startswith("yaxis")]
+    scene_keys = [k for k in layout_dict.keys() if re.fullmatch(r"scene\d*", str(k) or "")]
+    if not axis_keys:
+        cartesian_types = {"scatter", "scattergl", "bar", "histogram", "box", "violin", "heatmap", "contour"}
+        has_cartesian = any(str(getattr(tr, "type", "") or "").lower() in cartesian_types for tr in fig.data)
+        if has_cartesian:
+            axis_keys = ["xaxis", "yaxis"]
+    if (not axis_keys) and (not scene_keys):
+        return
+
+    axis_level_to_tick = {1: 9, 2: 10, 3: 12, 4: 14, 5: 16, 6: 18, 7: 20, 8: 22}
+
+    def _axis_relayout(level: int) -> Dict[str, int]:
+        tick_sz = int(axis_level_to_tick.get(level, 14))
+        title_sz = tick_sz + 2
+        payload: Dict[str, int] = {}
+        for key in axis_keys:
+            payload[f"{key}.tickfont.size"] = tick_sz
+            payload[f"{key}.title.font.size"] = title_sz
+        for sk in scene_keys:
+            payload[f"{sk}.xaxis.tickfont.size"] = tick_sz
+            payload[f"{sk}.yaxis.tickfont.size"] = tick_sz
+            payload[f"{sk}.zaxis.tickfont.size"] = tick_sz
+            payload[f"{sk}.xaxis.title.font.size"] = title_sz
+            payload[f"{sk}.yaxis.title.font.size"] = title_sz
+            payload[f"{sk}.zaxis.title.font.size"] = title_sz
+        return payload
+
+    existing.append(
+        dict(
+            name="Axis label/ticks size level",
+            type="buttons",
+            direction="right",
+            showactive=True,
+            active=3,
+            buttons=[dict(label=str(level), method="relayout", args=[_axis_relayout(level)]) for level in range(1, 9)],
+        )
+    )
+    fig.update_layout(updatemenus=existing)
+
+
+def _infer_updatemenu_title(menu, idx: int) -> str:
+    """Infer a readable external control title from updatemenu semantics."""
+    explicit = str(getattr(menu, "name", "") or "").strip()
+    if explicit:
+        return explicit
+    buttons = list(getattr(menu, "buttons", []) or [])
+    labels: List[str] = [str(getattr(btn, "label", "") or "").strip() for btn in buttons]
+    low = " ".join(l.lower() for l in labels)
+    if "heat:" in low:
+        return "Heat summary variant"
+    if "top:" in low:
+        return "Top profile summary"
+    if "right:" in low:
+        return "Right profile summary"
+    if "cap" in low:
+        return "3D cap display"
+    if labels and all(l in {str(i) for i in range(1, 9)} for l in labels):
+        methods = {str(getattr(btn, "method", "") or "").lower() for btn in buttons}
+        arg_keys: set[str] = set()
+        for btn in buttons:
+            args = getattr(btn, "args", None)
+            if isinstance(args, (list, tuple)) and args:
+                first = args[0]
+                if isinstance(first, dict):
+                    arg_keys.update(str(k) for k in first.keys())
+        if "relayout" in methods:
+            return "Axis label/ticks size level"
+        if "marker.size" in arg_keys:
+            return "Dot size level"
+        if "line.width" in arg_keys:
+            return "Line thickness level"
+    return f"Figure control {idx + 1}"
+
+
+def _extract_figure_controls(fig: go.Figure) -> List[Dict[str, object]]:
+    """Extract Plotly updatemenus as external HTML controls and clear layout menus."""
+    menus = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    controls: List[Dict[str, object]] = []
+    if not menus:
+        return controls
+
+    for idx, menu in enumerate(menus):
+        mj = menu.to_plotly_json() if hasattr(menu, "to_plotly_json") else dict(menu)
+        raw_buttons = list(mj.get("buttons", []) or [])
+        buttons: List[Dict[str, object]] = []
+        for b in raw_buttons:
+            if not isinstance(b, dict):
+                continue
+            buttons.append(
+                {
+                    "label": str(b.get("label", "")),
+                    "method": str(b.get("method", "restyle")),
+                    "args": b.get("args", []),
+                }
+            )
+        if not buttons:
+            continue
+        controls.append(
+            {
+                "title": _infer_updatemenu_title(menu, idx),
+                "active": int(mj.get("active", 0) or 0),
+                "buttons": buttons,
+            }
+        )
+
+    # Explicit assignment is more reliable than update_layout(updatemenus=[]).
+    fig.layout.updatemenus = None
+    return controls
+
+
 def _register_lazy_plotly_figure(fig: go.Figure, *, min_height_px: int = 520) -> str:
     """Register one Plotly figure and return a placeholder ``div``.
 
@@ -712,6 +936,12 @@ def _register_lazy_plotly_figure(fig: go.Figure, *, min_height_px: int = 520) ->
         margin["t"] = max(int(margin.get("t", 80)), 132)
         fig_out.update_layout(margin=margin)
 
+    # Attach figure-level style controllers where meaningful, then externalize
+    # all updatemenus into a dedicated panel below the plot.
+    _attach_distribution_style_controls(fig_out)
+    _attach_axis_label_size_controller(fig_out)
+    controls = _extract_figure_controls(fig_out)
+
     height = fig_out.layout.height
     if not isinstance(height, (int, float)):
         height = 640
@@ -721,14 +951,18 @@ def _register_lazy_plotly_figure(fig: go.Figure, *, min_height_px: int = 520) ->
         {
             "figure": fig_out.to_plotly_json(),
             "config": {"responsive": True, "displaylogo": False},
+            "controls": controls,
         },
         cls=PlotlyJSONEncoder,
         separators=(",", ":"),
     ).replace("</", "<\\/")
     _LAZY_PLOT_PAYLOADS[payload_id] = payload_json
     return (
+        "<div class='lazy-plot-wrap'>"
         f"<div id='{fig_id}' class='js-lazy-plot' data-payload-id='{payload_id}' "
         f"style='height:{height}px; width:100%;'></div>"
+        "<div class='plot-controls'></div>"
+        "</div>"
     )
 
 
@@ -1283,6 +1517,52 @@ def _build_subject_report_html(
     .js-plotly-plot {{
       width: 100% !important;
     }}
+    .lazy-plot-wrap {{
+      margin-top: 4px;
+    }}
+    .plot-controls {{
+      display: none;
+      margin-top: 10px;
+      border: 1px solid #b8d2ee;
+      border-radius: 10px;
+      background: #f1f7ff;
+      padding: 10px 10px 8px;
+    }}
+    .plot-controls.active {{
+      display: block;
+    }}
+    .plot-control-group {{
+      margin-bottom: 10px;
+    }}
+    .plot-control-group:last-child {{
+      margin-bottom: 0;
+    }}
+    .plot-control-title {{
+      font-size: 14px;
+      font-weight: 700;
+      color: #1f4a73;
+      margin: 0 0 5px;
+    }}
+    .plot-control-row {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }}
+    .plot-control-btn {{
+      border: 1px solid #3b82f6;
+      border-radius: 7px;
+      background: #e9f3ff;
+      color: #0f4c81;
+      padding: 3px 7px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .plot-control-btn.active {{
+      background: #cfe3ff;
+      border-color: #2c6ed5;
+      color: #0b5;
+    }}
     .summary-iframe {{
       width: 100%;
       min-height: 980px;
@@ -1397,6 +1677,70 @@ def _build_subject_report_html(
         }}, 260);
       }}
 
+      function runPlotlyControlAction(plotEl, control) {{
+        if (!plotEl || !control || typeof Plotly === 'undefined') {{
+          return;
+        }}
+        const method = String(control.method || 'restyle').toLowerCase();
+        const args = Array.isArray(control.args) ? control.args : [];
+        try {{
+          if (method === 'relayout') {{
+            Plotly.relayout(plotEl, ...(args || []));
+          }} else if (method === 'update') {{
+            Plotly.update(plotEl, ...(args || []));
+          }} else {{
+            Plotly.restyle(plotEl, ...(args || []));
+          }}
+        }} catch (err) {{
+          // no-op
+        }}
+      }}
+
+      function renderExternalControls(plotEl, controls) {{
+        const wrap = plotEl ? plotEl.closest('.lazy-plot-wrap') : null;
+        const panel = wrap ? wrap.querySelector('.plot-controls') : null;
+        if (!panel) {{
+          return;
+        }}
+        panel.innerHTML = '';
+        const groups = Array.isArray(controls) ? controls : [];
+        if (groups.length === 0) {{
+          panel.classList.remove('active');
+          return;
+        }}
+        panel.classList.add('active');
+        groups.forEach((group) => {{
+          const title = String((group && group.title) || 'Control');
+          const buttons = Array.isArray(group && group.buttons) ? group.buttons : [];
+          if (buttons.length === 0) {{
+            return;
+          }}
+          const gEl = document.createElement('div');
+          gEl.className = 'plot-control-group';
+          const tEl = document.createElement('div');
+          tEl.className = 'plot-control-title';
+          tEl.textContent = title;
+          gEl.appendChild(tEl);
+          const row = document.createElement('div');
+          row.className = 'plot-control-row';
+          const activeIdx = Number.isFinite(group && group.active) ? Number(group.active) : 0;
+          buttons.forEach((btn, idx) => {{
+            const bEl = document.createElement('button');
+            bEl.type = 'button';
+            bEl.className = 'plot-control-btn' + (idx === activeIdx ? ' active' : '');
+            bEl.textContent = String((btn && btn.label) || '');
+            bEl.addEventListener('click', () => {{
+              Array.from(row.querySelectorAll('.plot-control-btn')).forEach((x) => x.classList.remove('active'));
+              bEl.classList.add('active');
+              runPlotlyControlAction(plotEl, btn || {{}});
+            }});
+            row.appendChild(bEl);
+          }});
+          gEl.appendChild(row);
+          panel.appendChild(gEl);
+        }});
+      }}
+
       function renderLazyInScope(scopeRoot) {{
         const scope = scopeRoot || document;
         if (typeof Plotly === 'undefined') {{
@@ -1423,6 +1767,7 @@ def _build_subject_report_html(
               payload.config || {{ responsive: true, displaylogo: false }}
             );
             el.dataset.rendered = '1';
+            renderExternalControls(el, payload.controls || []);
             if (rendered && typeof rendered.then === 'function') {{
               promises.push(rendered.catch(() => undefined));
             }}

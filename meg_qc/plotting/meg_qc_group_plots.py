@@ -1527,6 +1527,32 @@ def plot_heatmap_sorted_channels_windows(
     )
     menus.append(
         dict(
+            name="Line thickness level",
+            type="buttons",
+            direction="right",
+            x=0.00,
+            y=-0.60,
+            xanchor="left",
+            yanchor="top",
+            showactive=True,
+            active=1,
+            bgcolor="#F3F8FE",
+            bordercolor="#2B6CB0",
+            borderwidth=1.8,
+            font=dict(size=14, color="#0F3D6E"),
+            pad=dict(r=16, t=10, l=14, b=10),
+            buttons=[
+                dict(
+                    label=f"   {level}   ",
+                    method="restyle",
+                    args=[{"line.width": [float(level)] * 6}, [4, 5, 6, 12, 13, 14]],
+                )
+                for level in range(1, 9)
+            ],
+        )
+    )
+    menus.append(
+        dict(
             type="buttons",
             direction="right",
             x=0.00,
@@ -1559,7 +1585,7 @@ def plot_heatmap_sorted_channels_windows(
     fig.update_layout(
         title={"text": title, "x": 0.5, "y": 0.97, "xanchor": "center", "yanchor": "top"},
         template="plotly_white",
-        margin={"l": 70, "r": 55, "t": 165, "b": 300},
+        margin={"l": 70, "r": 55, "t": 165, "b": 340},
         height=980,
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.06, "xanchor": "left", "x": 0},
         coloraxis={
@@ -1865,21 +1891,62 @@ def _lazy_payload_script_tags_html() -> str:
     )
 
 
-def _register_lazy_figure(fig: go.Figure, *, height_px: str) -> str:
+def _extract_figure_controls(fig: go.Figure) -> List[Dict[str, object]]:
+    """Extract Plotly updatemenus as external HTML controls and clear them from layout."""
+    menus = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    controls: List[Dict[str, object]] = []
+    if not menus:
+        return controls
+
+    for idx, menu in enumerate(menus):
+        mj = menu.to_plotly_json() if hasattr(menu, "to_plotly_json") else dict(menu)
+        raw_buttons = list(mj.get("buttons", []) or [])
+        buttons: List[Dict[str, object]] = []
+        for b in raw_buttons:
+            if not isinstance(b, dict):
+                continue
+            buttons.append(
+                {
+                    "label": str(b.get("label", "")),
+                    "method": str(b.get("method", "restyle")),
+                    "args": b.get("args", []),
+                }
+            )
+        if not buttons:
+            continue
+        controls.append(
+            {
+                "title": _infer_updatemenu_title(menu, idx),
+                "active": int(mj.get("active", 0) or 0),
+                "buttons": buttons,
+            }
+        )
+
+    # Important: update_layout(updatemenus=[]) may keep existing menus in
+    # serialized layout; assign directly to clear them reliably.
+    fig.layout.updatemenus = None
+    return controls
+
+
+def _register_lazy_figure(fig: go.Figure, *, height_px: str, controls: Optional[List[Dict[str, object]]] = None) -> str:
     fig_id = f"lazy-plot-{next(_LAZY_PLOT_COUNTER)}"
     payload_id = f"lazy-payload-{next(_LAZY_PAYLOAD_COUNTER)}"
     payload_json = json.dumps(
         {
             "figure": fig.to_plotly_json(),
             "config": {"responsive": True, "displaylogo": False},
+            "controls": controls or [],
         },
         cls=PlotlyJSONEncoder,
         separators=(",", ":"),
     ).replace("</", "<\\/")
     _LAZY_PLOT_PAYLOADS[payload_id] = payload_json
     return (
+        "<div class='lazy-plot-wrap'>"
         f"<div id='{fig_id}' class='js-lazy-plot' data-payload-id='{payload_id}' "
         f"style='height:{height_px}; width:100%;'></div>"
+        "<div class='plot-controls'></div>"
+        "</div>"
     )
 
 
@@ -1914,11 +1981,15 @@ def _figure_to_div(fig: Optional[go.Figure]) -> str:
     margin_json["t"] = top_margin
     fig_out.update_layout(margin=margin_json)
 
+    # Universal controls: axis-label sizing for all axis-bearing plots.
+    _attach_axis_label_size_controller(fig_out)
+    controls = _extract_figure_controls(fig_out)
+
     height = fig_out.layout.height
     if height is None or not np.isfinite(height):
         height = 640
     height_px = f"{int(max(420, float(height)))}px"
-    return _register_lazy_figure(fig_out, height_px=height_px)
+    return _register_lazy_figure(fig_out, height_px=height_px, controls=controls)
 
 
 def _trace_numeric(values) -> Optional[np.ndarray]:
@@ -2825,6 +2896,389 @@ def _kde_curve(values: np.ndarray, n_points: int = 220) -> Optional[Tuple[np.nda
     return x, y
 
 
+def _hex_to_rgba(color: str, alpha: float) -> str:
+    c = str(color).strip()
+    if c.startswith("#") and len(c) == 7:
+        r = int(c[1:3], 16)
+        g = int(c[3:5], 16)
+        b = int(c[5:7], 16)
+        return f"rgba({r},{g},{b},{float(alpha):.3f})"
+    return c
+
+
+def _attach_distribution_style_controls(
+    fig: go.Figure,
+    *,
+    default_line_width: float = 2.2,
+    default_marker_size: float = 8.0,
+) -> None:
+    """Attach numeric style controls for distribution plots."""
+    if fig is None or not fig.data:
+        return
+
+    marker_level_to_size = {1: 3.0, 2: 4.0, 3: 5.5, 4: 7.0, 5: 8.5, 6: 10.0, 7: 12.0, 8: 14.0}
+
+    has_marker_traces = False
+    for tr in fig.data:
+        t = getattr(tr, "type", "")
+        mode = str(getattr(tr, "mode", "") or "")
+        if t in {"scatter", "scattergl"} and ("markers" in mode):
+            has_marker_traces = True
+            break
+
+    def _line_restyle(level: int) -> Dict[str, List[Optional[float]]]:
+        line_width: List[Optional[float]] = []
+        marker_line_width: List[Optional[float]] = []
+        lw = float(level)
+        for tr in fig.data:
+            t = getattr(tr, "type", "")
+            mode = str(getattr(tr, "mode", "") or "")
+            if t in {"scatter", "scattergl", "violin", "box"}:
+                line_width.append(lw)
+            else:
+                line_width.append(None)
+            if t == "histogram":
+                marker_line_width.append(max(0.5, lw * 0.6))
+            elif t in {"scatter", "scattergl"} and ("markers" in mode):
+                marker_line_width.append(max(0.25, lw * 0.2))
+            else:
+                marker_line_width.append(None)
+        return {
+            "line.width": line_width,
+            "marker.line.width": marker_line_width,
+        }
+
+    def _marker_restyle(level: int) -> Dict[str, List[Optional[float]]]:
+        marker_size: List[Optional[float]] = []
+        size = float(marker_level_to_size.get(level, default_marker_size))
+        for tr in fig.data:
+            t = getattr(tr, "type", "")
+            mode = str(getattr(tr, "mode", "") or "")
+            if t in {"scatter", "scattergl"} and ("markers" in mode):
+                marker_size.append(size)
+            else:
+                marker_size.append(None)
+        return {"marker.size": marker_size}
+
+    levels = list(range(1, 9))
+    line_active = int(np.clip(int(round(default_line_width)), 1, 8) - 1)
+    marker_active_guess = min(levels, key=lambda lv: abs(marker_level_to_size[lv] - float(default_marker_size)))
+    marker_active = int(marker_active_guess - 1)
+
+    line_buttons = [
+        dict(
+            label=str(level),
+            method="restyle",
+            args=[_line_restyle(level)],
+        )
+        for level in levels
+    ]
+    marker_buttons = []
+    if has_marker_traces:
+        marker_buttons = [
+            dict(
+                label=str(level),
+                method="restyle",
+                args=[_marker_restyle(level)],
+            )
+            for level in levels
+        ]
+
+    existing = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    menu_names = {str(getattr(m, "name", "") or "") for m in existing}
+    if "Line thickness level" not in menu_names:
+        existing.append(
+            dict(
+                name="Line thickness level",
+                type="buttons",
+                direction="right",
+                showactive=True,
+                active=line_active,
+                buttons=line_buttons,
+            )
+        )
+    if marker_buttons and ("Dot size level" not in menu_names):
+        existing.append(
+            dict(
+                name="Dot size level",
+                type="buttons",
+                direction="right",
+                showactive=True,
+                active=marker_active,
+                buttons=marker_buttons,
+            )
+        )
+    fig.update_layout(updatemenus=existing)
+
+
+def _attach_dot_alignment_controller(
+    fig: go.Figure,
+    *,
+    centered_trace_indices: Sequence[int],
+    side_trace_indices: Sequence[int],
+    default_side: bool = False,
+) -> None:
+    """Attach a controller to toggle subject dots between centered and side placement."""
+    if fig is None or not fig.data:
+        return
+    centered = [int(i) for i in centered_trace_indices]
+    side = [int(i) for i in side_trace_indices]
+    if not centered or not side:
+        return
+
+    existing = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    menu_names = {str(getattr(m, "name", "") or "") for m in existing}
+    if "Dot placement" in menu_names:
+        return
+
+    target_indices = centered + side
+    centered_visible = [True] * len(centered) + [False] * len(side)
+    side_visible = [False] * len(centered) + [True] * len(side)
+
+    existing.append(
+        dict(
+            name="Dot placement",
+            type="buttons",
+            direction="right",
+            showactive=True,
+            active=1 if default_side else 0,
+            buttons=[
+                dict(
+                    label="Centered dots",
+                    method="restyle",
+                    args=[{"visible": centered_visible}, target_indices],
+                ),
+                dict(
+                    label="Side dots",
+                    method="restyle",
+                    args=[{"visible": side_visible}, target_indices],
+                ),
+            ],
+        )
+    )
+    fig.update_layout(updatemenus=existing)
+
+
+def _attach_side_displacement_controller(
+    fig: go.Figure,
+    *,
+    side_trace_indices: Sequence[int],
+    side_x_by_level: Dict[int, List[np.ndarray]],
+    default_level: int = 4,
+) -> None:
+    """Attach a controller to vary side-dot horizontal displacement (levels 1..8)."""
+    if fig is None or not fig.data:
+        return
+    side_indices = [int(i) for i in side_trace_indices]
+    if not side_indices:
+        return
+
+    existing = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    menu_names = {str(getattr(m, "name", "") or "") for m in existing}
+    if "Side displacement level" in menu_names:
+        return
+
+    levels = [lv for lv in range(1, 9) if lv in side_x_by_level and len(side_x_by_level[lv]) == len(side_indices)]
+    if not levels:
+        return
+    active = int(np.clip(int(default_level), min(levels), max(levels))) - 1
+    active = max(0, min(active, len(levels) - 1))
+
+    existing.append(
+        dict(
+            name="Side displacement level",
+            type="buttons",
+            direction="right",
+            showactive=True,
+            active=active,
+            buttons=[
+                dict(
+                    label=str(level),
+                    method="restyle",
+                    args=[{"x": side_x_by_level[level]}, side_indices],
+                )
+                for level in levels
+            ],
+        )
+    )
+    fig.update_layout(updatemenus=existing)
+
+
+def _attach_axis_label_size_controller(fig: go.Figure) -> None:
+    """Add a numeric axis-label/ticks-size controller for any figure with axes."""
+    if fig is None:
+        return
+    layout_dict = fig.to_plotly_json().get("layout", {})
+    axis_keys = [k for k in layout_dict.keys() if str(k).startswith("xaxis") or str(k).startswith("yaxis")]
+    scene_keys = [k for k in layout_dict.keys() if re.fullmatch(r"scene\d*", str(k) or "")]
+    if (not axis_keys) and (not scene_keys):
+        return
+
+    existing = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    if any(str(getattr(m, "name", "") or "") == "Axis label/ticks size level" for m in existing):
+        return
+
+    axis_level_to_tick = {1: 9, 2: 10, 3: 12, 4: 14, 5: 16, 6: 18, 7: 20, 8: 22}
+
+    def _axis_relayout(level: int) -> Dict[str, int]:
+        tick_sz = int(axis_level_to_tick.get(level, 14))
+        title_sz = tick_sz + 2
+        payload: Dict[str, int] = {}
+        for key in axis_keys:
+            payload[f"{key}.tickfont.size"] = tick_sz
+            payload[f"{key}.title.font.size"] = title_sz
+        for sk in scene_keys:
+            payload[f"{sk}.xaxis.tickfont.size"] = tick_sz
+            payload[f"{sk}.yaxis.tickfont.size"] = tick_sz
+            payload[f"{sk}.zaxis.tickfont.size"] = tick_sz
+            payload[f"{sk}.xaxis.title.font.size"] = title_sz
+            payload[f"{sk}.yaxis.title.font.size"] = title_sz
+            payload[f"{sk}.zaxis.title.font.size"] = title_sz
+        return payload
+
+    existing.append(
+        dict(
+            name="Axis label/ticks size level",
+            type="buttons",
+            direction="right",
+            showactive=True,
+            active=3,
+            buttons=[dict(label=str(level), method="relayout", args=[_axis_relayout(level)]) for level in range(1, 9)],
+        )
+    )
+    fig.update_layout(updatemenus=existing)
+
+
+def _infer_updatemenu_title(menu, idx: int) -> str:
+    explicit = str(getattr(menu, "name", "") or "").strip()
+    if explicit:
+        return explicit
+    buttons = list(getattr(menu, "buttons", []) or [])
+    labels: List[str] = [str(getattr(btn, "label", "") or "").strip() for btn in buttons]
+    low = " ".join(l.lower() for l in labels)
+    if "heat:" in low:
+        return "Heat summary variant"
+    if "top:" in low:
+        return "Top profile summary"
+    if "right:" in low:
+        return "Right profile summary"
+    if "cap" in low:
+        return "3D cap display"
+    if labels and all(l in {str(i) for i in range(1, 9)} for l in labels):
+        methods = {str(getattr(btn, "method", "") or "").lower() for btn in buttons}
+        arg_keys: set[str] = set()
+        for btn in buttons:
+            args = getattr(btn, "args", None)
+            if isinstance(args, (list, tuple)) and args:
+                first = args[0]
+                if isinstance(first, dict):
+                    arg_keys.update(str(k) for k in first.keys())
+        if "relayout" in methods:
+            return "Axis label/ticks size level"
+        if "marker.size" in arg_keys:
+            return "Dot size level"
+        if "line.width" in arg_keys:
+            return "Line thickness level"
+        return "Style level"
+    return f"Figure control {idx + 1}"
+
+
+def _encapsulate_updatemenus_panel(fig: go.Figure) -> None:
+    """Place all Plotly controllers in a dedicated bottom panel to avoid overlaps."""
+    if fig is None:
+        return
+    menus = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    if not menus:
+        return
+
+    # Skip only if every menu has an explicit negative y (already panelized).
+    menu_ys: List[float] = []
+    all_have_y = True
+    for m in menus:
+        yv = getattr(m, "y", None)
+        if yv is None:
+            all_have_y = False
+            break
+        try:
+            menu_ys.append(float(yv))
+        except Exception:
+            all_have_y = False
+            break
+    if all_have_y and menu_ys and max(menu_ys) < 0:
+        return
+
+    start_y = -0.17
+    step_y = 0.16
+    new_menus = []
+    title_annotations = []
+    for idx, menu in enumerate(menus):
+        mj = menu.to_plotly_json() if hasattr(menu, "to_plotly_json") else dict(menu)
+        y = start_y - idx * step_y
+        mj["x"] = 0.03
+        mj["y"] = y
+        mj["xanchor"] = "left"
+        mj["yanchor"] = "top"
+        mj["direction"] = "right"
+        mj["showactive"] = True if mj.get("showactive") is None else mj["showactive"]
+        mj.setdefault("bgcolor", "rgba(231,241,252,0.96)")
+        mj.setdefault("bordercolor", "#6EA2D5")
+        mj.setdefault("borderwidth", 1)
+        mj.setdefault("pad", {"r": 8, "t": 2, "l": 2, "b": 2})
+        new_menus.append(mj)
+
+        title = _infer_updatemenu_title(menu, idx)
+        title_annotations.append(
+            dict(
+                x=0.03,
+                y=y + 0.038,
+                xref="paper",
+                yref="paper",
+                text=f"<b>{title}</b>",
+                showarrow=False,
+                xanchor="left",
+                yanchor="top",
+                font={"size": 12, "color": "#17395C"},
+                align="left",
+            )
+        )
+
+    anns = list(fig.layout.annotations) if fig.layout.annotations else []
+    anns.extend(title_annotations)
+
+    y_top = -0.06
+    y_bottom = start_y - (len(new_menus) - 1) * step_y - 0.10
+    shapes = list(fig.layout.shapes) if fig.layout.shapes else []
+    shapes.append(
+        dict(
+            type="rect",
+            xref="paper",
+            yref="paper",
+            x0=0.0,
+            x1=1.0,
+            y0=y_bottom,
+            y1=y_top,
+            line={"color": "#9FC2E8", "width": 1},
+            fillcolor="rgba(238,246,255,0.92)",
+            layer="below",
+        )
+    )
+
+    margin = fig.layout.margin or {}
+    current_bottom = int(getattr(margin, "b", 50) or 50)
+    needed_bottom = 140 + int(len(new_menus) * 92)
+    fig.update_layout(
+        updatemenus=new_menus,
+        annotations=anns,
+        shapes=shapes,
+        margin={
+            "l": margin.l if hasattr(margin, "l") and margin.l is not None else 55,
+            "r": margin.r if hasattr(margin, "r") and margin.r is not None else 20,
+            "t": margin.t if hasattr(margin, "t") and margin.t is not None else 65,
+            "b": max(current_bottom, needed_bottom),
+        },
+    )
+
+
 def plot_histogram_distribution(
     values_by_group: Dict[str, List[float]],
     title: str,
@@ -2832,23 +3286,38 @@ def plot_histogram_distribution(
 ) -> Optional[go.Figure]:
     fig = go.Figure()
     density_curves = []
-    for label in sorted(values_by_group):
+    palette = [
+        "#1f77b4",
+        "#d62728",
+        "#2ca02c",
+        "#ff7f0e",
+        "#9467bd",
+        "#17becf",
+        "#8c564b",
+        "#e377c2",
+    ]
+    for idx, label in enumerate(sorted(values_by_group)):
         vals = _finite_array(values_by_group[label])
         if vals.size == 0:
             continue
         keep = _downsample_indices(vals.size, MAX_POINTS_VIOLIN)
         vals = vals[keep]
-        density_curves.append((label, vals))
+        color = palette[idx % len(palette)]
+        density_curves.append((label, vals, color))
         fig.add_trace(
             go.Histogram(
                 x=vals,
                 name=f"{label} (n={vals.size})",
                 histnorm="probability density",
-                opacity=0.42,
+                opacity=1.0,
+                marker={
+                    "color": _hex_to_rgba(color, 0.34),
+                    "line": {"width": 1.2, "color": color},
+                },
                 nbinsx=55,
             )
         )
-    for label, vals in density_curves:
+    for label, vals, color in density_curves:
         kde = _kde_curve(vals)
         if kde is None:
             continue
@@ -2859,7 +3328,7 @@ def plot_histogram_distribution(
                 y=y,
                 mode="lines",
                 name=f"{label} density",
-                line={"width": 2.0},
+                line={"width": 2.6, "color": color},
             )
         )
     if not fig.data:
@@ -2873,6 +3342,7 @@ def plot_histogram_distribution(
         margin={"l": 55, "r": 20, "t": 65, "b": 50},
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
     )
+    _attach_distribution_style_controls(fig, default_line_width=2.6, default_marker_size=8.0)
     return fig
 
 
@@ -2892,7 +3362,7 @@ def plot_density_distribution(
         if kde is None:
             continue
         x, y = kde
-        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=f"{label} (n={vals.size})", line={"width": 2.0}))
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=f"{label} (n={vals.size})", line={"width": 2.6}))
     if not fig.data:
         return None
     fig.update_layout(
@@ -2903,6 +3373,7 @@ def plot_density_distribution(
         margin={"l": 55, "r": 20, "t": 65, "b": 50},
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
     )
+    _attach_distribution_style_controls(fig, default_line_width=2.6, default_marker_size=8.0)
     return fig
 
 
@@ -2912,6 +3383,9 @@ def plot_violin_with_subject_jitter(
     point_col: str,
     title: str,
     y_title: str,
+    *,
+    show_density_ridge: bool = True,
+    spanmode: str = "soft",
 ) -> Optional[go.Figure]:
     labels = [k for k in values_by_group if _finite_array(values_by_group[k]).size > 0]
     if not labels:
@@ -2943,31 +3417,33 @@ def plot_violin_with_subject_jitter(
                 box_visible=True,
                 meanline_visible=False,
                 points=False,
-                line={"width": 1.0, "color": color},
+                spanmode=spanmode,
+                line={"width": 2.0, "color": color},
                 opacity=0.45,
                 legendgroup=group_id,
                 showlegend=True,
             )
         )
-        kde = _kde_curve(vals)
-        if kde is not None:
-            kde_x, kde_y = kde
-            y_max = float(np.nanmax(kde_y))
-            if np.isfinite(y_max) and y_max > 0:
-                ridge_x = xpos[label] + 0.18 + 0.22 * (kde_y / y_max)
-                fig.add_trace(
-                    go.Scatter(
-                        x=ridge_x,
-                        y=kde_x,
-                        mode="lines",
-                        line={"width": 1.5, "color": color},
-                        opacity=0.9,
-                        legendgroup=group_id,
-                        showlegend=False,
-                        hovertemplate=f"{label}<br>{y_title}=%{{y:.3g}}<br>density=%{{customdata:.3g}}<extra></extra>",
-                        customdata=kde_y,
+        if show_density_ridge:
+            kde = _kde_curve(vals)
+            if kde is not None:
+                kde_x, kde_y = kde
+                y_max = float(np.nanmax(kde_y))
+                if np.isfinite(y_max) and y_max > 0:
+                    ridge_x = xpos[label] + 0.18 + 0.22 * (kde_y / y_max)
+                    fig.add_trace(
+                        go.Scatter(
+                            x=ridge_x,
+                            y=kde_x,
+                            mode="lines",
+                            line={"width": 2.4, "color": color},
+                            opacity=0.9,
+                            legendgroup=group_id,
+                            showlegend=False,
+                            hovertemplate=f"{label}<br>{y_title}=%{{y:.3g}}<br>density=%{{customdata:.3g}}<extra></extra>",
+                            customdata=kde_y,
+                        )
                     )
-                )
 
     if points_df.empty or point_col not in points_df.columns or "subject" not in points_df.columns:
         points_data = pd.DataFrame()
@@ -3016,6 +3492,11 @@ def plot_violin_with_subject_jitter(
         points_data = pd.DataFrame(recs, columns=["label", "value", "subject", "hover"])
         points_data = points_data.loc[points_data["label"].isin(labels)]
 
+    centered_trace_indices: List[int] = []
+    side_trace_indices: List[int] = []
+    side_x_by_level: Dict[int, List[np.ndarray]] = {level: [] for level in range(1, 9)}
+    displacement_map = {1: 0.10, 2: 0.14, 3: 0.18, 4: 0.22, 5: 0.26, 6: 0.30, 7: 0.34, 8: 0.38}
+    default_side_level = 4
     if not points_data.empty:
         keep = _downsample_indices(len(points_data), min(MAX_POINTS_SCATTER, len(points_data)))
         points_data = points_data.iloc[keep].copy()
@@ -3025,15 +3506,20 @@ def plot_violin_with_subject_jitter(
             group_points = points_data.loc[points_data["label"] == label].copy()
             if group_points.empty:
                 continue
-            x_numeric = np.full(group_points.shape[0], xpos[label], dtype=float)
-            x_numeric = x_numeric + rng.uniform(-0.17, 0.17, size=x_numeric.size)
+            x_center = np.full(group_points.shape[0], xpos[label], dtype=float)
+            x_center = x_center + rng.uniform(-0.08, 0.08, size=x_center.size)
+            side_jitter = rng.uniform(-0.06, 0.06, size=x_center.size)
+            x_side_levels = {
+                level: (np.full(group_points.shape[0], xpos[label] + offset, dtype=float) + side_jitter)
+                for level, offset in displacement_map.items()
+            }
             fig.add_trace(
                 go.Scattergl(
-                    x=x_numeric,
+                    x=x_center,
                     y=group_points["value"],
                     mode="markers",
                     marker={
-                        "size": 6,
+                        "size": 8.0,
                         "color": group_points["subj_code"],
                         "colorscale": "Turbo",
                         "opacity": 0.7,
@@ -3044,8 +3530,33 @@ def plot_violin_with_subject_jitter(
                     hovertemplate="%{customdata[0]}<br>value=%{y:.3g}<extra></extra>",
                     legendgroup=f"group::{label}",
                     showlegend=False,
+                    visible=True,
                 )
             )
+            centered_trace_indices.append(len(fig.data) - 1)
+            fig.add_trace(
+                go.Scattergl(
+                    x=x_side_levels[default_side_level],
+                    y=group_points["value"],
+                    mode="markers",
+                    marker={
+                        "size": 8.0,
+                        "color": group_points["subj_code"],
+                        "colorscale": "Turbo",
+                        "opacity": 0.72,
+                        "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
+                        "showscale": False,
+                    },
+                    customdata=np.stack([group_points["hover"]], axis=-1),
+                    hovertemplate="%{customdata[0]}<br>value=%{y:.3g}<extra></extra>",
+                    legendgroup=f"group::{label}",
+                    showlegend=False,
+                    visible=False,
+                )
+            )
+            side_trace_indices.append(len(fig.data) - 1)
+            for level in range(1, 9):
+                side_x_by_level[level].append(x_side_levels[level])
 
     fig.update_layout(
         title={"text": title, "x": 0.5},
@@ -3066,7 +3577,226 @@ def plot_violin_with_subject_jitter(
         tickmode="array",
         tickvals=[xpos[l] for l in labels],
         ticktext=labels,
-        range=[-0.5, len(labels) - 0.1],
+        range=[-0.5, len(labels) - 0.1 + (0.50 if side_trace_indices else 0.0)],
+    )
+    _attach_distribution_style_controls(fig, default_line_width=2.2, default_marker_size=8.0)
+    for idx in centered_trace_indices:
+        if 0 <= idx < len(fig.data):
+            fig.data[idx].visible = True
+    for idx in side_trace_indices:
+        if 0 <= idx < len(fig.data):
+            fig.data[idx].visible = False
+    _attach_dot_alignment_controller(
+        fig,
+        centered_trace_indices=centered_trace_indices,
+        side_trace_indices=side_trace_indices,
+        default_side=False,
+    )
+    _attach_side_displacement_controller(
+        fig,
+        side_trace_indices=side_trace_indices,
+        side_x_by_level=side_x_by_level,
+        default_level=default_side_level,
+    )
+    return fig
+
+
+def plot_box_with_subject_jitter(
+    values_by_group: Dict[str, List[float]],
+    points_df: pd.DataFrame,
+    point_col: str,
+    title: str,
+    y_title: str,
+) -> Optional[go.Figure]:
+    """Boxplot view with the same subject-level jitter overlay used in violin views."""
+    labels = [k for k in values_by_group if _finite_array(values_by_group[k]).size > 0]
+    if not labels:
+        return None
+
+    xpos = {label: float(i) for i, label in enumerate(labels)}
+    fig = go.Figure()
+    palette = [
+        "#1f77b4",
+        "#d62728",
+        "#2ca02c",
+        "#ff7f0e",
+        "#9467bd",
+        "#17becf",
+        "#8c564b",
+        "#e377c2",
+    ]
+    for idx, label in enumerate(labels):
+        vals = _finite_array(values_by_group[label])
+        keep = _downsample_indices(vals.size, MAX_POINTS_VIOLIN)
+        vals = vals[keep]
+        color = palette[idx % len(palette)]
+        group_id = f"group::{label}"
+        fig.add_trace(
+            go.Box(
+                x=np.full(vals.size, xpos[label], dtype=float),
+                y=vals,
+                name=f"{label} (n={vals.size})",
+                boxpoints=False,
+                line={"width": 2.0, "color": color},
+                marker={"color": color},
+                fillcolor=_hex_to_rgba(color, 0.26),
+                opacity=0.9,
+                legendgroup=group_id,
+                showlegend=True,
+            )
+        )
+
+    if points_df.empty or point_col not in points_df.columns or "subject" not in points_df.columns:
+        points_data = pd.DataFrame()
+    else:
+        tmp = points_df.loc[np.isfinite(points_df[point_col])].copy()
+        tmp["condition_label"] = tmp.get("condition_label", "all recordings").astype(str)
+        tmp["subject"] = tmp["subject"].fillna("n/a").astype(str)
+        tmp["task"] = tmp.get("task", "n/a").fillna("n/a").astype(str)
+
+        recs = []
+        by_condition_subject = tmp.groupby(["condition_label", "subject"], dropna=False)
+        for (label, subject), group in by_condition_subject:
+            vals = pd.to_numeric(group[point_col], errors="coerce").to_numpy(dtype=float)
+            vals = _finite_array(vals)
+            if vals.size == 0:
+                continue
+            value = float(np.nanmedian(vals))
+            tasks = sorted({t for t in group["task"].tolist() if t != "n/a"})
+            hover = (
+                f"sub={subject}"
+                f"<br>condition={label}"
+                f"<br>n_recordings={len(group)}"
+                + (f"<br>tasks={', '.join(tasks)}" if tasks else "")
+                + f"<br>value={value:.3g}"
+            )
+            recs.append((str(label), value, str(subject), hover))
+
+        by_subject = tmp.groupby("subject", dropna=False)
+        for subject, group in by_subject:
+            vals = pd.to_numeric(group[point_col], errors="coerce").to_numpy(dtype=float)
+            vals = _finite_array(vals)
+            if vals.size == 0:
+                continue
+            value = float(np.nanmedian(vals))
+            tasks = sorted({t for t in group["task"].tolist() if t != "n/a"})
+            hover = (
+                f"sub={subject}"
+                "<br>condition=all tasks"
+                f"<br>n_recordings={len(group)}"
+                + (f"<br>tasks={', '.join(tasks)}" if tasks else "")
+                + f"<br>value={value:.3g}"
+            )
+            recs.append(("all tasks", value, str(subject), hover))
+
+        points_data = pd.DataFrame(recs, columns=["label", "value", "subject", "hover"])
+        points_data = points_data.loc[points_data["label"].isin(labels)]
+
+    centered_trace_indices: List[int] = []
+    side_trace_indices: List[int] = []
+    side_x_by_level: Dict[int, List[np.ndarray]] = {level: [] for level in range(1, 9)}
+    displacement_map = {1: 0.10, 2: 0.14, 3: 0.18, 4: 0.22, 5: 0.26, 6: 0.30, 7: 0.34, 8: 0.38}
+    default_side_level = 4
+    if not points_data.empty:
+        keep = _downsample_indices(len(points_data), min(MAX_POINTS_SCATTER, len(points_data)))
+        points_data = points_data.iloc[keep].copy()
+        points_data["subj_code"] = pd.Categorical(points_data["subject"]).codes.astype(float)
+        rng = np.random.default_rng(0)
+        for label in labels:
+            group_points = points_data.loc[points_data["label"] == label].copy()
+            if group_points.empty:
+                continue
+            x_center = np.full(group_points.shape[0], xpos[label], dtype=float)
+            x_center = x_center + rng.uniform(-0.08, 0.08, size=x_center.size)
+            side_jitter = rng.uniform(-0.06, 0.06, size=x_center.size)
+            x_side_levels = {
+                level: (np.full(group_points.shape[0], xpos[label] + offset, dtype=float) + side_jitter)
+                for level, offset in displacement_map.items()
+            }
+            fig.add_trace(
+                go.Scattergl(
+                    x=x_center,
+                    y=group_points["value"],
+                    mode="markers",
+                    marker={
+                        "size": 8.0,
+                        "color": group_points["subj_code"],
+                        "colorscale": "Turbo",
+                        "opacity": 0.7,
+                        "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
+                        "showscale": False,
+                    },
+                    customdata=np.stack([group_points["hover"]], axis=-1),
+                    hovertemplate="%{customdata[0]}<br>value=%{y:.3g}<extra></extra>",
+                    legendgroup=f"group::{label}",
+                    showlegend=False,
+                    visible=True,
+                )
+            )
+            centered_trace_indices.append(len(fig.data) - 1)
+            fig.add_trace(
+                go.Scattergl(
+                    x=x_side_levels[default_side_level],
+                    y=group_points["value"],
+                    mode="markers",
+                    marker={
+                        "size": 8.0,
+                        "color": group_points["subj_code"],
+                        "colorscale": "Turbo",
+                        "opacity": 0.72,
+                        "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
+                        "showscale": False,
+                    },
+                    customdata=np.stack([group_points["hover"]], axis=-1),
+                    hovertemplate="%{customdata[0]}<br>value=%{y:.3g}<extra></extra>",
+                    legendgroup=f"group::{label}",
+                    showlegend=False,
+                    visible=False,
+                )
+            )
+            side_trace_indices.append(len(fig.data) - 1)
+            for level in range(1, 9):
+                side_x_by_level[level].append(x_side_levels[level])
+
+    fig.update_layout(
+        title={"text": title, "x": 0.5},
+        xaxis_title="Task / condition",
+        yaxis_title=y_title,
+        template="plotly_white",
+        margin={"l": 55, "r": 20, "t": 65, "b": 50},
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "left",
+            "x": 0,
+            "groupclick": "togglegroup",
+        },
+    )
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=[xpos[l] for l in labels],
+        ticktext=labels,
+        range=[-0.5, len(labels) - 0.1 + (0.50 if side_trace_indices else 0.0)],
+    )
+    _attach_distribution_style_controls(fig, default_line_width=2.2, default_marker_size=8.0)
+    for idx in centered_trace_indices:
+        if 0 <= idx < len(fig.data):
+            fig.data[idx].visible = True
+    for idx in side_trace_indices:
+        if 0 <= idx < len(fig.data):
+            fig.data[idx].visible = False
+    _attach_dot_alignment_controller(
+        fig,
+        centered_trace_indices=centered_trace_indices,
+        side_trace_indices=side_trace_indices,
+        default_side=False,
+    )
+    _attach_side_displacement_controller(
+        fig,
+        side_trace_indices=side_trace_indices,
+        side_x_by_level=side_x_by_level,
+        default_level=default_side_level,
     )
     return fig
 
@@ -4425,12 +5155,21 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
         if not vals:
             return "<p>No values are available for this variant.</p>"
         point_col_safe = point_col if point_col in df.columns else "__none__"
-        violin = plot_violin_with_subject_jitter(
+        box_raw = plot_box_with_subject_jitter(
             vals,
             df,
             point_col=point_col_safe,
-            title=f"{title_prefix} - violin",
+            title=f"{title_prefix} - boxplot",
             y_title=value_label,
+        )
+        violin_density = plot_violin_with_subject_jitter(
+            vals,
+            df,
+            point_col=point_col_safe,
+            title=f"{title_prefix} - violin densities",
+            y_title=value_label,
+            show_density_ridge=True,
+            spanmode="soft",
         )
         hist = plot_histogram_distribution(
             vals,
@@ -4446,13 +5185,26 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
             group_id,
             [
                 (
-                    "Violin",
+                    "Boxplot",
                     _figure_block(
-                        violin,
+                        box_raw,
                         (
-                            "Each violin is the pooled distribution for the selected group. "
+                            "Each box summarizes the pooled empirical spread for the selected group (median, quartiles, and whiskers). "
                             f"Jittered dots show one robust value per subject for the selected {variant_label.lower()} summary "
                             "(median over available runs). "
+                            f"Units: {value_label}."
+                        ),
+                        normalized_variant=True,
+                        norm_mode="y",
+                    ),
+                ),
+                (
+                    "Violin densities",
+                    _figure_block(
+                        violin_density,
+                        (
+                            "Density-smoothed violin variant of the same values. "
+                            f"Jittered dots show one robust value per subject for the selected {variant_label.lower()} summary. "
                             f"Units: {value_label}."
                         ),
                         normalized_variant=True,
@@ -5214,6 +5966,55 @@ def _build_report_html(
     .fig .js-plotly-plot {{
       width: 100% !important;
     }}
+    .lazy-plot-wrap {{
+      width: 100%;
+    }}
+    .plot-controls {{
+      margin-top: 10px;
+      padding: 10px 12px 12px;
+      border: 1px solid #c7dbf2;
+      border-radius: 10px;
+      background: #f4f9ff;
+      display: none;
+    }}
+    .plot-controls.active {{
+      display: block;
+    }}
+    .plot-control-group {{
+      margin-bottom: 10px;
+    }}
+    .plot-control-group:last-child {{
+      margin-bottom: 0;
+    }}
+    .plot-control-title {{
+      font-size: 12px;
+      font-weight: 700;
+      color: #21486f;
+      margin-bottom: 6px;
+      letter-spacing: 0.1px;
+    }}
+    .plot-control-row {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }}
+    .plot-control-btn {{
+      border: 1px solid #78a9df;
+      border-radius: 7px;
+      background: #eaf3ff;
+      color: #1f3f61;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 4px 10px;
+      cursor: pointer;
+    }}
+    .plot-control-btn.active {{
+      background: #d3e8ff;
+      border-color: #4f90d8;
+      color: #0f3256;
+      box-shadow: inset 0 0 0 1px rgba(79,144,216,0.2);
+    }}
     .fig-note {{
       margin: 6px 2px 14px;
       font-size: 13px;
@@ -5486,6 +6287,72 @@ def _build_report_html(
         }}, 260);
       }}
 
+      function runPlotlyControlAction(plotEl, control) {{
+        if (!plotEl || !control || typeof Plotly === 'undefined') {{
+          return;
+        }}
+        const method = String(control.method || 'restyle').toLowerCase();
+        const args = Array.isArray(control.args) ? control.args : [];
+        try {{
+          if (method === 'relayout') {{
+            Plotly.relayout(plotEl, ...(args || []));
+          }} else if (method === 'update') {{
+            Plotly.update(plotEl, ...(args || []));
+          }} else {{
+            Plotly.restyle(plotEl, ...(args || []));
+          }}
+        }} catch (err) {{
+          // no-op
+        }}
+      }}
+
+      function renderExternalControls(plotEl, controls) {{
+        const wrap = plotEl ? plotEl.closest('.lazy-plot-wrap') : null;
+        const panel = wrap ? wrap.querySelector('.plot-controls') : null;
+        if (!panel) {{
+          return;
+        }}
+        panel.innerHTML = '';
+        const groups = Array.isArray(controls) ? controls : [];
+        if (groups.length === 0) {{
+          panel.classList.remove('active');
+          return;
+        }}
+        panel.classList.add('active');
+        groups.forEach((group) => {{
+          const title = String((group && group.title) || 'Control');
+          const buttons = Array.isArray(group && group.buttons) ? group.buttons : [];
+          if (buttons.length === 0) {{
+            return;
+          }}
+          const gEl = document.createElement('div');
+          gEl.className = 'plot-control-group';
+
+          const tEl = document.createElement('div');
+          tEl.className = 'plot-control-title';
+          tEl.textContent = title;
+          gEl.appendChild(tEl);
+
+          const row = document.createElement('div');
+          row.className = 'plot-control-row';
+          const activeIdx = Number.isFinite(Number(group.active)) ? Number(group.active) : 0;
+          buttons.forEach((btn, idx) => {{
+            const bEl = document.createElement('button');
+            bEl.type = 'button';
+            bEl.className = 'plot-control-btn' + (idx === activeIdx ? ' active' : '');
+            bEl.textContent = String((btn && btn.label) || String(idx + 1));
+            bEl.addEventListener('click', () => {{
+              Array.from(row.querySelectorAll('.plot-control-btn')).forEach((x) => x.classList.remove('active'));
+              bEl.classList.add('active');
+              runPlotlyControlAction(plotEl, btn || {{}});
+            }});
+            row.appendChild(bEl);
+          }});
+          gEl.appendChild(row);
+          panel.appendChild(gEl);
+        }});
+      }}
+
       function renderLazyInScope(scopeRoot) {{
         if (typeof Plotly === 'undefined') {{
           return Promise.resolve();
@@ -5516,6 +6383,8 @@ def _build_report_html(
                 return Plotly.addFrames(el, frames).catch(() => undefined);
               }}
               return undefined;
+            }}).then(() => {{
+              renderExternalControls(el, payload.controls || []);
             }});
             el.dataset.rendered = '1';
             renderPromises.push(withFrames.catch(() => undefined));

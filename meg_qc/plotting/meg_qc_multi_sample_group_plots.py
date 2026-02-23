@@ -49,6 +49,7 @@ from meg_qc.plotting.meg_qc_group_plots import (
     _reset_lazy_figure_store,
     _run_rows_dataframe,
     plot_density_distribution,
+    plot_box_with_subject_jitter,
     plot_heatmap_sorted_channels_windows,
     plot_topomap_3d_if_available,
     plot_histogram_distribution,
@@ -393,12 +394,21 @@ def _distribution_views(
     if not values_map:
         return "<p>No values are available for this panel.</p>"
 
-    violin = plot_violin_with_subject_jitter(
+    box_raw = plot_box_with_subject_jitter(
         values_map,
         points_df,
         point_col=point_col,
-        title=f"{title_prefix} - violin",
+        title=f"{title_prefix} - boxplot",
         y_title=value_label,
+    )
+    violin_density = plot_violin_with_subject_jitter(
+        values_map,
+        points_df,
+        point_col=point_col,
+        title=f"{title_prefix} - violin densities",
+        y_title=value_label,
+        show_density_ridge=True,
+        spanmode="soft",
     )
     hist = plot_histogram_distribution(
         values_map,
@@ -415,11 +425,24 @@ def _distribution_views(
         tab_id,
         [
             (
-                "Violin",
+                "Boxplot",
                 _figure_block(
-                    violin,
+                    box_raw,
                     (
-                        "Each violin is one dataset-task group. Labels include '<dataset> | <task/condition>' and '<dataset> | all tasks'. "
+                        "Each box is one dataset-task group summarizing median, quartiles, and whiskers. "
+                        "Labels include '<dataset> | <task/condition>' and '<dataset> | all tasks'. "
+                        "Jittered dots are one robust subject summary for the selected variant."
+                    ),
+                    normalized_variant=True,
+                    norm_mode="y",
+                ),
+            ),
+            (
+                "Violin densities",
+                _figure_block(
+                    violin_density,
+                    (
+                        "Density-smoothed violin version of the same dataset-task groups. "
                         "Jittered dots are one robust subject summary for the selected variant."
                     ),
                     normalized_variant=True,
@@ -1211,6 +1234,55 @@ def _build_multi_sample_report_html(
     .fig .js-plotly-plot {{
       width: 100% !important;
     }}
+    .lazy-plot-wrap {{
+      width: 100%;
+    }}
+    .plot-controls {{
+      margin-top: 10px;
+      padding: 10px 12px 12px;
+      border: 1px solid #c7dbf2;
+      border-radius: 10px;
+      background: #f4f9ff;
+      display: none;
+    }}
+    .plot-controls.active {{
+      display: block;
+    }}
+    .plot-control-group {{
+      margin-bottom: 10px;
+    }}
+    .plot-control-group:last-child {{
+      margin-bottom: 0;
+    }}
+    .plot-control-title {{
+      font-size: 12px;
+      font-weight: 700;
+      color: #21486f;
+      margin-bottom: 6px;
+      letter-spacing: 0.1px;
+    }}
+    .plot-control-row {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }}
+    .plot-control-btn {{
+      border: 1px solid #78a9df;
+      border-radius: 7px;
+      background: #eaf3ff;
+      color: #1f3f61;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 4px 10px;
+      cursor: pointer;
+    }}
+    .plot-control-btn.active {{
+      background: #d3e8ff;
+      border-color: #4f90d8;
+      color: #0f3256;
+      box-shadow: inset 0 0 0 1px rgba(79,144,216,0.2);
+    }}
     .fig-note {{
       margin: 6px 2px 14px;
       font-size: 13px;
@@ -1481,6 +1553,72 @@ def _build_multi_sample_report_html(
         }}, 260);
       }}
 
+      function runPlotlyControlAction(plotEl, control) {{
+        if (typeof Plotly === 'undefined' || !plotEl || !control) {{
+          return;
+        }}
+        const method = String(control.method || 'restyle').toLowerCase();
+        const args = Array.isArray(control.args) ? control.args : [];
+        try {{
+          if (method === 'relayout') {{
+            Plotly.relayout(plotEl, ...(args || []));
+          }} else if (method === 'update') {{
+            Plotly.update(plotEl, ...(args || []));
+          }} else {{
+            Plotly.restyle(plotEl, ...(args || []));
+          }}
+        }} catch (err) {{
+          // no-op
+        }}
+      }}
+
+      function renderExternalControls(plotEl, controls) {{
+        const wrap = plotEl ? plotEl.closest('.lazy-plot-wrap') : null;
+        const panel = wrap ? wrap.querySelector('.plot-controls') : null;
+        if (!panel) {{
+          return;
+        }}
+        panel.innerHTML = '';
+        const groups = Array.isArray(controls) ? controls : [];
+        if (groups.length === 0) {{
+          panel.classList.remove('active');
+          return;
+        }}
+        panel.classList.add('active');
+        groups.forEach((group) => {{
+          const title = String((group && group.title) || 'Control');
+          const buttons = Array.isArray(group && group.buttons) ? group.buttons : [];
+          if (buttons.length === 0) {{
+            return;
+          }}
+          const gEl = document.createElement('div');
+          gEl.className = 'plot-control-group';
+
+          const tEl = document.createElement('div');
+          tEl.className = 'plot-control-title';
+          tEl.textContent = title;
+          gEl.appendChild(tEl);
+
+          const row = document.createElement('div');
+          row.className = 'plot-control-row';
+          const activeIdx = Number.isFinite(Number(group.active)) ? Number(group.active) : 0;
+          buttons.forEach((btn, idx) => {{
+            const bEl = document.createElement('button');
+            bEl.type = 'button';
+            bEl.className = 'plot-control-btn' + (idx === activeIdx ? ' active' : '');
+            bEl.textContent = String((btn && btn.label) || String(idx + 1));
+            bEl.addEventListener('click', () => {{
+              Array.from(row.querySelectorAll('.plot-control-btn')).forEach((x) => x.classList.remove('active'));
+              bEl.classList.add('active');
+              runPlotlyControlAction(plotEl, btn || {{}});
+            }});
+            row.appendChild(bEl);
+          }});
+          gEl.appendChild(row);
+          panel.appendChild(gEl);
+        }});
+      }}
+
       function renderLazyInScope(scopeRoot) {{
         if (typeof Plotly === 'undefined') {{
           return Promise.resolve();
@@ -1511,6 +1649,8 @@ def _build_multi_sample_report_html(
                 return Plotly.addFrames(el, frames).catch(() => undefined);
               }}
               return undefined;
+            }}).then(() => {{
+              renderExternalControls(el, payload.controls || []);
             }});
             el.dataset.rendered = '1';
             renderPromises.push(withFrames.catch(() => undefined));

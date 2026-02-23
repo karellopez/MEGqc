@@ -12,7 +12,7 @@ data_directory = '/Users/karelo/Development/datasets/cc700'
 # Optional external derivatives root for plotting results
 derivatives_output_path = None
 # Number of CPU cores you want to use (for example, 4). Use -1 to utilize all available CPU cores:
-n_jobs_to_use = 3
+n_jobs_to_use = -1
 # ------------------------------------------------------------------
 
 # RUN plotting Module
