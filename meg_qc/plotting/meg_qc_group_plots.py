@@ -1950,7 +1950,12 @@ def _register_lazy_figure(fig: go.Figure, *, height_px: str, controls: Optional[
     )
 
 
-def _figure_to_div(fig: Optional[go.Figure]) -> str:
+def _figure_to_div(
+    fig: Optional[go.Figure],
+    *,
+    include_axis_size_control: bool = True,
+    include_plot_controls: bool = True,
+) -> str:
     if fig is None:
         return "<p>No distribution is available for this section.</p>"
     fig_out = go.Figure(fig)
@@ -1982,8 +1987,9 @@ def _figure_to_div(fig: Optional[go.Figure]) -> str:
     fig_out.update_layout(margin=margin_json)
 
     # Universal controls: axis-label sizing for all axis-bearing plots.
-    _attach_axis_label_size_controller(fig_out)
-    controls = _extract_figure_controls(fig_out)
+    if include_axis_size_control:
+        _attach_axis_label_size_controller(fig_out)
+    controls = _extract_figure_controls(fig_out) if include_plot_controls else []
 
     height = fig_out.layout.height
     if height is None or not np.isfinite(height):
@@ -2415,6 +2421,182 @@ def _paths_html(source_paths: set) -> str:
     if hidden > 0:
         items += f"<li>... {hidden} additional paths omitted for brevity.</li>"
     return f"<ul>{items}</ul>"
+
+
+def _plot_summary_distribution_recordings(
+    df: pd.DataFrame,
+    value_col: str,
+    *,
+    title: str,
+    y_label: str,
+    color: str = "#2A6FBB",
+    enable_style_controls: bool = True,
+    show_counts_annotation: bool = True,
+) -> Optional[go.Figure]:
+    """One-panel pooled distribution where each dot is one recording."""
+    if df.empty or value_col not in df.columns:
+        return None
+    vals = pd.to_numeric(df[value_col], errors="coerce").to_numpy(dtype=float)
+    mask = np.isfinite(vals)
+    if not np.any(mask):
+        return None
+    data = df.loc[mask].copy()
+    vals = vals[mask]
+    if vals.size == 0:
+        return None
+
+    x_center = np.zeros(vals.size, dtype=float)
+    rng = np.random.default_rng(17)
+    x_jitter = x_center + rng.uniform(-0.10, 0.10, size=vals.size)
+    if "hover_entities" in data.columns:
+        hover = data["hover_entities"].astype(str).to_numpy()
+    else:
+        hover = (
+            "sub=" + data.get("subject", "n/a").astype(str)
+            + "<br>task=" + data.get("task", "n/a").astype(str)
+            + "<br>run=" + data.get("run", "n/a").astype(str)
+            + "<br>channel_type=" + data.get("channel_type", "n/a").astype(str)
+        ).to_numpy()
+    subject_codes = pd.Categorical(data.get("subject", pd.Series(["n/a"] * len(data))).astype(str)).codes.astype(float)
+    fig = go.Figure()
+    fig.add_trace(
+        go.Violin(
+            x=x_center,
+            y=vals,
+            name=f"all recordings (n={vals.size})",
+            box_visible=False,
+            meanline_visible=False,
+            points=False,
+            line={"width": 2.2, "color": color},
+            fillcolor=_hex_to_rgba(color, 0.22),
+            opacity=0.70,
+            width=0.78,
+            spanmode="hard",
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Box(
+            x=x_center,
+            y=vals,
+            name="box",
+            boxpoints=False,
+            line={"width": 2.2, "color": color},
+            marker={"color": color},
+            fillcolor="rgba(0,0,0,0)",
+            opacity=1.0,
+            whiskerwidth=0.95,
+            width=0.22,
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scattergl(
+            x=x_jitter,
+            y=vals,
+            mode="markers",
+            marker={
+                "size": 8.0,
+                "color": subject_codes,
+                "colorscale": "Turbo",
+                "opacity": 0.76,
+                "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
+                "showscale": False,
+            },
+            customdata=np.stack([hover], axis=-1),
+            hovertemplate="%{customdata[0]}<br>value=%{y:.3g}<extra></extra>",
+            name="recordings",
+            showlegend=False,
+        )
+    )
+    fig.update_layout(
+        title={"text": title, "x": 0.5},
+        xaxis_title="Recordings",
+        yaxis_title=y_label,
+        template="plotly_white",
+        margin={"l": 50, "r": 12, "t": 72, "b": 48},
+        height=410,
+    )
+    fig.update_xaxes(tickmode="array", tickvals=[0.0], ticktext=["all recordings"], range=[-0.55, 0.55])
+    if show_counts_annotation:
+        fig.add_annotation(
+            xref="paper",
+            yref="paper",
+            x=0.98,
+            y=0.98,
+            xanchor="right",
+            yanchor="top",
+            showarrow=False,
+            text=f"N={vals.size} recordings",
+            font={"size": 11, "color": "#2f4a68"},
+        )
+    if enable_style_controls:
+        _attach_distribution_style_controls(fig, default_line_width=2.2, default_marker_size=8.0)
+    return fig
+
+
+def _pooled_topomap_payload(
+    payloads_by_condition: Dict[str, TopomapPayload],
+    counts_by_condition: Optional[Dict[str, np.ndarray]] = None,
+) -> Optional[TopomapPayload]:
+    """Pool condition-level topomap values into one weighted channel map."""
+    if not payloads_by_condition:
+        return None
+
+    weighted_sum: Dict[str, float] = {}
+    weight_sum: Dict[str, float] = {}
+    coords: Dict[str, Tuple[float, float, float]] = {}
+    order: List[str] = []
+    has_any_z = False
+
+    for cond, payload in payloads_by_condition.items():
+        if payload is None:
+            continue
+        names = list(payload.layout.names)
+        vals = np.asarray(payload.values, dtype=float).reshape(-1)
+        x = np.asarray(payload.layout.x, dtype=float).reshape(-1)
+        y = np.asarray(payload.layout.y, dtype=float).reshape(-1)
+        z = np.asarray(payload.layout.z, dtype=float).reshape(-1) if payload.layout.z is not None else None
+        cnt = None
+        if counts_by_condition is not None and cond in counts_by_condition:
+            cnt = np.asarray(counts_by_condition[cond], dtype=float).reshape(-1)
+
+        n = min(len(names), vals.size, x.size, y.size, (z.size if z is not None else len(names)))
+        if cnt is not None:
+            n = min(n, cnt.size)
+        if n <= 0:
+            continue
+
+        for idx in range(n):
+            name = str(names[idx])
+            val = float(vals[idx])
+            if not np.isfinite(val):
+                continue
+            w = float(cnt[idx]) if (cnt is not None and np.isfinite(cnt[idx]) and float(cnt[idx]) > 0) else 1.0
+            weighted_sum[name] = weighted_sum.get(name, 0.0) + val * w
+            weight_sum[name] = weight_sum.get(name, 0.0) + w
+            if name not in coords:
+                zi = float(z[idx]) if (z is not None and np.isfinite(z[idx])) else np.nan
+                if np.isfinite(zi):
+                    has_any_z = True
+                coords[name] = (float(x[idx]), float(y[idx]), zi)
+                order.append(name)
+
+    keep = [name for name in order if name in weight_sum and weight_sum[name] > 0]
+    if not keep:
+        return None
+
+    vals_out = np.asarray([weighted_sum[name] / weight_sum[name] for name in keep], dtype=float)
+    x_out = np.asarray([coords[name][0] for name in keep], dtype=float)
+    y_out = np.asarray([coords[name][1] for name in keep], dtype=float)
+    z_out = np.asarray([coords[name][2] for name in keep], dtype=float) if has_any_z else None
+    if z_out is not None and not np.any(np.isfinite(z_out)):
+        z_out = None
+
+    return TopomapPayload(
+        layout=SensorLayout(x=x_out, y=y_out, names=list(keep), z=z_out),
+        values=vals_out,
+    )
 
 
 def _run_rows_dataframe(rows: List[RunMetricRow]) -> pd.DataFrame:
@@ -4882,6 +5064,196 @@ def _build_subject_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_u
     )
 
 
+def _summary_shared_controls_panel_html(summary_group_id: str) -> str:
+    """Single shared controller panel for the six summary-strip plots."""
+
+    def _buttons(kind: str, *, n: int = 8, active_level: int = 4) -> str:
+        return "".join(
+            f"<button class='plot-control-btn{' active' if i == active_level else ''}' "
+            f"data-summary-kind='{kind}' data-level='{i}'>{i}</button>"
+            for i in range(1, n + 1)
+        )
+
+    return (
+        f"<div class='summary-shared-controls' data-summary-group='{summary_group_id}'>"
+        "<div class='plot-control-group'>"
+        "<div class='plot-control-title'>Line thickness level</div>"
+        f"<div class='plot-control-row'>{_buttons('line')}</div>"
+        "</div>"
+        "<div class='plot-control-group'>"
+        "<div class='plot-control-title'>Dot size level</div>"
+        f"<div class='plot-control-row'>{_buttons('dot')}</div>"
+        "</div>"
+        "<div class='plot-control-group'>"
+        "<div class='plot-control-title'>Axis label/ticks size level</div>"
+        f"<div class='plot-control-row'>{_buttons('axis')}</div>"
+        "</div>"
+        "<div class='plot-control-group'>"
+        "<div class='plot-control-title'>Dot visibility</div>"
+        "<div class='plot-control-row'>"
+        "<button class='plot-control-btn active' data-summary-kind='dotvis' data-level='1'>Show dots</button>"
+        "<button class='plot-control-btn' data-summary-kind='dotvis' data-level='0'>Hide dots</button>"
+        "</div>"
+        "</div>"
+        "<div class='plot-control-group'>"
+        "<div class='plot-control-title'>Dot displacement level</div>"
+        f"<div class='plot-control-row'>{_buttons('disp', n=12, active_level=1)}</div>"
+        "</div>"
+        "</div>"
+    )
+
+
+def _build_summary_distributions_section(
+    acc: ChTypeAccumulator,
+    amplitude_unit: str,
+    is_combined: bool,
+    *,
+    tab_token: str = "tab",
+) -> str:
+    """Quick pooled distributions and pooled topomaps across all recordings."""
+    df = _run_rows_dataframe(acc.run_rows)
+    if df.empty:
+        return (
+            "<section>"
+            "<h2>Summary distributions</h2>"
+            "<p>No run-level summaries are available for this tab.</p>"
+            "</section>"
+        )
+
+    summary_group_id = f"summary-dist-{tab_token}"
+    def _finite_count_map(values_by_condition: Dict[str, List[float]]) -> int:
+        total = 0
+        for vals in values_by_condition.values():
+            arr = np.asarray(vals, dtype=float).reshape(-1)
+            total += int(np.isfinite(arr).sum())
+        return int(total)
+
+    std_nch_total = _finite_count_map(acc.std_dist_by_condition)
+    ptp_nch_total = _finite_count_map(acc.ptp_dist_by_condition)
+    psd_nch_total = _finite_count_map(acc.psd_ratio_by_condition)
+    ecg_nch_total = _finite_count_map(acc.ecg_corr_by_condition)
+    eog_nch_total = _finite_count_map(acc.eog_corr_by_condition)
+    muscle_nch_total = _finite_count_map(acc.muscle_scalar_by_condition)
+    metric_defs = [
+        ("STD", "std_mean", f"STD ({amplitude_unit})", "#2A6FBB", std_nch_total),
+        ("PtP", "ptp_mean", f"PtP ({amplitude_unit})", "#2B9348", ptp_nch_total),
+        ("PSD", "mains_ratio", "Mains relative power", "#E07A00", psd_nch_total),
+        ("ECG", "ecg_mean_abs_corr", "ECG |r| mean", "#C23B22", ecg_nch_total),
+        ("EOG", "eog_mean_abs_corr", "EOG |r| mean", "#7B5CC4", eog_nch_total),
+        ("Muscle", "muscle_mean", "Muscle mean score", "#0B8F8C", muscle_nch_total),
+    ]
+
+    def _metric_cards(defs: Sequence[Tuple[str, str, str, str, Optional[int]]]) -> str:
+        cards: List[str] = []
+        for metric_name, col, y_label, color, nch_total in defs:
+            vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float) if col in df.columns else np.array([])
+            n_rec = int(np.isfinite(vals).sum())
+            n_ch_label = str(int(nch_total)) if int(nch_total) > 0 else "n/a"
+            fig = _plot_summary_distribution_recordings(
+                df,
+                col,
+                title=metric_name,
+                y_label=y_label,
+                color=color,
+                enable_style_controls=False,
+                show_counts_annotation=False,
+            )
+            cards.append(
+                "<div class='summary-dist-card'>"
+                + f"<div class='summary-card-meta'>N recordings={n_rec}; N channels={n_ch_label}</div>"
+                + "<div class='fig summary-strip-fig'>"
+                + _figure_to_div(fig, include_axis_size_control=False, include_plot_controls=False)
+                + "</div>"
+                + "</div>"
+            )
+        return f"<div class='summary-dist-grid' data-summary-group='{summary_group_id}'>" + "".join(cards) + "</div>"
+
+    topo_specs = [
+        ("STD", acc.std_topomap_by_condition, acc.std_topomap_count_by_condition, f"STD ({amplitude_unit})"),
+        ("PtP", acc.ptp_topomap_by_condition, acc.ptp_topomap_count_by_condition, f"PtP ({amplitude_unit})"),
+        ("PSD", acc.psd_topomap_by_condition, acc.psd_topomap_count_by_condition, "Mains relative power"),
+        ("ECG", acc.ecg_topomap_by_condition, acc.ecg_topomap_count_by_condition, "ECG |r| mean"),
+        ("EOG", acc.eog_topomap_by_condition, acc.eog_topomap_count_by_condition, "EOG |r| mean"),
+        ("Muscle", {}, None, "Muscle mean score"),
+    ]
+    topo_tabs: List[Tuple[str, str]] = []
+    for idx, (metric_name, payloads, counts, color_title) in enumerate(topo_specs):
+        pooled = _pooled_topomap_payload(payloads, counts)
+        if pooled is None:
+            topo_tabs.append((metric_name, "<p>Topographic maps are not available for this metric in stored outputs.</p>"))
+            continue
+        fig2d = plot_topomap_if_available(
+            pooled,
+            title=f"{metric_name} pooled channel footprint",
+            color_title=color_title,
+        )
+        fig3d = plot_topomap_3d_if_available(
+            pooled,
+            title=f"{metric_name} pooled channel footprint (3D)",
+            color_title=color_title,
+        )
+        views: List[Tuple[str, str]] = []
+        if fig2d is not None:
+            views.append(
+                (
+                    "2D",
+                    _figure_block(
+                        fig2d,
+                        "Each channel value is pooled across all recordings and tasks in this tab.",
+                    ),
+                )
+            )
+        if fig3d is not None:
+            views.append(
+                (
+                    "3D",
+                    _figure_block(
+                        fig3d,
+                        "3D view of pooled channel values across all recordings and tasks in this tab.",
+                    ),
+                )
+            )
+        topo_tabs.append(
+            (
+                metric_name,
+                _build_subtabs_html(
+                    f"summary-topo-{tab_token}-{re.sub(r'[^a-z0-9]+', '-', metric_name.lower())}-{idx}",
+                    views,
+                    level=3,
+                ) if views else "<p>Topographic maps are not available for this metric.</p>",
+            )
+        )
+
+    env_defs = metric_defs[:3]
+    phys_defs = metric_defs[3:]
+    return (
+        "<section>"
+        "<h2>Summary distributions</h2>"
+        "<p>Task-agnostic compact summary strip.</p>"
+        f"<div data-summary-group='{summary_group_id}'>"
+        "<div class='summary-category-block'>"
+        "<h3>Environmental/Hardware noise</h3>"
+        + _metric_cards(env_defs)
+        + "</div>"
+        "<div class='summary-category-block'>"
+        "<h3>Physiological noise</h3>"
+        + _metric_cards(phys_defs)
+        + "</div>"
+        + "</div>"
+        + _summary_shared_controls_panel_html(summary_group_id)
+        + (
+            "<div class='summary-shared-note'><strong>How to interpret:</strong> "
+            "Each panel is one metric. One dot is one recording summary (subject x task x run); hover shows recording entities. "
+            "Violin + box represent pooled recording distribution. "
+            "Units: STD/PtP use amplitude units shown on each y-axis, PSD is mains relative power, ECG/EOG are |r| magnitudes, and Muscle is score."
+            "</div>"
+        )
+        + "<h3>Pooled channel topomaps</h3>"
+        + _build_subtabs_html(f"summary-topo-main-{tab_token}", topo_tabs, level=2)
+        + "</section>"
+    )
+
+
 def _build_cohort_overview_section(acc: ChTypeAccumulator, amplitude_unit: str, is_combined: bool) -> str:
     df = _run_rows_dataframe(acc.run_rows)
     token = "combined" if is_combined else ("grad" if "/m" in amplitude_unit else "mag")
@@ -5823,6 +6195,7 @@ def _build_statistical_appendix_section(acc: ChTypeAccumulator, amplitude_unit: 
 
 
 def _build_tab_content(tab_name: str, acc: ChTypeAccumulator, is_combined: bool) -> str:
+    tab_token = re.sub(r"[^a-z0-9]+", "-", tab_name.lower())
     if is_combined:
         amplitude_unit = "mixed pT-based MEG units (all channels)"
     elif tab_name.upper() == "MAG":
@@ -5846,6 +6219,15 @@ def _build_tab_content(tab_name: str, acc: ChTypeAccumulator, is_combined: bool)
         )
 
     sections = [
+        (
+            "Summary distributions",
+            _build_summary_distributions_section(
+                acc,
+                amplitude_unit=amplitude_unit,
+                is_combined=is_combined,
+                tab_token=tab_token,
+            ),
+        ),
         ("Cohort QA overview", _build_cohort_overview_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
         ("QA metrics across tasks", _build_condition_effect_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
         ("QA metrics details", _build_metric_details_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
@@ -5950,6 +6332,50 @@ def _build_report_html(
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
       gap: 12px;
+    }}
+    .summary-category-block {{
+      margin-top: 10px;
+    }}
+    .summary-category-block h3 {{
+      margin: 0 0 8px;
+      font-size: 18px;
+      color: #1f3f63;
+    }}
+    .summary-dist-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(300px, 1fr));
+      gap: 12px;
+      margin-top: 6px;
+    }}
+    .summary-dist-card {{
+      border: 1px solid #d9e7f8;
+      border-radius: 10px;
+      padding: 8px;
+      background: #fbfdff;
+      min-width: 0;
+    }}
+    .summary-card-meta {{
+      font-size: 12px;
+      font-weight: 700;
+      color: #244466;
+      background: #eef6ff;
+      border: 1px solid #d3e6fb;
+      border-radius: 7px;
+      padding: 5px 8px;
+      margin-bottom: 6px;
+    }}
+    .summary-shared-controls {{
+      margin-top: 10px;
+      padding: 10px 12px 12px;
+      border: 1px solid #c7dbf2;
+      border-radius: 10px;
+      background: #f4f9ff;
+    }}
+    .summary-shared-note {{
+      margin: 8px 2px 12px;
+      font-size: 13px;
+      line-height: 1.45;
+      color: #2a425f;
     }}
     .tile {{
       border: 1px solid #d9e7f8;
@@ -6353,6 +6779,170 @@ def _build_report_html(
         }});
       }}
 
+      const summaryStyleState = {{}};
+      const summaryDotMap = {{1: 3.0, 2: 4.0, 3: 5.5, 4: 7.0, 5: 8.5, 6: 10.0, 7: 12.0, 8: 14.0}};
+      const summaryDispMap = {{1: 0.00, 2: 0.02, 3: 0.04, 4: 0.06, 5: 0.08, 6: 0.10, 7: 0.12, 8: 0.14, 9: 0.16, 10: 0.18, 11: 0.20, 12: 0.22}};
+
+      function getSummaryGrids(groupId) {{
+        if (!groupId) return [];
+        return Array.from(document.querySelectorAll(`.summary-dist-grid[data-summary-group="${{groupId}}"]`));
+      }}
+
+      function getSummaryPlots(groupId) {{
+        const grids = getSummaryGrids(groupId);
+        if (grids.length === 0) return [];
+        const plots = [];
+        grids.forEach((grid) => {{
+          plots.push(...Array.from(grid.querySelectorAll('.js-plotly-plot')));
+        }});
+        return plots;
+      }}
+
+      function applySummaryLineLevel(plotEl, level) {{
+        const lw = Number(level);
+        const lineWidth = (plotEl.data || []).map((tr) => {{
+          const t = String((tr && tr.type) || '');
+          return (t === 'scatter' || t === 'scattergl' || t === 'violin' || t === 'box') ? lw : null;
+        }});
+        const markerLineWidth = (plotEl.data || []).map((tr) => {{
+          const t = String((tr && tr.type) || '');
+          const mode = String((tr && tr.mode) || '');
+          if (t === 'histogram') return Math.max(0.5, lw * 0.6);
+          if ((t === 'scatter' || t === 'scattergl') && mode.includes('markers')) return Math.max(0.25, lw * 0.2);
+          return null;
+        }});
+        try {{
+          Plotly.restyle(plotEl, {{'line.width': lineWidth, 'marker.line.width': markerLineWidth}});
+        }} catch (err) {{}}
+      }}
+
+      function applySummaryDotLevel(plotEl, level) {{
+        const size = Number(summaryDotMap[level] || 8.0);
+        const markerSize = (plotEl.data || []).map((tr) => {{
+          const t = String((tr && tr.type) || '');
+          const mode = String((tr && tr.mode) || '');
+          return ((t === 'scatter' || t === 'scattergl') && mode.includes('markers')) ? size : null;
+        }});
+        try {{
+          Plotly.restyle(plotEl, {{'marker.size': markerSize}});
+        }} catch (err) {{}}
+      }}
+
+      function _summaryScatterIdx(plotEl) {{
+        const out = [];
+        (plotEl.data || []).forEach((tr, idx) => {{
+          const t = String((tr && tr.type) || '');
+          const mode = String((tr && tr.mode) || '');
+          if ((t === 'scatter' || t === 'scattergl') && mode.includes('markers')) out.push(idx);
+        }});
+        return out;
+      }}
+
+      function applySummaryDotVisibility(plotEl, visibleLevel) {{
+        const visible = Number(visibleLevel) > 0;
+        const traceVisible = (plotEl.data || []).map((tr) => {{
+          const t = String((tr && tr.type) || '');
+          const mode = String((tr && tr.mode) || '');
+          return ((t === 'scatter' || t === 'scattergl') && mode.includes('markers')) ? visible : null;
+        }});
+        try {{
+          Plotly.restyle(plotEl, {{'visible': traceVisible}});
+        }} catch (err) {{}}
+      }}
+
+      function applySummaryDisplacement(plotEl, level) {{
+        const shift = Number(summaryDispMap[level] ?? 0.0);
+        if (!plotEl.__summaryBaseX) plotEl.__summaryBaseX = {{}};
+        const idxs = _summaryScatterIdx(plotEl);
+        const xUpdate = [];
+        const traceIdx = [];
+        idxs.forEach((i) => {{
+          if (!plotEl.__summaryBaseX.hasOwnProperty(i)) {{
+            const base = Array.isArray(plotEl.data[i].x) ? plotEl.data[i].x.slice() : [];
+            plotEl.__summaryBaseX[i] = base;
+          }}
+          const base = plotEl.__summaryBaseX[i] || [];
+          xUpdate.push(base.map((v) => Number(v) + shift));
+          traceIdx.push(i);
+        }});
+        if (traceIdx.length === 0) return;
+        try {{
+          Plotly.restyle(plotEl, {{'x': xUpdate}}, traceIdx);
+        }} catch (err) {{}}
+      }}
+
+      function applySummaryAxisLevel(plotEl, level) {{
+        const tickMap = {{1: 9, 2: 10, 3: 12, 4: 14, 5: 16, 6: 18, 7: 20, 8: 22}};
+        const tick = Number(tickMap[level] || 14);
+        const title = tick + 2;
+        const layout = plotEl.layout || {{}};
+        const axisKeys = Object.keys(layout).filter((k) => k.startsWith('xaxis') || k.startsWith('yaxis'));
+        const upd = {{}};
+        if (axisKeys.length === 0) {{
+          upd['xaxis.tickfont.size'] = tick;
+          upd['xaxis.title.font.size'] = title;
+          upd['yaxis.tickfont.size'] = tick;
+          upd['yaxis.title.font.size'] = title;
+        }} else {{
+          axisKeys.forEach((k) => {{
+            upd[`${{k}}.tickfont.size`] = tick;
+            upd[`${{k}}.title.font.size`] = title;
+          }});
+        }}
+        try {{
+          Plotly.relayout(plotEl, upd);
+        }} catch (err) {{}}
+      }}
+
+      function applySummaryState(groupId, scopeRoot) {{
+        const state = summaryStyleState[groupId] || {{line: 4, dot: 4, axis: 4, dotvis: 1, disp: 1}};
+        const grids = getSummaryGrids(groupId);
+        const run = () => {{
+          const plots = getSummaryPlots(groupId);
+          plots.forEach((plotEl) => {{
+            applySummaryLineLevel(plotEl, state.line);
+            applySummaryDotLevel(plotEl, state.dot);
+            applySummaryDotVisibility(plotEl, state.dotvis);
+            applySummaryDisplacement(plotEl, state.disp);
+            applySummaryAxisLevel(plotEl, state.axis);
+          }});
+        }};
+        if (grids.length > 0) {{
+          Promise.all(grids.map((grid) => renderLazyInScope(grid))).then(run);
+        }} else {{
+          run();
+        }}
+      }}
+
+      function bindSummarySharedControls(scopeRoot) {{
+        const scope = scopeRoot || document;
+        const panels = Array.from(scope.querySelectorAll('.summary-shared-controls'));
+        panels.forEach((panel) => {{
+          if (panel.dataset.bound === '1') return;
+          panel.dataset.bound = '1';
+          const groupId = panel.dataset.summaryGroup;
+          if (!groupId) return;
+          if (!summaryStyleState[groupId]) {{
+            summaryStyleState[groupId] = {{line: 4, dot: 4, axis: 4, dotvis: 1, disp: 1}};
+          }}
+          Array.from(panel.querySelectorAll('.plot-control-btn[data-summary-kind]')).forEach((btn) => {{
+            btn.addEventListener('click', () => {{
+              const kind = String(btn.dataset.summaryKind || '');
+              const level = Number(btn.dataset.level || 4);
+              if (!(kind in summaryStyleState[groupId])) return;
+              summaryStyleState[groupId][kind] = level;
+              const row = btn.parentElement;
+              if (row) {{
+                Array.from(row.querySelectorAll('.plot-control-btn')).forEach((b) => b.classList.remove('active'));
+              }}
+              btn.classList.add('active');
+              applySummaryState(groupId, scope);
+            }});
+          }});
+          applySummaryState(groupId, scope);
+        }});
+      }}
+
       function renderLazyInScope(scopeRoot) {{
         if (typeof Plotly === 'undefined') {{
           return Promise.resolve();
@@ -6393,6 +6983,27 @@ def _build_report_html(
           }}
         }});
         return renderPromises.length > 0 ? Promise.all(renderPromises).then(() => undefined) : Promise.resolve();
+      }}
+
+      function teardownLazyInScope(scopeRoot) {{
+        if (typeof Plotly === 'undefined') return;
+        const scope = scopeRoot || document;
+        const placeholders = Array.from(scope.querySelectorAll('.js-lazy-plot[data-rendered="1"]'));
+        placeholders.forEach((el) => {{
+          try {{
+            Plotly.purge(el);
+          }} catch (err) {{
+            // no-op
+          }}
+          el.innerHTML = '';
+          delete el.dataset.rendered;
+          const wrap = el.closest('.lazy-plot-wrap');
+          const panel = wrap ? wrap.querySelector('.plot-controls') : null;
+          if (panel) {{
+            panel.innerHTML = '';
+            panel.classList.remove('active');
+          }}
+        }});
       }}
 
       function applyGridToPlot(plotEl, show) {{
@@ -6449,9 +7060,14 @@ def _build_report_html(
           if (!gridsVisible) {{
             applyGridState(false, root);
           }}
+          bindSummarySharedControls(root);
         }});
       }}
       function activate(targetId) {{
+        const activePrev = tabs.find(t => t.classList.contains('active'));
+        if (activePrev && activePrev.id !== targetId) {{
+          teardownLazyInScope(activePrev);
+        }}
         tabs.forEach(t => t.classList.toggle('active', t.id === targetId));
         buttons.forEach(b => b.classList.toggle('active', b.dataset.target === targetId));
         window.requestAnimationFrame(() => {{
@@ -6477,6 +7093,10 @@ def _build_report_html(
       function activateSubtab(groupId, targetId) {{
         const subButtons = Array.from(document.querySelectorAll(`.subtab-btn[data-tab-group="${{groupId}}"]`));
         const subPanels = Array.from(document.querySelectorAll(`.subtab-content[data-tab-group="${{groupId}}"]`));
+        const prevPanel = subPanels.find((p) => p.classList.contains('active'));
+        if (prevPanel && prevPanel.id !== targetId) {{
+          teardownLazyInScope(prevPanel);
+        }}
         subPanels.forEach(p => p.classList.toggle('active', p.id === targetId));
         subButtons.forEach(b => b.classList.toggle('active', b.dataset.target === targetId));
         const activePanel = document.getElementById(targetId);
@@ -6504,6 +7124,7 @@ def _build_report_html(
           activateSubtab(groupId, firstBtn.dataset.target);
         }}
       }});
+      bindSummarySharedControls(document);
       // Per-figure raw/normalized toggles.
       function activateFigVariant(toggleId, targetId) {{
         const root = document.querySelector(`.fig-switch[data-fig-toggle="${{toggleId}}"]`);

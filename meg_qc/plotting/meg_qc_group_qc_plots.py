@@ -362,6 +362,16 @@ def _component_frame(df: pd.DataFrame, spec: ComponentSpec, view: str) -> pd.Dat
     return out
 
 
+def _summary_component_frame(df: pd.DataFrame, values: pd.Series) -> pd.DataFrame:
+    base_cols = ["subject", "task", "task_label", "recording_label"]
+    if "dataset" in df.columns:
+        base_cols.append("dataset")
+    out = df[base_cols].copy()
+    out["value"] = pd.to_numeric(values, errors="coerce")
+    out = out.loc[np.isfinite(out["value"])].copy()
+    return out
+
+
 def _with_all_tasks(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -449,6 +459,35 @@ def _palette(labels: Sequence[str]) -> Dict[str, str]:
         "#FF9DA6", "#9D755D", "#BAB0AC", "#1F77B4", "#2CA02C", "#D62728",
     ]
     return {label: base[i % len(base)] for i, label in enumerate(labels)}
+
+
+def _summary_distribution_components(df: pd.DataFrame, view: str) -> List[Tuple[str, str, pd.DataFrame]]:
+    """Return summary component dataframes (one recording = one row)."""
+    gqi = _summary_component_frame(df, _series_for_component(df, COMPONENTS["GQI"][0], view))
+    std_noisy = _series_for_component(df, COMPONENTS["STD"][0], view)
+    std_flat = _series_for_component(df, COMPONENTS["STD"][1], view)
+    std_vals = pd.Series(np.nanmean(np.column_stack([std_noisy.to_numpy(dtype=float), std_flat.to_numpy(dtype=float)]), axis=1), index=df.index)
+    std = _summary_component_frame(df, std_vals)
+
+    ptp_noisy = _series_for_component(df, COMPONENTS["PtP"][0], view)
+    ptp_flat = _series_for_component(df, COMPONENTS["PtP"][1], view)
+    ptp_vals = pd.Series(np.nanmean(np.column_stack([ptp_noisy.to_numpy(dtype=float), ptp_flat.to_numpy(dtype=float)]), axis=1), index=df.index)
+    ptp = _summary_component_frame(df, ptp_vals)
+
+    psd = _summary_component_frame(df, _series_for_component(df, COMPONENTS["PSD"][0], view))
+    ecg = _summary_component_frame(df, _series_for_component(df, COMPONENTS["ECG"][0], view))
+    eog = _summary_component_frame(df, _series_for_component(df, COMPONENTS["EOG"][0], view))
+    muscle = _summary_component_frame(df, _series_for_component(df, COMPONENTS["Muscle"][0], view))
+
+    return [
+        ("GQI", "GQI (%)", gqi),
+        ("STD", "STD pooled noisy/flat channels (% channels)", std),
+        ("PtP", "PtP pooled noisy/flat channels (% channels)", ptp),
+        ("PSD", "PSD noise burden (% relative power)", psd),
+        ("ECG", "ECG high-correlation channels (% channels)", ecg),
+        ("EOG", "EOG high-correlation channels (% channels)", eog),
+        ("Muscle", "Muscle events (count)", muscle),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1312,6 +1351,337 @@ def plot_density_by_task(df: pd.DataFrame, title: str, x_label: str) -> Optional
     return fig
 
 
+def _plot_summary_distribution_recordings_qc(
+    df_value: pd.DataFrame,
+    *,
+    title: str,
+    y_label: str,
+    color: str = "#2A6FBB",
+    enable_style_controls: bool = True,
+    show_counts_annotation: bool = True,
+) -> Optional[go.Figure]:
+    """One pooled box+violin where each dot is one recording row."""
+    if df_value.empty or "value" not in df_value.columns:
+        return None
+    vals = pd.to_numeric(df_value["value"], errors="coerce").to_numpy(dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return None
+    data = df_value.loc[np.isfinite(pd.to_numeric(df_value["value"], errors="coerce"))].copy()
+
+    x0 = np.zeros(vals.size, dtype=float)
+    rng = np.random.default_rng(23)
+    xj = x0 + rng.uniform(-0.10, 0.10, size=vals.size)
+    subj_keys = (
+        data.get("dataset", pd.Series(["dataset"] * len(data))).astype(str)
+        + "::"
+        + data.get("subject", pd.Series(["n/a"] * len(data))).astype(str)
+    )
+    subj_codes = pd.Categorical(subj_keys).codes.astype(float)
+    hover = (
+        "dataset=" + data.get("dataset", pd.Series(["dataset"] * len(data))).astype(str)
+        + "<br>subject=" + data.get("subject", pd.Series(["n/a"] * len(data))).astype(str)
+        + "<br>task=" + data.get("task", pd.Series(["unknown"] * len(data))).astype(str)
+        + "<br>recording=" + data.get("recording_label", pd.Series(["n/a"] * len(data))).astype(str)
+        + "<br>value=" + pd.to_numeric(data["value"], errors="coerce").map(lambda v: f"{float(v):.3g}" if np.isfinite(v) else "n/a")
+    ).to_numpy()
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Violin(
+            x=x0,
+            y=vals,
+            name=f"all recordings (n={vals.size})",
+            box_visible=False,
+            meanline_visible=False,
+            points=False,
+            line={"width": 2.2, "color": color},
+            fillcolor=_hex_to_rgba(color, 0.22),
+            opacity=0.70,
+            width=0.78,
+            spanmode="hard",
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Box(
+            x=x0,
+            y=vals,
+            name="box",
+            boxpoints=False,
+            line={"width": 2.2, "color": color},
+            marker={"color": color},
+            fillcolor="rgba(0,0,0,0)",
+            opacity=1.0,
+            whiskerwidth=0.95,
+            width=0.22,
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scattergl(
+            x=xj,
+            y=vals,
+            mode="markers",
+            marker={
+                "size": 8.0,
+                "color": subj_codes,
+                "colorscale": "Turbo",
+                "opacity": 0.76,
+                "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
+                "showscale": False,
+            },
+            customdata=np.stack([hover], axis=-1),
+            hovertemplate="%{customdata[0]}<extra></extra>",
+            name="recordings",
+            showlegend=False,
+        )
+    )
+    fig.update_layout(
+        title={"text": title, "x": 0.5},
+        xaxis_title="Recordings",
+        yaxis_title=y_label,
+        template="plotly_white",
+        margin={"l": 50, "r": 12, "t": 72, "b": 48},
+        height=410,
+    )
+    fig.update_xaxes(tickmode="array", tickvals=[0.0], ticktext=["all recordings"], range=[-0.55, 0.55])
+    if show_counts_annotation:
+        fig.add_annotation(
+            xref="paper",
+            yref="paper",
+            x=0.98,
+            y=0.98,
+            xanchor="right",
+            yanchor="top",
+            showarrow=False,
+            text=f"N={vals.size} recordings",
+            font={"size": 11, "color": "#2f4a68"},
+        )
+    if enable_style_controls:
+        _attach_distribution_style_controls(fig, default_line_width=2.2, default_marker_size=8.0)
+    return fig
+
+
+def _summary_shared_controls_panel_html(summary_group_id: str) -> str:
+    """Single shared controller panel for the summary-strip QC plots."""
+
+    def _buttons(kind: str, *, n: int = 8, active_level: int = 4) -> str:
+        return "".join(
+            f"<button class='plot-control-btn{' active' if i == active_level else ''}' "
+            f"data-summary-kind='{kind}' data-level='{i}'>{i}</button>"
+            for i in range(1, n + 1)
+        )
+
+    return (
+        f"<div class='summary-shared-controls' data-summary-group='{summary_group_id}'>"
+        "<div class='plot-control-group'>"
+        "<div class='plot-control-title'>Line thickness level</div>"
+        f"<div class='plot-control-row'>{_buttons('line')}</div>"
+        "</div>"
+        "<div class='plot-control-group'>"
+        "<div class='plot-control-title'>Dot size level</div>"
+        f"<div class='plot-control-row'>{_buttons('dot')}</div>"
+        "</div>"
+        "<div class='plot-control-group'>"
+        "<div class='plot-control-title'>Axis label/ticks size level</div>"
+        f"<div class='plot-control-row'>{_buttons('axis')}</div>"
+        "</div>"
+        "<div class='plot-control-group'>"
+        "<div class='plot-control-title'>Dot visibility</div>"
+        "<div class='plot-control-row'>"
+        "<button class='plot-control-btn active' data-summary-kind='dotvis' data-level='1'>Show dots</button>"
+        "<button class='plot-control-btn' data-summary-kind='dotvis' data-level='0'>Hide dots</button>"
+        "</div>"
+        "</div>"
+        "<div class='plot-control-group'>"
+        "<div class='plot-control-title'>Dot displacement level</div>"
+        f"<div class='plot-control-row'>{_buttons('disp', n=12, active_level=1)}</div>"
+        "</div>"
+        "</div>"
+    )
+
+
+def _summary_distribution_grid_html(
+    df_view: pd.DataFrame,
+    *,
+    view: str,
+    view_label: str,
+    summary_group_id: str,
+) -> str:
+    def _median_positive(series: pd.Series) -> Optional[int]:
+        vals = _coerce_numeric(series).to_numpy(dtype=float)
+        vals = vals[np.isfinite(vals) & (vals > 0)]
+        if vals.size == 0:
+            return None
+        return int(round(float(np.nanmedian(vals))))
+
+    def _estimate_from_num_pct(num_col: str, pct_col: str) -> Optional[int]:
+        if num_col not in df_view.columns or pct_col not in df_view.columns:
+            return None
+        num = _coerce_numeric(df_view[num_col]).to_numpy(dtype=float)
+        pct = _coerce_numeric(df_view[pct_col]).to_numpy(dtype=float)
+        mask = np.isfinite(num) & np.isfinite(pct) & (pct > 0)
+        if not np.any(mask):
+            return None
+        est = num[mask] / (pct[mask] / 100.0)
+        est = est[np.isfinite(est) & (est > 0)]
+        if est.size == 0:
+            return None
+        return int(round(float(np.nanmedian(est))))
+
+    def _row_channel_total(idx: int) -> Optional[int]:
+        row = df_view.loc[idx]
+
+        def _row_val(col: str) -> Optional[float]:
+            if col not in df_view.columns:
+                return None
+            v = pd.to_numeric(pd.Series([row[col]]), errors="coerce").iloc[0]
+            return float(v) if np.isfinite(v) else None
+
+        def _num_pct(num_col: str, pct_col: str) -> Optional[float]:
+            num = _row_val(num_col)
+            pct = _row_val(pct_col)
+            if num is None or pct is None or pct <= 0:
+                return None
+            est = num / (pct / 100.0)
+            return float(est) if np.isfinite(est) and est > 0 else None
+
+        if view == "mag":
+            candidates = [
+                _row_val("ECG_mag_total_channels"),
+                _row_val("EOG_mag_total_channels"),
+                _num_pct("STD_ts_noisy_channels_mag_num", "STD_ts_noisy_channels_mag_percentage"),
+                _num_pct("PTP_ts_noisy_channels_mag_num", "PTP_ts_noisy_channels_mag_percentage"),
+                _num_pct("STD_ts_flat_channels_mag_num", "STD_ts_flat_channels_mag_percentage"),
+                _num_pct("PTP_ts_flat_channels_mag_num", "PTP_ts_flat_channels_mag_percentage"),
+            ]
+            c = next((x for x in candidates if x is not None), None)
+            return int(round(c)) if c is not None else None
+        if view == "grad":
+            candidates = [
+                _row_val("ECG_grad_total_channels"),
+                _row_val("EOG_grad_total_channels"),
+                _num_pct("STD_ts_noisy_channels_grad_num", "STD_ts_noisy_channels_grad_percentage"),
+                _num_pct("PTP_ts_noisy_channels_grad_num", "PTP_ts_noisy_channels_grad_percentage"),
+                _num_pct("STD_ts_flat_channels_grad_num", "STD_ts_flat_channels_grad_percentage"),
+                _num_pct("PTP_ts_flat_channels_grad_num", "PTP_ts_flat_channels_grad_percentage"),
+            ]
+            c = next((x for x in candidates if x is not None), None)
+            return int(round(c)) if c is not None else None
+
+        mag_candidates = [
+            _row_val("ECG_mag_total_channels"),
+            _row_val("EOG_mag_total_channels"),
+            _num_pct("STD_ts_noisy_channels_mag_num", "STD_ts_noisy_channels_mag_percentage"),
+            _num_pct("PTP_ts_noisy_channels_mag_num", "PTP_ts_noisy_channels_mag_percentage"),
+            _num_pct("STD_ts_flat_channels_mag_num", "STD_ts_flat_channels_mag_percentage"),
+            _num_pct("PTP_ts_flat_channels_mag_num", "PTP_ts_flat_channels_mag_percentage"),
+        ]
+        grad_candidates = [
+            _row_val("ECG_grad_total_channels"),
+            _row_val("EOG_grad_total_channels"),
+            _num_pct("STD_ts_noisy_channels_grad_num", "STD_ts_noisy_channels_grad_percentage"),
+            _num_pct("PTP_ts_noisy_channels_grad_num", "PTP_ts_noisy_channels_grad_percentage"),
+            _num_pct("STD_ts_flat_channels_grad_num", "STD_ts_flat_channels_grad_percentage"),
+            _num_pct("PTP_ts_flat_channels_grad_num", "PTP_ts_flat_channels_grad_percentage"),
+        ]
+        mag = next((x for x in mag_candidates if x is not None), None)
+        grad = next((x for x in grad_candidates if x is not None), None)
+        if mag is None and grad is None:
+            return None
+        return int(round((mag or 0.0) + (grad or 0.0)))
+
+    def _frame_channel_total(frame: pd.DataFrame) -> Optional[int]:
+        if frame.empty:
+            return None
+        total = 0
+        found = False
+        for idx in frame.index.tolist():
+            c = _row_channel_total(int(idx)) if isinstance(idx, (int, np.integer)) else _row_channel_total(idx)
+            if c is None:
+                continue
+            found = True
+            total += int(c)
+        return int(total) if found else None
+
+    cards_gqi: List[str] = []
+    cards_env: List[str] = []
+    cards_phys: List[str] = []
+    metric_colors = {
+        "GQI": "#2A6FBB",
+        "STD": "#2B9348",
+        "PtP": "#E07A00",
+        "PSD": "#C23B22",
+        "ECG": "#7B5CC4",
+        "EOG": "#0B8F8C",
+        "Muscle": "#8D6E63",
+    }
+    for metric_name, y_label, frame in _summary_distribution_components(df_view, view=view):
+        vals = _coerce_numeric(frame["value"]) if "value" in frame.columns else pd.Series(dtype=float)
+        n_rec = int(np.isfinite(vals.to_numpy(dtype=float)).sum())
+        frame_ch_total = _frame_channel_total(frame)
+        n_ch = "n/a" if frame_ch_total is None else str(int(frame_ch_total))
+        fig = _plot_summary_distribution_recordings_qc(
+            frame,
+            title=metric_name,
+            y_label=y_label,
+            color=metric_colors.get(metric_name, "#2A6FBB"),
+            enable_style_controls=False,
+            show_counts_annotation=False,
+        )
+        card = (
+            "<div class='summary-dist-card'>"
+            + f"<div class='summary-card-meta'>N recordings={n_rec}; N channels={n_ch}</div>"
+            + "<div class='fig summary-strip-fig'>"
+            + _figure_to_div(fig, include_axis_size_control=False, include_plot_controls=False)
+            + "</div>"
+            + "</div>"
+        )
+        if metric_name == "GQI":
+            cards_gqi.append(card)
+        elif metric_name in {"STD", "PtP", "PSD"}:
+            cards_env.append(card)
+        else:
+            cards_phys.append(card)
+    if not cards_gqi and not cards_env and not cards_phys:
+        return "<p>No summary distributions available.</p>"
+    return (
+        (
+            "<div class='summary-category-block'><h3>Global quality index</h3>"
+            + f"<div class='summary-dist-grid' data-summary-group='{summary_group_id}'>"
+            + "".join(cards_gqi)
+            + "</div></div>"
+            if cards_gqi
+            else ""
+        )
+        + (
+            "<div class='summary-category-block'><h3>Environmental/Hardware noise</h3>"
+            + f"<div class='summary-dist-grid' data-summary-group='{summary_group_id}'>"
+            + "".join(cards_env)
+            + "</div></div>"
+            if cards_env
+            else ""
+        )
+        + (
+            "<div class='summary-category-block'><h3>Physiological noise</h3>"
+            + f"<div class='summary-dist-grid' data-summary-group='{summary_group_id}'>"
+            + "".join(cards_phys)
+            + "</div></div>"
+            if cards_phys
+            else ""
+        )
+        + _summary_shared_controls_panel_html(summary_group_id)
+        + (
+            "<div class='summary-shared-note'><strong>How to interpret:</strong> "
+            "Each panel is one QC metric. One dot is one recording row (subject x task); hover shows entities. "
+            "Violin + box represent pooled recording distribution. "
+            "QC summary units are shown on each y-axis (percentages, burden units, or event counts)."
+            "</div>"
+        )
+    )
+
+
 def plot_task_profiles(df: pd.DataFrame, title: str, y_label: str) -> Optional[go.Figure]:
     if df.empty:
         return None
@@ -1541,12 +1911,18 @@ def _lazy_payload_script_tags_html() -> str:
     )
 
 
-def _figure_to_div(fig: Optional[go.Figure]) -> str:
+def _figure_to_div(
+    fig: Optional[go.Figure],
+    *,
+    include_axis_size_control: bool = True,
+    include_plot_controls: bool = True,
+) -> str:
     if fig is None:
         return "<p>No data available for this panel.</p>"
     fig_out = go.Figure(fig)
-    _attach_axis_label_size_controller(fig_out)
-    controls = _extract_figure_controls(fig_out)
+    if include_axis_size_control:
+        _attach_axis_label_size_controller(fig_out)
+    controls = _extract_figure_controls(fig_out) if include_plot_controls else []
     height = fig_out.layout.height
     if height is None or (isinstance(height, (float, int)) and not np.isfinite(height)):
         height = 620
@@ -1903,6 +2279,59 @@ def _metric_tab_content(df: pd.DataFrame, metric_name: str, view: str, view_labe
     )
 
 
+def _build_summary_distributions_section_qc(df: pd.DataFrame, *, view: str, view_label: str) -> str:
+    """First-level QC summary distributions (single or multi-dataset)."""
+    if df.empty:
+        return "<section><h2>Summary distributions</h2><p>No QC rows available for this view.</p></section>"
+
+    multi_dataset = "dataset" in df.columns and (df["dataset"].astype(str).nunique() > 1)
+    if multi_dataset:
+        tabs: List[Tuple[str, str]] = [
+            (
+                "Pooled sample",
+                _summary_distribution_grid_html(
+                    df,
+                    view=view,
+                    view_label=view_label,
+                    summary_group_id=f"qc-summary-strip-{re.sub(r'[^a-z0-9]+','-',view_label.lower())}-pooled",
+                ),
+            )
+        ]
+        for ds in sorted(df["dataset"].astype(str).unique()):
+            ds_df = df.loc[df["dataset"].astype(str) == ds].copy()
+            tabs.append(
+                (
+                    ds,
+                    _summary_distribution_grid_html(
+                        ds_df,
+                        view=view,
+                        view_label=f"{view_label} - {ds}",
+                        summary_group_id=f"qc-summary-strip-{re.sub(r'[^a-z0-9]+','-',view_label.lower())}-{re.sub(r'[^a-z0-9]+','-',ds.lower())}",
+                    ),
+                )
+            )
+        body = _build_subtabs_html(
+            f"qc-summary-dist-{re.sub(r'[^a-z0-9]+','-',view_label.lower())}",
+            tabs,
+            level=2,
+        )
+    else:
+        body = _summary_distribution_grid_html(
+            df,
+            view=view,
+            view_label=view_label,
+            summary_group_id=f"qc-summary-strip-{re.sub(r'[^a-z0-9]+','-',view_label.lower())}",
+        )
+
+    return (
+        "<section>"
+        "<h2>Summary distributions</h2>"
+        "<p>Compact pooled QC screen. Each dot is one recording row; hover reveals dataset/subject/task entities.</p>"
+        + body
+        + "</section>"
+    )
+
+
 def _tab_content(
     df: pd.DataFrame,
     top_tab: str,
@@ -1978,7 +2407,11 @@ def _tab_content(
 
     return _build_subtabs_html(
         f"qc-sections-{re.sub(r'[^a-z0-9]+','-',top_tab.lower())}",
-        [("Cohort QC overview", overview_html), ("QC metrics details", metrics_html)],
+        [
+            ("Summary distributions", _build_summary_distributions_section_qc(df, view=view, view_label=top_tab)),
+            ("Cohort QC overview", overview_html),
+            ("QC metrics details", metrics_html),
+        ],
         level=1,
     )
 
@@ -2058,6 +2491,50 @@ def _build_report_html(
     th, td {{ border: 1px solid #d5e3f3; padding: 7px 8px; text-align: left; vertical-align: top; }}
     th {{ background: #e7f1ff; color: #224c78; }}
     .summary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }}
+    .summary-category-block {{
+      margin-top: 10px;
+    }}
+    .summary-category-block h3 {{
+      margin: 0 0 8px;
+      font-size: 18px;
+      color: #1f3f63;
+    }}
+    .summary-dist-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(300px, 1fr));
+      gap: 12px;
+      margin-top: 6px;
+    }}
+    .summary-dist-card {{
+      border: 1px solid #d9e7f8;
+      border-radius: 10px;
+      padding: 8px;
+      background: #fbfdff;
+      min-width: 0;
+    }}
+    .summary-card-meta {{
+      font-size: 12px;
+      font-weight: 700;
+      color: #244466;
+      background: #eef6ff;
+      border: 1px solid #d3e6fb;
+      border-radius: 7px;
+      padding: 5px 8px;
+      margin-bottom: 6px;
+    }}
+    .summary-shared-controls {{
+      margin-top: 10px;
+      padding: 10px 12px 12px;
+      border: 1px solid #c7dbf2;
+      border-radius: 10px;
+      background: #f4f9ff;
+    }}
+    .summary-shared-note {{
+      margin: 8px 2px 12px;
+      font-size: 13px;
+      line-height: 1.45;
+      color: #2a425f;
+    }}
     .tile {{ border: 1px solid #d9e7f8; border-radius: 10px; padding: 10px; background: #fbfdff; }}
     .fig {{ border-top: 1px solid #e7eef8; margin-top: 10px; padding-top: 10px; overflow: visible; }}
     .fig .js-plotly-plot {{ width: 100% !important; }}
@@ -2333,6 +2810,170 @@ def _build_report_html(
         }});
       }}
 
+      const summaryStyleState = {{}};
+      const summaryDotMap = {{1: 3.0, 2: 4.0, 3: 5.5, 4: 7.0, 5: 8.5, 6: 10.0, 7: 12.0, 8: 14.0}};
+      const summaryDispMap = {{1: 0.00, 2: 0.02, 3: 0.04, 4: 0.06, 5: 0.08, 6: 0.10, 7: 0.12, 8: 0.14, 9: 0.16, 10: 0.18, 11: 0.20, 12: 0.22}};
+
+      function getSummaryGrids(groupId) {{
+        if (!groupId) return [];
+        return Array.from(document.querySelectorAll(`.summary-dist-grid[data-summary-group="${{groupId}}"]`));
+      }}
+
+      function getSummaryPlots(groupId) {{
+        const grids = getSummaryGrids(groupId);
+        if (grids.length === 0) return [];
+        const plots = [];
+        grids.forEach((grid) => {{
+          plots.push(...Array.from(grid.querySelectorAll('.js-plotly-plot')));
+        }});
+        return plots;
+      }}
+
+      function applySummaryLineLevel(plotEl, level) {{
+        const lw = Number(level);
+        const lineWidth = (plotEl.data || []).map((tr) => {{
+          const t = String((tr && tr.type) || '');
+          return (t === 'scatter' || t === 'scattergl' || t === 'violin' || t === 'box') ? lw : null;
+        }});
+        const markerLineWidth = (plotEl.data || []).map((tr) => {{
+          const t = String((tr && tr.type) || '');
+          const mode = String((tr && tr.mode) || '');
+          if (t === 'histogram') return Math.max(0.5, lw * 0.6);
+          if ((t === 'scatter' || t === 'scattergl') && mode.includes('markers')) return Math.max(0.25, lw * 0.2);
+          return null;
+        }});
+        try {{
+          Plotly.restyle(plotEl, {{'line.width': lineWidth, 'marker.line.width': markerLineWidth}});
+        }} catch (err) {{}}
+      }}
+
+      function applySummaryDotLevel(plotEl, level) {{
+        const size = Number(summaryDotMap[level] || 8.0);
+        const markerSize = (plotEl.data || []).map((tr) => {{
+          const t = String((tr && tr.type) || '');
+          const mode = String((tr && tr.mode) || '');
+          return ((t === 'scatter' || t === 'scattergl') && mode.includes('markers')) ? size : null;
+        }});
+        try {{
+          Plotly.restyle(plotEl, {{'marker.size': markerSize}});
+        }} catch (err) {{}}
+      }}
+
+      function _summaryScatterIdx(plotEl) {{
+        const out = [];
+        (plotEl.data || []).forEach((tr, idx) => {{
+          const t = String((tr && tr.type) || '');
+          const mode = String((tr && tr.mode) || '');
+          if ((t === 'scatter' || t === 'scattergl') && mode.includes('markers')) out.push(idx);
+        }});
+        return out;
+      }}
+
+      function applySummaryDotVisibility(plotEl, visibleLevel) {{
+        const visible = Number(visibleLevel) > 0;
+        const traceVisible = (plotEl.data || []).map((tr) => {{
+          const t = String((tr && tr.type) || '');
+          const mode = String((tr && tr.mode) || '');
+          return ((t === 'scatter' || t === 'scattergl') && mode.includes('markers')) ? visible : null;
+        }});
+        try {{
+          Plotly.restyle(plotEl, {{'visible': traceVisible}});
+        }} catch (err) {{}}
+      }}
+
+      function applySummaryDisplacement(plotEl, level) {{
+        const shift = Number(summaryDispMap[level] ?? 0.0);
+        if (!plotEl.__summaryBaseX) plotEl.__summaryBaseX = {{}};
+        const idxs = _summaryScatterIdx(plotEl);
+        const xUpdate = [];
+        const traceIdx = [];
+        idxs.forEach((i) => {{
+          if (!plotEl.__summaryBaseX.hasOwnProperty(i)) {{
+            const base = Array.isArray(plotEl.data[i].x) ? plotEl.data[i].x.slice() : [];
+            plotEl.__summaryBaseX[i] = base;
+          }}
+          const base = plotEl.__summaryBaseX[i] || [];
+          xUpdate.push(base.map((v) => Number(v) + shift));
+          traceIdx.push(i);
+        }});
+        if (traceIdx.length === 0) return;
+        try {{
+          Plotly.restyle(plotEl, {{'x': xUpdate}}, traceIdx);
+        }} catch (err) {{}}
+      }}
+
+      function applySummaryAxisLevel(plotEl, level) {{
+        const tickMap = {{1: 9, 2: 10, 3: 12, 4: 14, 5: 16, 6: 18, 7: 20, 8: 22}};
+        const tick = Number(tickMap[level] || 14);
+        const title = tick + 2;
+        const layout = plotEl.layout || {{}};
+        const axisKeys = Object.keys(layout).filter((k) => k.startsWith('xaxis') || k.startsWith('yaxis'));
+        const upd = {{}};
+        if (axisKeys.length === 0) {{
+          upd['xaxis.tickfont.size'] = tick;
+          upd['xaxis.title.font.size'] = title;
+          upd['yaxis.tickfont.size'] = tick;
+          upd['yaxis.title.font.size'] = title;
+        }} else {{
+          axisKeys.forEach((k) => {{
+            upd[`${{k}}.tickfont.size`] = tick;
+            upd[`${{k}}.title.font.size`] = title;
+          }});
+        }}
+        try {{
+          Plotly.relayout(plotEl, upd);
+        }} catch (err) {{}}
+      }}
+
+      function applySummaryState(groupId) {{
+        const state = summaryStyleState[groupId] || {{line: 4, dot: 4, axis: 4, dotvis: 1, disp: 1}};
+        const grids = getSummaryGrids(groupId);
+        const run = () => {{
+          const plots = getSummaryPlots(groupId);
+          plots.forEach((plotEl) => {{
+            applySummaryLineLevel(plotEl, state.line);
+            applySummaryDotLevel(plotEl, state.dot);
+            applySummaryDotVisibility(plotEl, state.dotvis);
+            applySummaryDisplacement(plotEl, state.disp);
+            applySummaryAxisLevel(plotEl, state.axis);
+          }});
+        }};
+        if (grids.length > 0) {{
+          Promise.all(grids.map((grid) => renderLazyInScope(grid))).then(run);
+        }} else {{
+          run();
+        }}
+      }}
+
+      function bindSummarySharedControls(scopeRoot) {{
+        const scope = scopeRoot || document;
+        const panels = Array.from(scope.querySelectorAll('.summary-shared-controls'));
+        panels.forEach((panel) => {{
+          if (panel.dataset.bound === '1') return;
+          panel.dataset.bound = '1';
+          const groupId = panel.dataset.summaryGroup;
+          if (!groupId) return;
+          if (!summaryStyleState[groupId]) {{
+            summaryStyleState[groupId] = {{line: 4, dot: 4, axis: 4, dotvis: 1, disp: 1}};
+          }}
+          Array.from(panel.querySelectorAll('.plot-control-btn[data-summary-kind]')).forEach((btn) => {{
+            btn.addEventListener('click', () => {{
+              const kind = String(btn.dataset.summaryKind || '');
+              const level = Number(btn.dataset.level || 4);
+              if (!(kind in summaryStyleState[groupId])) return;
+              summaryStyleState[groupId][kind] = level;
+              const row = btn.parentElement;
+              if (row) {{
+                Array.from(row.querySelectorAll('.plot-control-btn')).forEach((b) => b.classList.remove('active'));
+              }}
+              btn.classList.add('active');
+              applySummaryState(groupId);
+            }});
+          }});
+          applySummaryState(groupId);
+        }});
+      }}
+
       function renderLazyInScope(scopeRoot) {{
         if (typeof Plotly === 'undefined') return Promise.resolve();
         const scope = scopeRoot || document;
@@ -2355,6 +2996,27 @@ def _build_report_html(
           }} catch (err) {{}}
         }});
         return renderPromises.length ? Promise.all(renderPromises).then(() => undefined) : Promise.resolve();
+      }}
+
+      function teardownLazyInScope(scopeRoot) {{
+        if (typeof Plotly === 'undefined') return;
+        const scope = scopeRoot || document;
+        const placeholders = Array.from(scope.querySelectorAll('.js-lazy-plot[data-rendered="1"]'));
+        placeholders.forEach((el) => {{
+          try {{
+            Plotly.purge(el);
+          }} catch (err) {{
+            // no-op
+          }}
+          el.innerHTML = '';
+          delete el.dataset.rendered;
+          const wrap = el.closest('.lazy-plot-wrap');
+          const panel = wrap ? wrap.querySelector('.plot-controls') : null;
+          if (panel) {{
+            panel.innerHTML = '';
+            panel.classList.remove('active');
+          }}
+        }});
       }}
 
       function applyGridToPlot(plotEl, show) {{
@@ -2382,6 +3044,7 @@ def _build_report_html(
         const root = document.getElementById(targetId);
         if (!root) return Promise.resolve();
         return renderLazyInScope(root).then(() => {{
+          bindSummarySharedControls(root);
           const plots = Array.from(root.querySelectorAll('.js-plotly-plot'));
           plots.forEach((plotEl) => {{ try {{ Plotly.Plots.resize(plotEl); }} catch (err) {{}} }});
           if (!gridsVisible) applyGridState(false, root);
@@ -2389,6 +3052,10 @@ def _build_report_html(
       }}
 
       function activate(targetId) {{
+        const activePrev = tabs.find(t => t.classList.contains('active'));
+        if (activePrev && activePrev.id !== targetId) {{
+          teardownLazyInScope(activePrev);
+        }}
         tabs.forEach(t => t.classList.toggle('active', t.id === targetId));
         buttons.forEach(b => b.classList.toggle('active', b.dataset.target === targetId));
         window.requestAnimationFrame(() => {{
@@ -2411,6 +3078,10 @@ def _build_report_html(
       function activateSubtab(groupId, targetId) {{
         const subButtons = Array.from(document.querySelectorAll(`.subtab-btn[data-tab-group="${{groupId}}"]`));
         const subPanels = Array.from(document.querySelectorAll(`.subtab-content[data-tab-group="${{groupId}}"]`));
+        const prevPanel = subPanels.find((p) => p.classList.contains('active'));
+        if (prevPanel && prevPanel.id !== targetId) {{
+          teardownLazyInScope(prevPanel);
+        }}
         subPanels.forEach(p => p.classList.toggle('active', p.id === targetId));
         subButtons.forEach(b => b.classList.toggle('active', b.dataset.target === targetId));
         const activePanel = document.getElementById(targetId);
@@ -2431,6 +3102,8 @@ def _build_report_html(
         const firstBtn = document.querySelector(`.subtab-btn[data-tab-group="${{groupId}}"]`);
         if (firstBtn) activateSubtab(groupId, firstBtn.dataset.target);
       }});
+
+      bindSummarySharedControls(document);
 
       window.addEventListener('resize', () => {{
         const active = tabs.find(t => t.classList.contains('active'));

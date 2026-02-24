@@ -8,7 +8,7 @@ from meg_qc.plotting.meg_qc_plots import make_plots_meg_qc
 # Parameters:
 # ------------------------------------------------------------------
 # Path to the root of your BIDS MEG dataset.
-data_directory = '/Users/karelo/Development/datasets/cc700'
+data_directory = '/Users/karelo/Development/datasets/ds_small'
 # Optional external derivatives root for plotting results
 derivatives_output_path = None
 # Number of CPU cores you want to use (for example, 4). Use -1 to utilize all available CPU cores:
