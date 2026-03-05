@@ -10,9 +10,6 @@ from statistics import mean
 from typing import Union, Optional, Dict
 
 import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
-import matplotlib.cm as cm
 
 from meg_qc.calculation.initial_meg_qc import get_all_config_params
 
@@ -609,103 +606,6 @@ def create_summary_report(
     print(f"HTML successfully generated: {html_output}")
     print(f"JSON summary successfully generated: {json_output}")
 
-
-def create_group_metrics_figure(tsv_path: Union[str, os.PathLike], output_png: Union[str, os.PathLike]) -> None:
-    """Generate violin plot of group GQI metrics."""
-    # Read the table with per-subject metrics
-    df = pd.read_csv(tsv_path, sep="\t")
-
-    cols = [
-        "GQI",
-        "GQI_penalty_ch",
-        "GQI_penalty_corr",
-        "GQI_penalty_mus",
-        "GQI_penalty_psd",
-        "GQI_std_pct",
-        "GQI_ptp_pct",
-        "GQI_ecg_pct",
-        "GQI_eog_pct",
-        "GQI_muscle_pct",
-        "GQI_psd_noise_pct",
-    ]
-
-    label_map = {
-        "GQI": "GQI",
-        "GQI_penalty_ch": "Variability penalty",
-        "GQI_penalty_corr": "Correlational penalty",
-        "GQI_penalty_mus": "Muscle penalty",
-        "GQI_penalty_psd": "PSD penalty",
-        "GQI_std_pct": "STD noise",
-        "GQI_ptp_pct": "PtP noise",
-        "GQI_ecg_pct": "ECG noise",
-        "GQI_eog_pct": "EOG noise",
-        "GQI_muscle_pct": "Muscle noise",
-        "GQI_psd_noise_pct": "PSD noise",
-    }
-    # Only plot metrics present in the table and containing data
-    available_cols = [
-        c for c in cols if c in df.columns and not df[c].dropna().empty
-    ]
-    data = df[available_cols].apply(pd.to_numeric, errors="coerce")
-    violin_data = [data[c].dropna().values for c in available_cols]
-
-    palette = cm.get_cmap("tab10", len(available_cols))
-
-    plt.figure(figsize=(22, 10))
-    # Draw the violin plot with mean lines
-    parts = plt.violinplot(
-        violin_data,
-        showmeans=True,
-        showextrema=True,
-        showmedians=False,
-        widths=0.8,
-    )
-
-    # Colour each violin body for clarity
-    for i, pc in enumerate(parts["bodies"]):
-        color = palette(i)
-        pc.set_facecolor(color)
-        pc.set_edgecolor("black")
-        pc.set_alpha(0.3)
-
-    parts["cmeans"].set_linewidth(3)
-    parts["cmeans"].set_color("black")
-    parts["cbars"].set_color("black")
-
-    # Overlay individual data points with jitter
-    for i, y in enumerate(violin_data, start=1):
-        x = np.random.normal(i, 0.08, size=len(y))
-        plt.scatter(
-            x,
-            y,
-            s=40,
-            alpha=0.3,
-            edgecolor="black",
-            linewidth=0.6,
-            facecolor=palette(i - 1),
-        )
-
-    # Label axes and finalise the figure
-    tick_labels = [label_map.get(c, c) for c in available_cols]
-    plt.xticks(
-        range(1, len(available_cols) + 1),
-        tick_labels,
-        rotation=35,
-        ha="right",
-        fontsize=20,
-        fontweight="bold",
-    )
-    plt.yticks(fontsize=18)
-    plt.ylabel("Percentage of Quality, Penalties and Noise", fontsize=22, fontweight="bold")
-    plt.title("Violin Plot of GQI Metrics with Individual Data Points", fontsize=26, pad=25)
-
-    plt.grid(axis="y", linestyle="--", alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_png, dpi=300)
-    plt.close()
-
-
-
 def generate_gqi_summary(dataset_path: str, derivatives_root: str, config_file: str) -> None:
     """Generate Global Quality Index summaries from existing metrics."""
     # Load user configuration to retrieve GQI settings
@@ -739,7 +639,7 @@ def generate_gqi_summary(dataset_path: str, derivatives_root: str, config_file: 
         task_label = _extract_task_label(json_path)
         summary_paths.append((out_json, task_label))
 
-    # Collate per-subject summaries into a group table and figure
+    # Collate per-subject summaries into a group table
     group_dir = os.path.join(reports_root, "group_metrics")
     os.makedirs(group_dir, exist_ok=True)
     from meg_qc.calculation.meg_qc_pipeline import flatten_summary_metrics
@@ -760,9 +660,6 @@ def generate_gqi_summary(dataset_path: str, derivatives_root: str, config_file: 
         df = df[cols]
         tsv_file = os.path.join(group_dir, f"Global_Quality_Index_attempt_{attempt}.tsv")
         df.to_csv(tsv_file, sep="\t", index=False)
-        png_file = os.path.join(group_dir, f"Global_Quality_Index_attempt_{attempt}.png")
-        # Produce violin plot summarising group metrics
-        create_group_metrics_figure(tsv_file, png_file)
 
     # Save configuration used for this attempt
     config_dir = os.path.join(reports_root, "config")

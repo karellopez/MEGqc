@@ -239,37 +239,268 @@ def get_config():
 
 def get_plots():
     """
-    Launches the MEG QC plotting module, which generates visualizations
-    from the pipeline results in the derivatives folder.
+    Unified plotting entry point for QA/QC report generation.
+
+    This command supports explicit QA and QC modes with one-shot execution.
+    It can run subject-level, group-level, and multi-sample reports depending
+    on provided flags and number of datasets.
     """
     from meg_qc.plotting.meg_qc_plots import make_plots_meg_qc
+    from meg_qc.plotting.meg_qc_group_plots import make_group_plots_meg_qc
+    from meg_qc.plotting.meg_qc_multi_sample_group_plots import make_multi_sample_group_plots_meg_qc
+    from meg_qc.plotting.meg_qc_group_qc_plots import (
+        make_group_qc_plots_meg_qc,
+        make_group_qc_plots_multi_meg_qc,
+    )
     from meg_qc.calculation.meg_qc_pipeline import resolve_output_roots
 
     dataset_path_parser = argparse.ArgumentParser(
-        description="parser for MEGqc: --inputdata (mandatory) path/to/BIDSds"
+        description=(
+            "MEGqc plotting dispatcher for QA/QC reports.\n\n"
+            "Use explicit flags to choose report scope:\n"
+            "  QA flags: --qa-subject, --qa-group, --qa-multisample, --qa-all\n"
+            "  QC flags: --qc-group, --qc-multisample, --qc-all\n"
+            "  Combined: --all (runs QA+QC in one shot)\n\n"
+            "Examples:\n"
+            "  Subject QA (single dataset):\n"
+            "    run-megqc-plotting --inputdata /path/ds --qa-subject\n\n"
+            "  Group QA (single dataset):\n"
+            "    run-megqc-plotting --inputdata /path/ds --qa-group\n\n"
+            "  Multi-sample QA (2+ datasets):\n"
+            "    run-megqc-plotting --inputdata /path/ds1 /path/ds2 --qa-multisample\n\n"
+            "  Group QC with selected attempt:\n"
+            "    run-megqc-plotting --inputdata /path/ds --qc-group --attempt 2\n\n"
+            "  All QA+QC reports (one shot):\n"
+            "    run-megqc-plotting --inputdata /path/ds1 /path/ds2 --all"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
     )
     dataset_path_parser.add_argument(
         "--inputdata",
+        nargs="+",
         type=str,
         required=True,
-        help="Path to the root of your BIDS MEG dataset"
+        help="Path(s) to one or more BIDS MEG datasets.",
     )
     dataset_path_parser.add_argument(
         "--derivatives_output",
         type=str,
         required=False,
-        help="Optional folder to store derivatives outside the BIDS dataset",
+        help=(
+            "Optional external derivatives parent folder. For single-dataset "
+            "modes, dataset-specific derivatives are resolved from this root."
+        ),
+    )
+    dataset_path_parser.add_argument(
+        "--output_report",
+        type=str,
+        required=False,
+        help=(
+            "Optional explicit output HTML path. Allowed only when exactly one "
+            "single-report mode is selected: --qa-multisample, --qc-group, "
+            "or --qc-multisample."
+        ),
+    )
+    dataset_path_parser.add_argument(
+        "--attempt",
+        type=int,
+        required=False,
+        help=(
+            "QC only: attempt number used to select "
+            "Global_Quality_Index_attempt_<n>.tsv when --input_tsv is not given."
+        ),
+    )
+    dataset_path_parser.add_argument(
+        "--input_tsv",
+        type=str,
+        required=False,
+        help=(
+            "QC only: explicit Global_Quality_Index_attempt_*.tsv path. "
+            "Allowed only with --qc-group and a single dataset."
+        ),
+    )
+    dataset_path_parser.add_argument(
+        "-njobs",
+        "--njobs",
+        type=int,
+        default=1,
+        required=False,
+        help="Parallel workers for supported QA plotting tasks (1=sequential, -1=all cores).",
+    )
+    dataset_path_parser.add_argument(
+        "--qa-subject",
+        action="store_true",
+        help="Run subject-level QA plotting for each selected dataset.",
+    )
+    dataset_path_parser.add_argument(
+        "--qa-group",
+        action="store_true",
+        help="Run dataset-level QA group report for each selected dataset.",
+    )
+    dataset_path_parser.add_argument(
+        "--qa-multisample",
+        action="store_true",
+        help="Run one multi-sample QA report across selected datasets (requires >=2 datasets).",
+    )
+    dataset_path_parser.add_argument(
+        "--qa-all",
+        action="store_true",
+        help="Run all QA modes valid for the provided datasets.",
+    )
+    dataset_path_parser.add_argument(
+        "--qc-group",
+        action="store_true",
+        help=(
+            "Run dataset-level QC report(s). For one dataset, uses --input_tsv "
+            "or --attempt when provided; otherwise selects latest attempt."
+        ),
+    )
+    dataset_path_parser.add_argument(
+        "--qc-multisample",
+        action="store_true",
+        help="Run one multi-sample QC report across selected datasets (requires >=2 datasets).",
+    )
+    dataset_path_parser.add_argument(
+        "--qc-all",
+        action="store_true",
+        help="Run all QC modes valid for the provided datasets.",
+    )
+    dataset_path_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run all QA and QC modes valid for the provided datasets in one shot.",
     )
     args = dataset_path_parser.parse_args()
-    data_directory = args.inputdata
 
-    # Mirror the calculation module: allow the derivatives to live outside the
-    # dataset by resolving a custom output root when requested. The returned
-    # path is logged to help users find the exact folder being read.
-    _, derivatives_root = resolve_output_roots(data_directory, args.derivatives_output)
-    print(f"Using derivatives from: {derivatives_root}")
+    dataset_paths = args.inputdata
+    n_datasets = len(dataset_paths)
 
-    make_plots_meg_qc(data_directory, derivatives_base=args.derivatives_output)
+    qa_subject = args.qa_subject
+    qa_group = args.qa_group
+    qa_multisample = args.qa_multisample
+    qc_group = args.qc_group
+    qc_multisample = args.qc_multisample
+
+    # Expand aggregate flags.
+    if args.qa_all or args.all:
+        qa_subject = True
+        qa_group = True
+        qa_multisample = True
+    if args.qc_all or args.all:
+        qc_group = True
+        qc_multisample = True
+
+    # Backward compatibility: default to subject-level QA when no action flags.
+    if not any([qa_subject, qa_group, qa_multisample, qc_group, qc_multisample]):
+        print("No QA/QC plotting mode selected; defaulting to --qa-subject.")
+        qa_subject = True
+
+    # Validate dataset count requirements for multi-sample modes.
+    if qa_multisample and n_datasets < 2:
+        dataset_path_parser.error("--qa-multisample requires at least two datasets in --inputdata.")
+    if qc_multisample and n_datasets < 2:
+        dataset_path_parser.error("--qc-multisample requires at least two datasets in --inputdata.")
+
+    # Validate --input_tsv usage.
+    if args.input_tsv:
+        if not qc_group:
+            dataset_path_parser.error("--input_tsv is only valid with --qc-group.")
+        if n_datasets != 1:
+            dataset_path_parser.error("--input_tsv is only valid with --qc-group and a single dataset.")
+        if qc_multisample:
+            dataset_path_parser.error("--input_tsv cannot be combined with --qc-multisample.")
+
+    # Validate --output_report usage to avoid path collisions.
+    if args.output_report:
+        enabled_modes = [
+            ("qa_subject", qa_subject),
+            ("qa_group", qa_group),
+            ("qa_multisample", qa_multisample),
+            ("qc_group", qc_group),
+            ("qc_multisample", qc_multisample),
+        ]
+        enabled_count = sum(1 for _, on in enabled_modes if on)
+        if enabled_count != 1:
+            dataset_path_parser.error(
+                "--output_report is only allowed when exactly one plotting mode is selected."
+            )
+        if qa_subject or qa_group:
+            dataset_path_parser.error(
+                "--output_report is not used by --qa-subject/--qa-group. "
+                "Use it with --qa-multisample, --qc-group, or --qc-multisample."
+            )
+
+    # Inform user about derivatives roots that will be used.
+    for ds in dataset_paths:
+        _, derivatives_root = resolve_output_roots(ds, args.derivatives_output)
+        print(f"Using derivatives from: {derivatives_root}")
+
+    # --------------------------
+    # QA execution
+    # --------------------------
+    if qa_subject:
+        for ds in dataset_paths:
+            print(f"Running QA subject plotting for dataset: {ds}")
+            make_plots_meg_qc(ds, n_jobs=args.njobs, derivatives_base=args.derivatives_output)
+
+    if qa_group:
+        for ds in dataset_paths:
+            print(f"Running QA group plotting for dataset: {ds}")
+            make_group_plots_meg_qc(
+                ds,
+                derivatives_base=args.derivatives_output,
+                n_jobs=args.njobs,
+            )
+
+    if qa_multisample:
+        print("Running QA multisample plotting...")
+        derivatives_bases = (
+            [args.derivatives_output] * n_datasets if args.derivatives_output else None
+        )
+        make_multi_sample_group_plots_meg_qc(
+            dataset_paths=dataset_paths,
+            derivatives_bases=derivatives_bases,
+            output_report_path=args.output_report,
+            n_jobs=args.njobs,
+        )
+
+    # --------------------------
+    # QC execution
+    # --------------------------
+    if qc_group:
+        if n_datasets == 1:
+            print(f"Running QC group plotting for dataset: {dataset_paths[0]}")
+            make_group_qc_plots_meg_qc(
+                dataset_path=dataset_paths[0],
+                input_tsv=args.input_tsv,
+                output_html=args.output_report,
+                attempt=args.attempt,
+                derivatives_base=args.derivatives_output,
+            )
+        else:
+            if args.input_tsv:
+                dataset_path_parser.error(
+                    "--input_tsv is not supported when --qc-group is used with multiple datasets."
+                )
+            for ds in dataset_paths:
+                print(f"Running QC group plotting for dataset: {ds}")
+                make_group_qc_plots_meg_qc(
+                    dataset_path=ds,
+                    input_tsv=None,
+                    output_html=None,
+                    attempt=args.attempt,
+                    derivatives_base=args.derivatives_output,
+                )
+
+    if qc_multisample:
+        print("Running QC multisample plotting...")
+        make_group_qc_plots_multi_meg_qc(
+            dataset_paths=dataset_paths,
+            output_html=args.output_report,
+            attempt=args.attempt,
+            derivatives_base=args.derivatives_output,
+        )
+
     return
 
 

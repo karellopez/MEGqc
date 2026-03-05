@@ -417,7 +417,7 @@ class MainWindow(QMainWindow):
         if LOGO_PATH and LOGO_PATH.exists():
             logo = QLabel()
             pix = QPixmap(str(LOGO_PATH))
-            pix = pix.scaledToHeight(120, Qt.TransformationMode.SmoothTransformation)
+            pix = pix.scaledToHeight(60, Qt.TransformationMode.SmoothTransformation)
             logo.setPixmap(pix)
             logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
             vlay.addWidget(logo)
