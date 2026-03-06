@@ -32,11 +32,7 @@ Default settings [DEFAULT]
     - **Muscle** (bool) : High frequency (110-140Hz) noise strongy correlated with (but not limited to) Muscle artifacts. Default: *True*
 
 - **data_crop_tmin** (int) & **data_crop_tmax** (int) : Settings for data crop. If no cropping needed, leave blank. Unit: seconds. Default: *blank*
-- **plot_mne_butterfly** (bool) : Plot MNE butterfly plot. Default: *True*
-- **plot_interactive_time_series** (bool) : Plot of the whole time series (each channel on top of others, separated by ch type: mags, grads). Will be done on the data resampled to 100Hz/sec. Raw data is shown, no filetring applied even if filer is set in the filering section. Benefit: it is interactive (you can see all or 1 or several channels, zoom in), which makes it more informative than built-in mne plot. Downside: This plot may signifcantly increase the time it takes to run the pipeline and the plot itself in html presentation might be slow due to large number of data points. Large size of html report. If you want to run it faster, set this to False. Default: *False*
-- **plot_interactive_time_series_average** (bool) : Plot interactive time series average (average over all channels of each type: mags, grads). Plot will be done on the data resampled to 100Hz/sec. This plot may increase the time it takes to run the pipeline, but dosnt significantly increase the size of html report. Default: False
-- **data_directory** (str) : **Absolute** path to the data directory . Possible to also enter several data path separated by coma. Example: *user/path/to/my/data/ds000000, user/path/to/my/data/ds000001*
-- **verbose_plots** (bool) : Show the plots when running the script (plotly and matplotlib). Default: True
+- **data_directory** (str) : **Absolute** path to the data directory. Possible to enter several dataset paths separated by comma. Example: *user/path/to/my/data/ds000000, user/path/to/my/data/ds000001*
 
 Filtering [Filtering]
 ---------------------
