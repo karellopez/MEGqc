@@ -38,7 +38,12 @@ def get_all_config_params(config_file_path: str):
     config = configparser.ConfigParser()
     config.read(config_file_path)
 
-    default_section = config['DEFAULT']
+    # Backward/forward compatible handling:
+    # older configs relied on DEFAULT, while newer public configs use [GENERAL].
+    if "GENERAL" in config:
+        default_section = config["GENERAL"]
+    else:
+        default_section = config["DEFAULT"]
 
     m_or_g_chosen = default_section['ch_types']
     m_or_g_chosen = [chosen.strip() for chosen in m_or_g_chosen.split(",")]
@@ -79,9 +84,6 @@ def get_all_config_params(config_file_path: str):
             'run_EOG': run_EOG,
             'run_Head': run_Head,
             'run_Muscle': run_Muscle,
-            'plot_mne_butterfly': default_section.getboolean('plot_mne_butterfly'),
-            'plot_interactive_time_series': default_section.getboolean('plot_interactive_time_series'),
-            'plot_interactive_time_series_average': default_section.getboolean('plot_interactive_time_series_average'),
             'crop_tmin': tmin,
             'crop_tmax': tmax})
         all_qc_params['default'] = default_params
@@ -1027,7 +1029,7 @@ def save_meg_with_suffix(
     """
     Save an MNE raw object alongside the derivatives with a custom suffix.
 
-    The output directory is constructed as ``<derivatives_root>/temp/<subject>``
+    The output directory is constructed as ``<derivatives_root>/.tmp/<subject>``
     where ``subject`` is inferred from the first path component starting with
     ``sub-`` in ``file_path``. Using ``derivatives_root`` allows callers to place
     temporary files outside the read-only BIDS directory if needed.
@@ -1040,7 +1042,9 @@ def save_meg_with_suffix(
     if subject is None:
         raise ValueError("Unable to determine subject from file path for temporary output")
 
-    output_dir = os.path.join(derivatives_root, 'temp', subject)
+    # Profile-scoped temporary intermediates are stored in ".tmp" to make
+    # their transient nature explicit for users inspecting derivatives.
+    output_dir = os.path.join(derivatives_root, '.tmp', subject)
     output_dir = os.path.abspath(output_dir)
     print("Output directory:", output_dir)
 
@@ -1146,11 +1150,13 @@ def delete_temp_folder(derivatives_root: str) -> str:
          Absolute path to the dataset's derivatives directory (either inside
          the BIDS dataset or in an external location).
     """
-    temp_dir = os.path.join(derivatives_root, 'temp')
-    temp_dir = os.path.abspath(temp_dir)
-    if os.path.isdir(temp_dir):
-        shutil.rmtree(temp_dir)
-        print("Removing directory:", temp_dir)
+    # Prefer modern ".tmp" folder and also clean legacy "temp" if present.
+    for folder_name in ('.tmp', 'temp'):
+        temp_dir = os.path.join(derivatives_root, folder_name)
+        temp_dir = os.path.abspath(temp_dir)
+        if os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir)
+            print("Removing directory:", temp_dir)
 
     return
 

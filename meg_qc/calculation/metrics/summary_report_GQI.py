@@ -606,16 +606,37 @@ def create_summary_report(
     print(f"HTML successfully generated: {html_output}")
     print(f"JSON summary successfully generated: {json_output}")
 
-def generate_gqi_summary(dataset_path: str, derivatives_root: str, config_file: str) -> None:
-    """Generate Global Quality Index summaries from existing metrics."""
+def generate_gqi_summary(dataset_path: str, megqc_root: str, config_file: str) -> None:
+    """Generate Global Quality Index summaries from existing metrics.
+
+    Parameters
+    ----------
+    dataset_path
+        BIDS dataset root (currently used for logging/context only).
+    megqc_root
+        Root directory of one MEGqc analysis space. This is normally either:
+        - ``.../derivatives/Meg_QC`` (legacy mode), or
+        - ``.../derivatives/Meg_QC/profiles/<analysis_id>`` (profile mode).
+
+        For backward compatibility, callers may still pass a derivatives root
+        (``.../derivatives``). In that case the function auto-resolves
+        ``.../derivatives/Meg_QC``.
+    config_file
+        Settings INI path used to read ``[GlobalQualityIndex]`` parameters.
+    """
     # Load user configuration to retrieve GQI settings
     qc_params = get_all_config_params(config_file)
     if qc_params is None:
         return
     gqi_params = qc_params.get("GlobalQualityIndex")
 
-    calc_dir = os.path.join(derivatives_root, "Meg_QC", "calculation")
-    reports_root = os.path.join(derivatives_root, "Meg_QC", "summary_reports")
+    # Accept both direct Meg_QC roots and legacy derivatives roots.
+    root = os.path.abspath(megqc_root)
+    if os.path.isdir(os.path.join(root, "Meg_QC")):
+        root = os.path.join(root, "Meg_QC")
+
+    calc_dir = os.path.join(root, "calculation")
+    reports_root = os.path.join(root, "summary_reports")
     os.makedirs(reports_root, exist_ok=True)
 
     # Create a new attempt folder using incremental numbering

@@ -37,6 +37,7 @@ except Exception:
     delayed = None
 
 import meg_qc
+from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
 
 
 MODULES = ("STD", "PTP", "PSD", "ECG", "EOG", "Muscle")
@@ -2331,8 +2332,9 @@ def _topomap_blocks(
     return "".join(chunks)
 
 
-def _load_settings_snapshot(derivatives_root: str) -> str:
-    config_dir = Path(derivatives_root) / "Meg_QC" / "config"
+def _load_settings_snapshot(megqc_root: str) -> str:
+    """Load the latest MEGqc settings snapshot from one analysis root."""
+    config_dir = Path(megqc_root) / "config"
     ini_files = sorted(config_dir.glob("*.ini"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not ini_files:
         return "No settings snapshot file was found."
@@ -7859,6 +7861,8 @@ def make_group_plots_meg_qc(
     dataset_path: str,
     derivatives_base: Optional[str] = None,
     n_jobs: int = 1,
+    analysis_mode: str = "legacy",
+    analysis_id: Optional[str] = None,
 ) -> Dict[str, Path]:
     """Build dataset-level QA reports from saved per-run derivatives.
 
@@ -7872,6 +7876,11 @@ def make_group_plots_meg_qc(
     n_jobs : int
         Number of parallel workers for subject-level run processing. Use ``1``
         for sequential mode, or ``-1`` to use all available cores.
+    analysis_mode : str
+        Analysis root selection mode (``legacy``, ``new``, ``reuse``, ``latest``).
+        Plotting typically uses ``legacy`` or ``reuse``/``latest``.
+    analysis_id : str, optional
+        Profile ID used with ``analysis_mode='reuse'``.
 
     Returns
     -------
@@ -7879,11 +7888,23 @@ def make_group_plots_meg_qc(
         Mapping ``{"report": Path(...)}`` for the generated dataset-level HTML.
     """
 
-    _, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
+    (
+        _output_root,
+        derivatives_root,
+        megqc_root,
+        _resolved_analysis_id,
+        _analysis_segments,
+    ) = resolve_analysis_root(
+        dataset_path=dataset_path,
+        external_derivatives_root=derivatives_base,
+        analysis_mode=analysis_mode,
+        analysis_id=analysis_id,
+        create_if_missing=True,
+    )
     dataset_name = os.path.basename(os.path.normpath(dataset_path))
 
-    calculation_dir = Path(derivatives_root) / "Meg_QC" / "calculation"
-    reports_dir = Path(derivatives_root) / "Meg_QC" / "reports"
+    calculation_dir = Path(megqc_root) / "calculation"
+    reports_dir = Path(megqc_root) / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     if not calculation_dir.exists():
@@ -7897,7 +7918,7 @@ def make_group_plots_meg_qc(
 
     acc_by_type = _build_accumulators_for_runs(run_records, n_jobs=n_jobs)
 
-    settings_snapshot = _load_settings_snapshot(derivatives_root)
+    settings_snapshot = _load_settings_snapshot(megqc_root)
     combined_acc = _combine_accumulators(acc_by_type)
 
     tab_accumulators: Dict[str, ChTypeAccumulator] = {

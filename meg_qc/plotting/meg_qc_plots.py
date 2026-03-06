@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Sequence
 from pprint import pprint
 import gc
 from ancpbids import DatasetOptions
-import configparser
 from pathlib import Path
 import time
 from typing import Tuple, Optional
@@ -24,6 +23,7 @@ import plotly.graph_objects as go
 from plotly.utils import PlotlyJSONEncoder
 from plotly.offline import get_plotlyjs
 import mne
+from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
 
 # Get the absolute path of the parent directory of the current script
 parent_dir = os.path.dirname(os.getcwd())
@@ -35,33 +35,20 @@ sys.path.append(gradparent_dir)
 
 from meg_qc.calculation.objects import QC_derivative
 
-# Plotting backends (``universal_plots`` vs ``universal_plots_lite``) and the
-# accompanying report helpers need to be available not only in the main process
-# but also in the worker processes spawned by joblib.  Configure them at module
-# import time so that all processes share the same setup.
+# Configure plotting helpers at import time so worker processes spawned by
+# joblib use the same plotting/reporting functions as the main process.
 
 
 def _load_plotting_backend():
-    """Configure plotting backend and expose report helpers."""
+    """Expose the single supported plotting backend and report helpers."""
 
     # If the backend has been loaded already, do nothing.
     if 'make_joined_report_mne' in globals():
         return
 
-    cfg = configparser.ConfigParser()
-    settings_path = (
-        Path(__file__).resolve().parents[1] / 'settings' / 'settings.ini'
-    )
-    cfg.read(settings_path)
-    use_full_reports = cfg['DEFAULT'].getboolean('full_html_reports', True)
+    import meg_qc.plotting.universal_plots as _plots
 
-    if use_full_reports:
-        import meg_qc.plotting.universal_plots as _plots
-    else:
-        import meg_qc.plotting.universal_plots_lite as _plots
-
-    # Make the chosen backend available under the expected module name so that
-    # other modules (e.g. ``universal_html_report``) pick it up.
+    # Keep alias stable for modules importing ``meg_qc.plotting.universal_plots``.
     sys.modules['meg_qc.plotting.universal_plots'] = _plots
     globals().update(
         {
@@ -147,7 +134,10 @@ def temporary_dataset_base(dataset, base_dir: str):
         dataset.base_dir_ = original_base
 
 
-def _ensure_megqc_output_layout(output_derivatives_root: str) -> Path:
+def _ensure_megqc_output_layout(
+    output_derivatives_root: str,
+    analysis_segments: Optional[List[str]] = None,
+) -> Path:
     """Create minimal output folders/metadata for MEGqc reports.
 
     We keep ANCPBIDS for input discovery/querying but write consolidated subject
@@ -156,7 +146,10 @@ def _ensure_megqc_output_layout(output_derivatives_root: str) -> Path:
     ``dataset_description.json`` when missing.
     """
 
+    analysis_segments = analysis_segments or []
     megqc_root = Path(output_derivatives_root) / "Meg_QC"
+    for seg in analysis_segments:
+        megqc_root = megqc_root / str(seg)
     reports_root = megqc_root / "reports"
     reports_root.mkdir(parents=True, exist_ok=True)
 
@@ -2104,6 +2097,7 @@ def process_subject(
         plot_settings: dict,
         output_derivatives_root: str,
         dataset_name: str,
+        analysis_segments: Optional[List[str]] = None,
 ):
     """Build one consolidated HTML report for a single subject.
 
@@ -2112,7 +2106,10 @@ def process_subject(
     subject-level report with nested tabs and inline lazy Plotly rendering.
     """
 
-    reports_root = _ensure_megqc_output_layout(output_derivatives_root)
+    reports_root = _ensure_megqc_output_layout(
+        output_derivatives_root,
+        analysis_segments=analysis_segments,
+    )
 
     # Sort run keys for deterministic tab ordering.
     existing_raws_per_sub = sorted(set(
@@ -2231,7 +2228,13 @@ def process_subject(
     return
 
 
-def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Optional[str] = None):
+def make_plots_meg_qc(
+    dataset_path: str,
+    n_jobs: int = 1,
+    derivatives_base: Optional[str] = None,
+    analysis_mode: str = "legacy",
+    analysis_id: Optional[str] = None,
+):
     """
     Create plots for the MEG QC pipeline, but WITHOUT the interactive selector.
     Instead, we assume 'all' for every entity (subject, task, session, run, metric).
@@ -2251,7 +2254,21 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
               'No data found in the given directory path! \nCheck directory path in config file and presence of data.')
         return
 
-    output_root, dataset_derivatives_root, output_derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
+    (
+        output_root,
+        _derivatives_root,
+        _megqc_root,
+        _resolved_analysis_id,
+        analysis_segments,
+    ) = resolve_analysis_root(
+        dataset_path=dataset_path,
+        external_derivatives_root=derivatives_base,
+        analysis_mode=analysis_mode,
+        analysis_id=analysis_id,
+        create_if_missing=True,
+    )
+    dataset_derivatives_root = os.path.join(dataset_path, "derivatives")
+    output_derivatives_root = os.path.join(output_root, "derivatives")
 
     # Query derivatives source:
     # - Prefer external derivatives tree when it already contains Meg_QC
@@ -2259,7 +2276,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
     # - Otherwise fall back to derivatives inside the input dataset, while
     #   still writing reports into ``output_root``.
     source_derivatives_root = output_derivatives_root
-    calc_rel = os.path.join('Meg_QC', 'calculation')
+    calc_rel = os.path.join('Meg_QC', *analysis_segments, 'calculation')
     if not os.path.isdir(os.path.join(source_derivatives_root, calc_rel)):
         source_derivatives_root = dataset_derivatives_root
 
@@ -2277,10 +2294,15 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
         query_dataset = ancpbids.load_dataset(overlay_root, DatasetOptions(lazy_loading=True))
         print(f"___MEGqc___: Using overlay dataset for queries at: {overlay_root}")
 
-    calculated_derivs_folder = os.path.join('derivatives', 'Meg_QC', 'calculation')
+    calculated_derivs_folder = os.path.join(
+        'derivatives', 'Meg_QC', *analysis_segments, 'calculation'
+    )
 
     # Create output derivative folders once before subject-parallel processing.
-    _ensure_megqc_output_layout(output_derivatives_root)
+    _ensure_megqc_output_layout(
+        output_derivatives_root,
+        analysis_segments=analysis_segments,
+    )
 
     # --------------------------------------------------------------------------------
     # REPLACE THE SELECTOR WITH A HARDCODED "ALL" CHOICE
@@ -2423,6 +2445,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Opti
                 plot_settings=plot_settings,
                 output_derivatives_root=output_derivatives_root,
                 dataset_name=os.path.basename(os.path.normpath(dataset_path)),
+                analysis_segments=analysis_segments,
             )
             for sub in chosen_entities['subject']
         )

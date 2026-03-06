@@ -28,7 +28,7 @@ import plotly.graph_objects as go
 from plotly.utils import PlotlyJSONEncoder
 
 import meg_qc
-from meg_qc.calculation.meg_qc_pipeline import resolve_output_roots
+from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
 
 
 METRIC_ORDER = ("GQI", "STD", "PtP", "PSD", "ECG", "EOG", "Muscle")
@@ -199,13 +199,28 @@ def _resolve_input_paths(
     derivatives_base: Optional[str],
     input_tsv: Optional[str],
     attempt: Optional[int],
-) -> Tuple[str, Path, Optional[Path], Optional[int], Path]:
+    analysis_mode: str = "legacy",
+    analysis_id: Optional[str] = None,
+) -> Tuple[str, str, Path, Optional[Path], Optional[int], Path]:
     """Resolve derivatives root, selected TSV, matching config, and reports dir."""
-    _, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
-    summary_root = Path(derivatives_root) / "Meg_QC" / "summary_reports"
+    (
+        _output_root,
+        derivatives_root,
+        megqc_root,
+        _resolved_analysis_id,
+        _analysis_segments,
+    ) = resolve_analysis_root(
+        dataset_path=dataset_path,
+        external_derivatives_root=derivatives_base,
+        analysis_mode=analysis_mode,
+        analysis_id=analysis_id,
+        create_if_missing=True,
+    )
+
+    summary_root = Path(megqc_root) / "summary_reports"
     group_metrics_dir = summary_root / "group_metrics"
     config_dir = summary_root / "config"
-    reports_dir = Path(derivatives_root) / "Meg_QC" / "reports"
+    reports_dir = Path(megqc_root) / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     if input_tsv:
@@ -233,7 +248,7 @@ def _resolve_input_paths(
         if candidate.exists():
             cfg_path = candidate
 
-    return derivatives_root, tsv_path, cfg_path, resolved_attempt, reports_dir
+    return derivatives_root, megqc_root, tsv_path, cfg_path, resolved_attempt, reports_dir
 
 
 def _load_one_dataset_bundle(
@@ -242,9 +257,12 @@ def _load_one_dataset_bundle(
     derivatives_base: Optional[str],
     input_tsv: Optional[str],
     attempt: Optional[int],
+    analysis_mode: str = "legacy",
+    analysis_id: Optional[str] = None,
 ) -> QCDatasetBundle:
     (
         derivatives_root,
+        megqc_root,
         tsv_path,
         cfg_path,
         resolved_attempt,
@@ -254,6 +272,8 @@ def _load_one_dataset_bundle(
         derivatives_base=derivatives_base,
         input_tsv=input_tsv,
         attempt=attempt,
+        analysis_mode=analysis_mode,
+        analysis_id=analysis_id,
     )
 
     df_raw = pd.read_csv(tsv_path, sep="\t", low_memory=False)
@@ -271,7 +291,7 @@ def _load_one_dataset_bundle(
         cfg_path=cfg_path,
         attempt=resolved_attempt,
         df=df,
-        general_settings_snapshot=_general_settings_snapshot(derivatives_root),
+        general_settings_snapshot=_general_settings_snapshot(megqc_root),
         gqi_settings_snapshot=_config_snapshot(cfg_path),
     )
 
@@ -1968,9 +1988,9 @@ def _config_snapshot(cfg_path: Optional[Path]) -> str:
     return "\n".join(lines)
 
 
-def _general_settings_snapshot(derivatives_root: str) -> str:
+def _general_settings_snapshot(megqc_root: str) -> str:
     """Load the latest general MEGqc settings ini (same source used by QA report)."""
-    config_dir = Path(derivatives_root) / "Meg_QC" / "config"
+    config_dir = Path(megqc_root) / "config"
     ini_files = sorted(config_dir.glob("*.ini"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not ini_files:
         return "No general MEGqc settings ini was found."
@@ -3133,6 +3153,8 @@ def make_group_qc_plots_meg_qc(
     output_html: Optional[str] = None,
     attempt: Optional[int] = None,
     derivatives_base: Optional[str] = None,
+    analysis_mode: str = "legacy",
+    analysis_id: Optional[str] = None,
 ) -> Optional[Path]:
     """Build one dataset-level QC HTML report from GQI summary TSV.
 
@@ -3148,6 +3170,10 @@ def make_group_qc_plots_meg_qc(
         Optional attempt number (used only when ``input_tsv`` is omitted).
     derivatives_base
         Optional external derivatives parent root (same convention as QA CLI).
+    analysis_mode
+        Analysis root selection mode (``legacy``, ``new``, ``reuse``, ``latest``).
+    analysis_id
+        Profile ID used with ``analysis_mode='reuse'``.
 
     Returns
     -------
@@ -3160,6 +3186,8 @@ def make_group_qc_plots_meg_qc(
             derivatives_base=derivatives_base,
             input_tsv=input_tsv,
             attempt=attempt,
+            analysis_mode=analysis_mode,
+            analysis_id=analysis_id,
         )
     except Exception as exc:
         print(f"___MEGqc___: QC group report: unable to resolve inputs: {exc}")
@@ -3200,6 +3228,8 @@ def make_group_qc_plots_multi_meg_qc(
     output_html: Optional[str] = None,
     attempt: Optional[int] = None,
     derivatives_base: Optional[str] = None,
+    analysis_mode: str = "legacy",
+    analysis_id: Optional[str] = None,
 ) -> Optional[Path]:
     """Build one multi-dataset QC HTML report from multiple GQI summary TSVs."""
     if not dataset_paths:
@@ -3214,6 +3244,8 @@ def make_group_qc_plots_multi_meg_qc(
                 derivatives_base=derivatives_base,
                 input_tsv=None,
                 attempt=attempt,
+                analysis_mode=analysis_mode,
+                analysis_id=analysis_id,
             )
         except Exception as exc:
             print(f"___MEGqc___: QC multi report: failed to load dataset '{ds}': {exc}")

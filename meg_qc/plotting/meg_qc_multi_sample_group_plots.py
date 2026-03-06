@@ -28,7 +28,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 import meg_qc
-from meg_qc.calculation.meg_qc_pipeline import resolve_output_roots
+from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
 from meg_qc.plotting.meg_qc_group_plots import (
     ChTypeAccumulator,
     TopomapPayload,
@@ -98,13 +98,27 @@ def _collect_sample_bundle(
     dataset_path: str,
     derivatives_base: Optional[str] = None,
     n_jobs: int = 1,
+    analysis_mode: str = "legacy",
+    analysis_id: Optional[str] = None,
 ) -> Optional[SampleBundle]:
     """Load one dataset into MAG/GRAD/combined accumulators."""
-    _, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
+    (
+        _output_root,
+        derivatives_root,
+        megqc_root,
+        _resolved_analysis_id,
+        _analysis_segments,
+    ) = resolve_analysis_root(
+        dataset_path=dataset_path,
+        external_derivatives_root=derivatives_base,
+        analysis_mode=analysis_mode,
+        analysis_id=analysis_id,
+        create_if_missing=True,
+    )
     sample_id = _safe_sample_id(dataset_path)
 
-    calculation_dir = Path(derivatives_root) / "Meg_QC" / "calculation"
-    reports_dir = Path(derivatives_root) / "Meg_QC" / "reports"
+    calculation_dir = Path(megqc_root) / "calculation"
+    reports_dir = Path(megqc_root) / "reports"
 
     if not calculation_dir.exists():
         print(f"___MEGqc___: Multi-sample QA: skipping {sample_id}, calculation folder missing: {calculation_dir}")
@@ -132,7 +146,7 @@ def _collect_sample_bundle(
         dataset_path=dataset_path,
         derivatives_root=derivatives_root,
         reports_dir=reports_dir,
-        settings_snapshot=_load_settings_snapshot(derivatives_root),
+        settings_snapshot=_load_settings_snapshot(megqc_root),
         tab_accumulators=tab_accumulators,
     )
 
@@ -2300,6 +2314,8 @@ def make_multi_sample_group_plots_meg_qc(
     derivatives_bases: Optional[Sequence[Optional[str]]] = None,
     output_report_path: Optional[str] = None,
     n_jobs: int = 1,
+    analysis_mode: str = "legacy",
+    analysis_id: Optional[str] = None,
 ) -> Dict[str, Path]:
     """Build one HTML report comparing multiple MEGqc datasets.
 
@@ -2315,6 +2331,10 @@ def make_multi_sample_group_plots_meg_qc(
     n_jobs
         Number of parallel workers used for subject-level run loading within
         each dataset. Use ``1`` for sequential mode, or ``-1`` for all cores.
+    analysis_mode
+        Analysis root selection mode (``legacy``, ``new``, ``reuse``, ``latest``).
+    analysis_id
+        Profile ID used with ``analysis_mode='reuse'``.
 
     Returns
     -------
@@ -2335,7 +2355,13 @@ def make_multi_sample_group_plots_meg_qc(
 
     bundles: List[SampleBundle] = []
     for ds_path, der_base in zip(dataset_paths, derivatives_bases):
-        bundle = _collect_sample_bundle(ds_path, der_base, n_jobs=n_jobs)
+        bundle = _collect_sample_bundle(
+            ds_path,
+            der_base,
+            n_jobs=n_jobs,
+            analysis_mode=analysis_mode,
+            analysis_id=analysis_id,
+        )
         if bundle is not None:
             bundles.append(bundle)
 

@@ -2,8 +2,7 @@ import sys
 import time
 from meg_qc.plotting.meg_qc_plots import make_plots_meg_qc
 
-# The plotting backend (full or lite) is controlled via the
-# 'full_html_reports' option in settings.ini.
+# Plotting uses the current full report backend.
 
 # Parameters:
 # ------------------------------------------------------------------
@@ -25,4 +24,3 @@ end_time = time.time()
 elapsed_seconds = end_time - start_time
 print(f"Script finished. Elapsed time: {elapsed_seconds:.2f} seconds.")
 # ------------------------------------------------------------------
-
