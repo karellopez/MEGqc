@@ -249,6 +249,28 @@ def temporary_dataset_base(dataset, base_dir: str):
     finally:
         dataset.base_dir_ = original_base
 
+
+def _ensure_derivative_dataset_description_filename(derivative) -> None:
+    """Guarantee a writable dataset_description filename for ANCPBIDS writes.
+
+    Some datasets contain partially written legacy ``derivatives/Meg_QC`` trees.
+    In that state ANCPBIDS can materialize ``derivative.dataset_description``
+    with ``name=None``. During ``write_derivative`` this makes the writer target
+    the folder path (``.../derivatives/Meg_QC``) as if it were a file, which
+    triggers ``No file writer registered``.
+
+    We normalize this eagerly so repeated runs remain robust regardless of
+    pre-existing derivative state.
+    """
+
+    dataset_description = getattr(derivative, "dataset_description", None)
+    if dataset_description is None:
+        return
+
+    # Only patch missing/blank names; preserve explicit names if present.
+    if not getattr(dataset_description, "name", None):
+        dataset_description.name = "dataset_description.json"
+
 def ctf_workaround(dataset, sid):
     artifacts = dataset.query(suffix="meg", return_type="object", subj=sid, scope='raw')
     # convert to folders of found files
@@ -864,6 +886,7 @@ def process_one_subject(
 
     # CREATE DERIVATIVE FOR THIS SUBJECT
     derivative = dataset.create_derivative(name="Meg_QC")
+    _ensure_derivative_dataset_description_filename(derivative)
     derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
 
     print('___MEGqc___: ', 'Take SUB: ', sub)
@@ -1520,6 +1543,7 @@ def make_derivative_meg_qc(
                     all_subs_raw_files.extend(subj_files)
 
             derivative = dataset.create_derivative(name="Meg_QC")
+            _ensure_derivative_dataset_description_filename(derivative)
             derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
             root_folder = derivative
             for seg in analysis_segments:

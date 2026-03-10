@@ -483,9 +483,11 @@ def _build_run_tab_labels(raw_entity_names: Sequence[str]) -> Dict[str, str]:
     """Create concise, task-first labels for run tabs.
 
     Preference:
-    1. Task name only when unique.
-    2. Task name with run/session suffix when duplicated.
-    3. Fallback to original run identifier when task is missing.
+    1. Task name with run suffix when run is available.
+    2. Task name only when unique and no run is present.
+    3. Task name with disambiguating session/acq/rec suffix when duplicated
+       and run is missing.
+    4. Fallback to original run identifier when task is missing.
     """
     task_counts: Dict[str, int] = defaultdict(int)
     parsed: Dict[str, Dict[str, Optional[str]]] = {}
@@ -508,12 +510,15 @@ def _build_run_tab_labels(raw_entity_names: Sequence[str]) -> Dict[str, str]:
         if not task:
             out[key] = _human_run_label(key)
             continue
+        run_val = parsed[key]["run"]
         if task_counts[task] <= 1:
-            out[key] = task
+            out[key] = f"{task} (run-{run_val})" if run_val else task
             continue
 
         suffix_parts = []
-        for ent in ("run", "ses", "acq", "rec"):
+        if run_val:
+            suffix_parts.append(f"run-{run_val}")
+        for ent in ("ses", "acq", "rec"):
             val = parsed[key][ent]
             if val:
                 suffix_parts.append(f"{ent}-{val}")
@@ -2608,7 +2613,7 @@ def process_subject(
 
     for raw_entity_name in existing_raws_per_sub:
         derivs_for_this_raw = [
-            d for d in derivs_to_plot if d.raw_entity_name == raw_entity_name
+            d for d in derivs_to_plot if d.subject == sub and d.raw_entity_name == raw_entity_name
         ]
         if not derivs_for_this_raw:
             continue
@@ -2874,11 +2879,9 @@ def make_plots_meg_qc(
             else:
                 query_args['desc'] = [metric]
 
-            # Optional session/run
-            if chosen_entities['session']:
-                query_args['session'] = chosen_entities['session']
-            if chosen_entities['run']:
-                query_args['run'] = chosen_entities['run']
+            # Do not constrain optional entities (session/run) globally in
+            # all-subject report generation. Applying a global run filter here
+            # can silently drop valid recordings that omit ``run-*`` in BIDS.
 
             with temporary_dataset_base(query_dataset, query_base):
                 tsv_paths = list(query_dataset.query(**query_args))
