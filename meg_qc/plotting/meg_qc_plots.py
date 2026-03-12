@@ -18,7 +18,8 @@ from pathlib import Path
 import time
 from typing import Tuple, Optional
 from contextlib import contextmanager
-import tempfile
+import uuid
+import shutil
 
 import plotly.graph_objects as go
 from plotly.utils import PlotlyJSONEncoder
@@ -94,17 +95,77 @@ def resolve_output_roots(
     return output_root, dataset_derivatives_root, output_derivatives_root
 
 
-def build_overlay_dataset(dataset_path: str, derivatives_root: str):
-    """Create a temporary overlay so ANCPBIDS sees external derivatives.
+class _ManagedDirectory:
+    """A manually-managed directory that mimics the ``TemporaryDirectory`` interface.
+
+    Unlike ``tempfile.TemporaryDirectory``, the directory is created at an
+    explicit, user-controlled path instead of the OS system temp location
+    (``/tmp``, ``%TEMP%``, etc.).  This avoids failures on HPC clusters and
+    organisational machines where the system temp directory is restricted,
+    quota-limited, or on a different filesystem.
+    """
+
+    def __init__(self, path: str):
+        os.makedirs(path, exist_ok=True)
+        self.name = path
+
+    def cleanup(self):
+        try:
+            shutil.rmtree(self.name, ignore_errors=True)
+        except Exception:
+            pass  # Best-effort cleanup; do not crash on exit.
+
+
+def build_overlay_dataset(
+    dataset_path: str,
+    derivatives_root: str,
+    overlay_base_dir: Optional[str] = None,
+):
+    """Create a lightweight overlay so ANCPBIDS sees external derivatives.
 
     ANCPBIDS expects the derivatives folder to live under the dataset root. When
     users direct outputs to an external path, we mirror the original dataset via
-    symlinks into a temporary directory and drop a ``derivatives`` link that
-    points to the external location. All symlinks stay outside the original
-    dataset, so read-only datasets remain untouched.
+    symlinks and drop a ``derivatives`` link that points to the external
+    location. All symlinks stay outside the original dataset, so read-only
+    datasets remain untouched.
+
+    The overlay directory is created under ``overlay_base_dir`` (defaults to
+    ``output_root``, i.e. the directory the user already has write access to).
+    This replaces the previous approach of writing into the OS system temp
+    directory (``/tmp``) which is frequently restricted or quota-limited on
+    servers and organisational machines.
+
+    Parameters
+    ----------
+    dataset_path : str
+        Path to the original BIDS dataset.
+    derivatives_root : str
+        Path to the external derivatives folder to expose as
+        ``<overlay>/derivatives``.
+    overlay_base_dir : str, optional
+        Parent directory in which to create the overlay folder.  Defaults to
+        the parent of ``derivatives_root`` (i.e. ``output_root``), which is
+        always writable because the user is already writing derivatives there.
     """
 
-    overlay_tmp = tempfile.TemporaryDirectory(prefix='megqc_bids_overlay_')
+    if overlay_base_dir is None:
+        # ``derivatives_root`` is typically ``output_root/derivatives``, so its
+        # parent is ``output_root`` — a path the caller already owns.
+        overlay_base_dir = os.path.dirname(os.path.normpath(derivatives_root))
+
+    # Use a short random suffix so concurrent runs do not collide.
+    overlay_name = f'.megqc_bids_overlay_{uuid.uuid4().hex[:8]}'
+    overlay_path = os.path.join(overlay_base_dir, overlay_name)
+
+    try:
+        overlay_tmp = _ManagedDirectory(overlay_path)
+    except OSError as exc:
+        raise OSError(
+            f"MEGqc could not create the BIDS overlay directory at "
+            f"'{overlay_path}'. Make sure '{overlay_base_dir}' is writable. "
+            f"Original error: {exc}"
+        ) from exc
+
     overlay_root = overlay_tmp.name
 
     for entry in os.listdir(dataset_path):
@@ -120,6 +181,10 @@ def build_overlay_dataset(dataset_path: str, derivatives_root: str):
             os.symlink(src, dst)
 
     os.symlink(derivatives_root, os.path.join(overlay_root, 'derivatives'))
+    print(
+        f"___MEGqc___: BIDS overlay created at '{overlay_root}' "
+        f"(inside user output directory, not system /tmp)."
+    )
     return overlay_tmp, overlay_root
 
 
@@ -2770,7 +2835,11 @@ def make_plots_meg_qc(
     # If query derivatives are not the dataset-local derivatives, build a
     # lightweight overlay so ANCPBIDS can resolve scope='derivatives/...'.
     if os.path.abspath(source_derivatives_root) != os.path.abspath(dataset_derivatives_root):
-        overlay_tmp, overlay_root = build_overlay_dataset(dataset_path, source_derivatives_root)
+        overlay_tmp, overlay_root = build_overlay_dataset(
+            dataset_path,
+            source_derivatives_root,
+            overlay_base_dir=output_root,  # always writable; avoids system /tmp
+        )
         query_base = overlay_root
         query_dataset = ancpbids.load_dataset(overlay_root, DatasetOptions(lazy_loading=True))
         print(f"___MEGqc___: Using overlay dataset for queries at: {overlay_root}")
