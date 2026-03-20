@@ -95,20 +95,37 @@ def resolve_output_roots(dataset_path: str, external_derivatives_root: Optional[
     output_root = dataset_path if external_derivatives_root is None else os.path.join(external_derivatives_root, ds_name)
     derivatives_root = os.path.join(output_root, 'derivatives')
     os.makedirs(derivatives_root, exist_ok=True)
+
+    # When output is external, seed output_root with a dataset_description.json.
+    # The plotting module loads ANCPBIDS directly from output_root (no symlink
+    # overlay) so this file must be present for schema-version detection.
+    if external_derivatives_root is not None:
+        desc_dst = os.path.join(output_root, "dataset_description.json")
+        if not os.path.exists(desc_dst):
+            desc_src = os.path.join(dataset_path, "dataset_description.json")
+            if os.path.exists(desc_src):
+                try:
+                    import shutil as _shutil
+                    _shutil.copy2(desc_src, desc_dst)
+                except OSError:
+                    pass
+            if not os.path.exists(desc_dst):
+                import json as _json
+                stub = {"Name": os.path.basename(output_root), "BIDSVersion": "1.8.0"}
+                try:
+                    with open(desc_dst, 'w', encoding='utf-8') as _fh:
+                        _json.dump(stub, _fh, indent=2)
+                except OSError:
+                    pass  # Non-fatal; ancpbids falls back gracefully.
+
     return output_root, derivatives_root
 
 
-def list_analysis_profiles(
-    dataset_path: str,
-    external_derivatives_root: Optional[str] = None,
-) -> List[str]:
-    """List available MEGqc profile IDs for one dataset.
+def _scan_profile_dir(profiles_root: str) -> List[Tuple[str, float]]:
+    """Scan one profiles directory and return ``(name, mtime)`` pairs sorted by mtime desc.
 
-    Profiles are discovered under ``derivatives/Meg_QC/profiles/<analysis_id>``.
-    Returned IDs are sorted by latest modification time first.
+    Returns an empty list when the directory does not exist.
     """
-    _, derivatives_root = resolve_output_roots(dataset_path, external_derivatives_root)
-    profiles_root = os.path.join(derivatives_root, "Meg_QC", "profiles")
     if not os.path.isdir(profiles_root):
         return []
     candidates = []
@@ -121,6 +138,47 @@ def list_analysis_profiles(
                 mtime = 0.0
             candidates.append((entry, mtime))
     candidates.sort(key=lambda item: item[1], reverse=True)
+    return candidates
+
+
+def list_analysis_profiles(
+    dataset_path: str,
+    external_derivatives_root: Optional[str] = None,
+) -> List[str]:
+    """List available MEGqc profile IDs for one dataset.
+
+    Profiles are discovered under ``derivatives/Meg_QC/profiles/<analysis_id>``.
+    Returned IDs are sorted by latest modification time first.
+
+    When an external derivatives root is provided **both** the external output
+    location and the original dataset's derivatives folder are searched.
+    External profiles take precedence; original-dataset profiles are appended
+    for any IDs not already found in the external location.
+
+    This makes profile mode work correctly for Scenario C: the user ran
+    calculation without an external path (so profiles live inside the original
+    BIDS dataset) but now wants to direct plotting reports to an external
+    output path.  Without this dual search the GUI "Load profiles" dialog shows
+    nothing and ``resolve_analysis_root`` raises ``FileNotFoundError``.
+    """
+    _, derivatives_root = resolve_output_roots(dataset_path, external_derivatives_root)
+    primary_profiles_root = os.path.join(derivatives_root, "Meg_QC", "profiles")
+    candidates = _scan_profile_dir(primary_profiles_root)
+
+    # Also search the original dataset when an external path is set and the two
+    # locations differ (covers the case where calc ran without --derivatives_output).
+    if external_derivatives_root is not None:
+        original_profiles_root = os.path.join(
+            dataset_path, "derivatives", "Meg_QC", "profiles"
+        )
+        if os.path.abspath(original_profiles_root) != os.path.abspath(primary_profiles_root):
+            original_candidates = _scan_profile_dir(original_profiles_root)
+            existing_names = {name for name, _ in candidates}
+            for name, mtime in original_candidates:
+                if name not in existing_names:
+                    candidates.append((name, mtime))
+            candidates.sort(key=lambda item: item[1], reverse=True)
+
     return [name for name, _ in candidates]
 
 

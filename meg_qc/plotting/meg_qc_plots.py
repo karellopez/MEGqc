@@ -18,7 +18,6 @@ from pathlib import Path
 import time
 from typing import Tuple, Optional
 from contextlib import contextmanager
-import uuid
 import shutil
 
 import plotly.graph_objects as go
@@ -92,100 +91,49 @@ def resolve_output_roots(
     dataset_derivatives_root = os.path.join(dataset_path, 'derivatives')
     output_derivatives_root = os.path.join(output_root, 'derivatives')
     os.makedirs(output_derivatives_root, exist_ok=True)
+
+    # When output is external, ensure output_root has a dataset_description.json
+    # so that ancpbids.load_dataset(output_root) works reliably in the plotting
+    # step (no symlink overlay required).
+    if external_derivatives_root is not None:
+        _ensure_output_root_bids_description(output_root, dataset_path)
+
     return output_root, dataset_derivatives_root, output_derivatives_root
 
 
-class _ManagedDirectory:
-    """A manually-managed directory that mimics the ``TemporaryDirectory`` interface.
+def _ensure_output_root_bids_description(output_root: str, original_dataset_path: str) -> None:
+    """Ensure output_root has a root-level dataset_description.json.
 
-    Unlike ``tempfile.TemporaryDirectory``, the directory is created at an
-    explicit, user-controlled path instead of the OS system temp location
-    (``/tmp``, ``%TEMP%``, etc.).  This avoids failures on HPC clusters and
-    organisational machines where the system temp directory is restricted,
-    quota-limited, or on a different filesystem.
+    ancpbids.load_dataset() uses this file to resolve the BIDS schema version.
+    When an external output path is used, the directory is newly created and may
+    not have this file yet.  We copy it from the original dataset; if that is not
+    possible we write a minimal stub so load_dataset() always succeeds.
+
+    This is idempotent — if the file already exists it is left untouched.
     """
+    desc_path = os.path.join(output_root, "dataset_description.json")
+    if os.path.exists(desc_path):
+        return
 
-    def __init__(self, path: str):
-        os.makedirs(path, exist_ok=True)
-        self.name = path
-
-    def cleanup(self):
+    # Prefer copying from the source dataset (preserves Name, BIDSVersion, …).
+    original_desc = os.path.join(original_dataset_path, "dataset_description.json")
+    if os.path.exists(original_desc):
         try:
-            shutil.rmtree(self.name, ignore_errors=True)
-        except Exception:
-            pass  # Best-effort cleanup; do not crash on exit.
+            shutil.copy2(original_desc, desc_path)
+            return
+        except OSError:
+            pass  # Fall through to stub creation.
 
-
-def build_overlay_dataset(
-    dataset_path: str,
-    derivatives_root: str,
-    overlay_base_dir: Optional[str] = None,
-):
-    """Create a lightweight overlay so ANCPBIDS sees external derivatives.
-
-    ANCPBIDS expects the derivatives folder to live under the dataset root. When
-    users direct outputs to an external path, we mirror the original dataset via
-    symlinks and drop a ``derivatives`` link that points to the external
-    location. All symlinks stay outside the original dataset, so read-only
-    datasets remain untouched.
-
-    The overlay directory is created under ``overlay_base_dir`` (defaults to
-    ``output_root``, i.e. the directory the user already has write access to).
-    This replaces the previous approach of writing into the OS system temp
-    directory (``/tmp``) which is frequently restricted or quota-limited on
-    servers and organisational machines.
-
-    Parameters
-    ----------
-    dataset_path : str
-        Path to the original BIDS dataset.
-    derivatives_root : str
-        Path to the external derivatives folder to expose as
-        ``<overlay>/derivatives``.
-    overlay_base_dir : str, optional
-        Parent directory in which to create the overlay folder.  Defaults to
-        the parent of ``derivatives_root`` (i.e. ``output_root``), which is
-        always writable because the user is already writing derivatives there.
-    """
-
-    if overlay_base_dir is None:
-        # ``derivatives_root`` is typically ``output_root/derivatives``, so its
-        # parent is ``output_root`` — a path the caller already owns.
-        overlay_base_dir = os.path.dirname(os.path.normpath(derivatives_root))
-
-    # Use a short random suffix so concurrent runs do not collide.
-    overlay_name = f'.megqc_bids_overlay_{uuid.uuid4().hex[:8]}'
-    overlay_path = os.path.join(overlay_base_dir, overlay_name)
-
+    # Write a minimal BIDS stub so ancpbids.load_dataset() can determine the schema.
+    ds_name = os.path.basename(os.path.normpath(output_root))
+    stub = {"Name": ds_name, "BIDSVersion": "1.8.0"}
     try:
-        overlay_tmp = _ManagedDirectory(overlay_path)
-    except OSError as exc:
-        raise OSError(
-            f"MEGqc could not create the BIDS overlay directory at "
-            f"'{overlay_path}'. Make sure '{overlay_base_dir}' is writable. "
-            f"Original error: {exc}"
-        ) from exc
+        with open(desc_path, 'w', encoding='utf-8') as fh:
+            json.dump(stub, fh, indent=2)
+    except OSError:
+        pass  # Non-fatal; ancpbids falls back to earliest schema when file missing.
 
-    overlay_root = overlay_tmp.name
 
-    for entry in os.listdir(dataset_path):
-        if entry == 'derivatives':
-            # Never point back to the original derivatives tree; we want the
-            # external one to be used instead.
-            continue
-
-        src = os.path.join(dataset_path, entry)
-        dst = os.path.join(overlay_root, entry)
-
-        if not os.path.exists(dst):
-            os.symlink(src, dst)
-
-    os.symlink(derivatives_root, os.path.join(overlay_root, 'derivatives'))
-    print(
-        f"___MEGqc___: BIDS overlay created at '{overlay_root}' "
-        f"(inside user output directory, not system /tmp)."
-    )
-    return overlay_tmp, overlay_root
 
 
 @contextmanager
@@ -2830,19 +2778,23 @@ def make_plots_meg_qc(
 
     query_dataset = dataset
     query_base = dataset_path
-    overlay_tmp = None
 
-    # If query derivatives are not the dataset-local derivatives, build a
-    # lightweight overlay so ANCPBIDS can resolve scope='derivatives/...'.
+    # When derivatives are at an external location, load ANCPBIDS directly from
+    # output_root rather than building a symlink overlay.  output_root already
+    # contains derivatives/Meg_QC/calculation/ (written by the calculation step),
+    # so a fresh load_dataset() scan will find all TSV/JSON files there natively.
+    #
+    # Advantages over the old symlink-overlay approach:
+    #   • No os.symlink() calls  →  no WinError 1314 on locked-down Windows
+    #   • No temp directory or cleanup required
+    #   • Simpler code path, same result
     if os.path.abspath(source_derivatives_root) != os.path.abspath(dataset_derivatives_root):
-        overlay_tmp, overlay_root = build_overlay_dataset(
-            dataset_path,
-            source_derivatives_root,
-            overlay_base_dir=output_root,  # always writable; avoids system /tmp
-        )
-        query_base = overlay_root
-        query_dataset = ancpbids.load_dataset(overlay_root, DatasetOptions(lazy_loading=True))
-        print(f"___MEGqc___: Using overlay dataset for queries at: {overlay_root}")
+        # dataset_description.json at output_root is guaranteed by resolve_output_roots
+        # (called earlier) but we double-check here in case plotting runs standalone.
+        _ensure_output_root_bids_description(output_root, dataset_path)
+        query_base = output_root
+        query_dataset = ancpbids.load_dataset(output_root, DatasetOptions(lazy_loading=True))
+        print(f"___MEGqc___: External output detected. Loading ANCPBIDS from output_root: {output_root}")
 
     calculated_derivs_folder = os.path.join(
         'derivatives', 'Meg_QC', *analysis_segments, 'calculation'
@@ -3005,10 +2957,9 @@ def make_plots_meg_qc(
         print("---------------------------------------------------------------")
         print("---------------------------------------------------------------")
         print(f"PLOTTING MODULE FINISHED. Elapsed time: {elapsed_seconds:.2f} seconds.")
-    finally:
-        # Ensure the temporary overlay is cleaned up.
-        if overlay_tmp is not None:
-            overlay_tmp.cleanup()
+    except Exception as e:
+        print(f"___MEGqc___: ERROR in plotting module: {e}")
+        raise
     return
 
 
