@@ -459,7 +459,7 @@ def _metric_to_report_section(metric: str) -> Optional[str]:
         return "MUSCLE"
     if "HEAD" in metric_upper:
         return "HEAD"
-    if "STIM" in metric_upper:
+    if "STIM" in metric_upper or "EVENTSUMMARY" in metric_upper:
         return "STIMULUS"
     return None
 
@@ -2697,14 +2697,34 @@ def process_subject(
             if (not derivatives) and (not metric_note):
                 continue
 
-            metrics_payload[metric].append(
-                {
-                    "run_label": run_label,
-                    "derivatives": derivatives,
-                    "metric_note": metric_note,
-                    "source_paths": tsv_paths,
-                }
-            )
+            # EventSummary derivatives map to STIMULUS section — merge them
+            # into the 'stimulus' payload bucket so everything appears on the
+            # same Stimulus tab rather than creating a separate hidden tab.
+            payload_key = 'stimulus' if metric == 'EventSummary' else metric
+
+            # Check if an entry for this run already exists in the payload
+            existing_entry = None
+            for entry in metrics_payload.get(payload_key, []):
+                if entry["run_label"] == run_label:
+                    existing_entry = entry
+                    break
+
+            if existing_entry is not None:
+                # Merge: prepend new derivatives (summary tables should come
+                # first) and combine metric notes
+                existing_entry["derivatives"] = derivatives + existing_entry["derivatives"]
+                if metric_note and metric_note not in existing_entry.get("metric_note", ""):
+                    existing_entry["metric_note"] = metric_note + existing_entry.get("metric_note", "")
+                existing_entry["source_paths"] = existing_entry.get("source_paths", []) + tsv_paths
+            else:
+                metrics_payload[payload_key].append(
+                    {
+                        "run_label": run_label,
+                        "derivatives": derivatives,
+                        "metric_note": metric_note,
+                        "source_paths": tsv_paths,
+                    }
+                )
 
     # Emit one subject-level HTML report.
     report_html = _build_subject_report_html(
@@ -2860,6 +2880,7 @@ def make_plots_meg_qc(
 
     # And now you can append or pop, etc.
     chosen_entities['METRIC'].append('stimulus')
+    chosen_entities['METRIC'].append('EventSummary')
     chosen_entities['METRIC'].append('RawInfo')
     chosen_entities['METRIC'].append('ReportStrings')
     # Ensure SimpleMetrics is always present so that summary reports can be built

@@ -1285,12 +1285,13 @@ def plot_heatmap_sorted_channels_windows(
         else:
             base_summary = np.nanmedian(base, axis=1)
     order = np.argsort(np.nan_to_num(base_summary, nan=-np.inf))[::-1]
+    natural_order = np.arange(n_rows, dtype=int)
 
     row_keep = _downsample_indices(n_rows, MAX_HEATMAP_CHANNELS)
     col_keep = _downsample_indices(n_cols, MAX_HEATMAP_WINDOWS)
 
-    def _payload_for(arr: np.ndarray) -> Dict[str, np.ndarray]:
-        arr_sorted = arr[order, :]
+    def _payload_for(arr: np.ndarray, ch_order: np.ndarray) -> Dict[str, np.ndarray]:
+        arr_sorted = arr[ch_order, :]
         z = arr_sorted[row_keep][:, col_keep]
         x = np.arange(n_cols, dtype=int)[col_keep]
         y = np.arange(n_rows, dtype=int)[row_keep]
@@ -1311,7 +1312,7 @@ def plot_heatmap_sorted_channels_windows(
             right_q95 = np.nanquantile(arr_sorted[row_keep, :], 0.95, axis=1)
             right_mean = np.nanmean(arr_sorted[row_keep, :], axis=1)
 
-        sorted_names = base_channel_names[order]
+        sorted_names = base_channel_names[ch_order]
         row_names = sorted_names[row_keep]
         heat_custom = np.tile(np.asarray(row_names, dtype=object)[:, None], (1, x.size))
 
@@ -1335,7 +1336,9 @@ def plot_heatmap_sorted_channels_windows(
             "right_mean": right_mean,
         }
 
-    payload_by_label = {label: _payload_for(padded[label]) for label in ordered_labels}
+    payload_by_label = {label: _payload_for(padded[label], order) for label in ordered_labels}
+    # Natural-order payloads for the channel order toggle.
+    nat_payload_by_label = {label: _payload_for(padded[label], natural_order) for label in ordered_labels}
     z_all = np.concatenate(
         [vals["z"][np.isfinite(vals["z"])] for vals in payload_by_label.values() if np.any(np.isfinite(vals["z"]))],
         axis=0,
@@ -1574,6 +1577,48 @@ def plot_heatmap_sorted_channels_windows(
         )
     )
 
+    # ── Channel order toggle (sorted vs natural) ─────────────────────────
+    # The active (default) variant is whichever label is currently rendered.
+    active_label = ordered_labels[0]
+    sorted_full = _variant_restyle_args(payload_by_label[active_label])
+    natural_full = _variant_restyle_args(nat_payload_by_label[active_label])
+    menus.append(
+        dict(
+            type="buttons",
+            direction="right",
+            x=0.00,
+            y=-0.74,
+            xanchor="left",
+            yanchor="top",
+            showactive=True,
+            bgcolor="#FFF8E1",
+            bordercolor="#D4A017",
+            borderwidth=1.8,
+            font=dict(size=14, color="#7B6B1A"),
+            pad=dict(r=16, t=10, l=14, b=10),
+            buttons=[
+                dict(
+                    label="   Channels: Sorted (high→low)   ",
+                    method="update",
+                    args=[
+                        sorted_full,
+                        {"yaxis3.title.text": "Sorted channel index"},
+                        trace_indices,
+                    ],
+                ),
+                dict(
+                    label="   Channels: Natural order   ",
+                    method="update",
+                    args=[
+                        natural_full,
+                        {"yaxis3.title.text": "Channel index (original)"},
+                        trace_indices,
+                    ],
+                ),
+            ],
+        )
+    )
+
     fig.update_xaxes(showticklabels=False, row=1, col=1)
     fig.update_yaxes(title_text=side_title, row=1, col=1, automargin=True, title_standoff=10)
     fig.update_xaxes(title_text="Epoch index", row=2, col=1)
@@ -1586,8 +1631,8 @@ def plot_heatmap_sorted_channels_windows(
     fig.update_layout(
         title={"text": title, "x": 0.5, "y": 0.97, "xanchor": "center", "yanchor": "top"},
         template="plotly_white",
-        margin={"l": 70, "r": 55, "t": 165, "b": 340},
-        height=980,
+        margin={"l": 70, "r": 55, "t": 165, "b": 400},
+        height=1020,
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.06, "xanchor": "left", "x": 0},
         coloraxis={
             "colorscale": "Viridis",

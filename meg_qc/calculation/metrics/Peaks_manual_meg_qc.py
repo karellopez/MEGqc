@@ -192,7 +192,7 @@ def get_ptp_epochs(channels: List, epochs_mg: mne.Epochs, sfreq: int, ptp_thresh
 
 def make_simple_metric_ptp_manual(ptp_manual_params: dict, big_ptp_with_value_all_data: dict,
                                   small_ptp_with_value_all_data: dict, channels: dict, deriv_epoch_ptp: dict,
-                                  metric_local: bool, m_or_g_chosen: List):
+                                  metric_local: bool, m_or_g_chosen: List, onset_times: list=None):
     """
     Create a simple metric for peak-to-peak amplitude. 
     Global: The metric is calculated for all data (not epoched) and 
@@ -242,7 +242,8 @@ def make_simple_metric_ptp_manual(ptp_manual_params: dict, big_ptp_with_value_al
                                                                    deriv_epoch_ptp[m_or_g][1].content,
                                                                    deriv_epoch_ptp[m_or_g][2].content,
                                                                    percent_noisy_flat_allowed=ptp_manual_params[
-                                                                       'allow_percent_noisy_flat_epochs'])
+                                                                       'allow_percent_noisy_flat_epochs'],
+                                                                   onset_times=onset_times)
             # deriv_epoch_std[m_or_g][1].content is df with big std(noisy), df_epoch_std[m_or_g][2].content is df with small std(flat)
         else:
             metric_local_content[m_or_g] = None
@@ -352,7 +353,8 @@ def PP_manual_meg_qc(
 
     simple_metric_ptp_manual = make_simple_metric_ptp_manual(ptp_manual_params, big_ptp_with_value_all_data,
                                                              small_ptp_with_value_all_data, channels,
-                                                             noisy_flat_epochs_derivs, metric_local, m_or_g_chosen)
+                                                             noisy_flat_epochs_derivs, metric_local, m_or_g_chosen,
+                                                             onset_times=dict_epochs_mg.get('epoch_onset_times_s'))
 
     # Extract chs_by_lobe into a data frame
     df_deriv = chs_dict_to_csv(chs_by_lobe_ptp, file_name_prefix='PtPsManual')

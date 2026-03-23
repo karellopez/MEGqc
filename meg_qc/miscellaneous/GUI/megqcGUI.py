@@ -306,6 +306,11 @@ class SettingsEditorDialog(QDialog):
         ("GENERAL", "data_crop_tmax"),
     }
 
+    # Fields that accept either an integer value OR the literal "False" to disable the feature.
+    _INT_OR_FALSE_KEYS = {
+        ("Filtering", "downsample_to_hz"),
+    }
+
     def __init__(self, source_path: Union[str, Path], defaults_path: Union[str, Path], title: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -373,6 +378,9 @@ class SettingsEditorDialog(QDialog):
         scroll.setWidget(container)
         root.addWidget(scroll)
 
+        # Wire apply_filtering toggle AFTER all widgets are built
+        self._wire_apply_filtering_toggle()
+
         btn_row = QHBoxLayout()
         self.btn_reset = QPushButton("Reset to defaults")
         self.btn_reset.clicked.connect(self._reset_to_defaults)
@@ -387,6 +395,29 @@ class SettingsEditorDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    def _wire_apply_filtering_toggle(self):
+        """
+        When 'apply_filtering' is unchecked, gray-out the filter frequency and
+        method fields so the user understands they have no effect.
+        Downsampling remains independently controllable.
+        """
+        if ("Filtering", "apply_filtering") not in self.widgets:
+            return
+        chk_widget, _ = self.widgets[("Filtering", "apply_filtering")]
+        # These keys only make sense when filtering is on
+        filter_dependent_keys = ["l_freq", "h_freq", "method"]
+
+        def _set_enabled(state):
+            enabled = bool(state)
+            for k in filter_dependent_keys:
+                if ("Filtering", k) in self.widgets:
+                    w, _ = self.widgets[("Filtering", k)]
+                    w.setEnabled(enabled)
+
+        chk_widget.stateChanged.connect(_set_enabled)
+        # Apply initial state on dialog open
+        _set_enabled(chk_widget.isChecked())
 
     def _ordered_sections(self) -> List[str]:
         sections = list(self.config.sections())
@@ -459,7 +490,7 @@ class SettingsEditorDialog(QDialog):
             combo.setMaximumWidth(205)
             return combo, "enum"
 
-        if val.lower() in {"true", "false"}:
+        if val.lower() in {"true", "false"} and sec_key not in self._INT_OR_FALSE_KEYS:
             chk = QCheckBox()
             chk.setChecked(val.lower() == "true")
             return chk, "bool"
@@ -470,6 +501,35 @@ class SettingsEditorDialog(QDialog):
             line.setMinimumWidth(145)
             line.setMaximumWidth(215)
             return line, "text"
+
+        if sec_key in self._INT_OR_FALSE_KEYS:
+            container = QWidget()
+            lay = QHBoxLayout(container)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(6)
+            chk = QCheckBox("enable")
+            spin = QSpinBox()
+            spin.setRange(1, 1_000_000)
+            spin.setMinimumWidth(100)
+            spin.setMaximumWidth(170)
+            spin.setSuffix(" Hz")
+            is_disabled = val.strip().lower() in ("false", "0", "no", "none", "")
+            if is_disabled:
+                chk.setChecked(False)
+                spin.setValue(1000)
+                spin.setEnabled(False)
+            else:
+                try:
+                    spin.setValue(int(val.strip()))
+                except (ValueError, TypeError):
+                    spin.setValue(1000)
+                chk.setChecked(True)
+                spin.setEnabled(True)
+            chk.stateChanged.connect(lambda state, s=spin: s.setEnabled(bool(state)))
+            lay.addWidget(chk)
+            lay.addWidget(spin)
+            container.setProperty("int_or_false_widgets", (chk, spin))
+            return container, "int_or_false"
 
         if val == "":
             line = QLineEdit("")
@@ -520,6 +580,9 @@ class SettingsEditorDialog(QDialog):
             return str(widget.currentText())
         if widget_type == "bool":
             return "True" if widget.isChecked() else "False"
+        if widget_type == "int_or_false":
+            chk, spin = widget.property("int_or_false_widgets")
+            return str(spin.value()) if chk.isChecked() else "False"
         if widget_type == "int":
             return str(int(widget.value()))
         if widget_type == "float":
@@ -558,6 +621,20 @@ class SettingsEditorDialog(QDialog):
                     widget.setValue(int(val))
                 except Exception:
                     pass
+            elif widget_type == "int_or_false":
+                chk, spin = widget.property("int_or_false_widgets")
+                is_disabled = val.strip().lower() in ("false", "0", "no", "none", "")
+                if is_disabled:
+                    chk.setChecked(False)
+                    spin.setValue(1000)
+                    spin.setEnabled(False)
+                else:
+                    try:
+                        spin.setValue(int(val.strip()))
+                    except Exception:
+                        spin.setValue(1000)
+                    chk.setChecked(True)
+                    spin.setEnabled(True)
             elif widget_type == "float":
                 try:
                     widget.setValue(float(val))

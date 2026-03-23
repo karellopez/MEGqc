@@ -1059,6 +1059,7 @@ def process_one_subject(
          raw,
          info_derivs,
          stim_deriv,
+         event_summary_deriv,
          shielding_str,
          epoching_str,
          sensors_derivs,
@@ -1312,7 +1313,9 @@ def process_one_subject(
             'EOG': eog_str,
             'HEAD': head_str,
             'MUSCLE': muscle_str,
-            'STIMULUS': 'If the data was cropped for this calculation, the stimulus data is also cropped.'
+            'STIMULUS': epoching_str + ('<p>If the data was cropped for this calculation, '
+                        'the stimulus data is also cropped.</p>'
+                        if all_qc_params['default'].get('crop_tmax') else '')
         }
 
         # Embed per-metric error summaries into the report strings so that
@@ -1332,6 +1335,7 @@ def process_one_subject(
         QC_derivs = {
             'Raw info': info_derivs,
             'Stimulus channels': stim_deriv,
+            'Event summary': event_summary_deriv,
             'Report_strings': report_str_derivs,
             'Sensors locations': sensors_derivs,
             'Standard deviation of the data': std_derivs,
@@ -1404,9 +1408,9 @@ def process_one_subject(
 
             del (meg_system, dict_epochs_mg, chs_by_lobe, channels,
                  raw_cropped_filtered, raw_cropped_filtered_resampled,
-                 raw_cropped, info_derivs, stim_deriv, shielding_str,
-                 epoching_str, sensors_derivs, m_or_g_chosen, m_or_g_skipped_str,
-                 lobes_color_coding_str, resample_str)
+                 raw_cropped, info_derivs, stim_deriv, event_summary_deriv,
+                 shielding_str, epoching_str, sensors_derivs, m_or_g_chosen,
+                 m_or_g_skipped_str, lobes_color_coding_str, resample_str)
             gc.collect()
             print('REMOVING TRASH: SUCCEEDED')
         except Exception:

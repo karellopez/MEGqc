@@ -99,12 +99,24 @@ def get_all_config_params(config_file_path: str):
         except:
             hfreq = None
 
+        try:
+            downsample_val = filtering_section.getint('downsample_to_hz')
+        except (ValueError, TypeError):
+            # Allows setting downsample_to_hz = False in the config to skip resampling
+            raw_val = filtering_section.get('downsample_to_hz', '').strip().lower()
+            downsample_val = False if raw_val in ('false', '0', 'no', 'none', '') else None
+            if downsample_val is None:
+                raise ValueError(
+                    f"Invalid value for 'downsample_to_hz' in config: '{filtering_section.get('downsample_to_hz')}'. "
+                    f"Expected an integer (e.g. 1000) or False to skip resampling."
+                )
+
         all_qc_params['Filtering'] = dict({
             'apply_filtering': filtering_section.getboolean('apply_filtering'),
             'l_freq': lfreq,
             'h_freq': hfreq,
             'method': filtering_section['method'],
-            'downsample_to_hz': filtering_section.getint('downsample_to_hz')})
+            'downsample_to_hz': downsample_val})
 
         epoching_section = config['Epoching']
         stim_channel = epoching_section['stim_channel']
@@ -113,11 +125,23 @@ def get_all_config_params(config_file_path: str):
         if stim_channel == ['']:
             stim_channel = None
 
+        # preferred_stim_channels: combined trigger channels preferred over individual bit channels.
+        # Split on comma, strip surrounding whitespace from each token, preserve internal spaces
+        # (e.g. "STI 101" is a valid channel name with an internal space).
+        preferred_raw = epoching_section.get('preferred_stim_channels', '')
+        preferred_stim_channels = [c.strip() for c in preferred_raw.split(',') if c.strip()]
+
+        # noisy_stim_channels: channels known to carry DC-offset noise rather than real events.
+        noisy_raw = epoching_section.get('noisy_stim_channels', '')
+        noisy_stim_channels = [c.strip() for c in noisy_raw.split(',') if c.strip()]
+
         epoching_params = dict({
             'event_dur': epoching_section.getfloat('event_dur'),
             'epoch_tmin': epoching_section.getfloat('epoch_tmin'),
             'epoch_tmax': epoching_section.getfloat('epoch_tmax'),
             'stim_channel': stim_channel,
+            'preferred_stim_channels': preferred_stim_channels,
+            'noisy_stim_channels': noisy_stim_channels,
             'event_repeated': epoching_section['event_repeated'],
             'use_fixed_length_epochs': epoching_section.getboolean('use_fixed_length_epochs'),
             'fixed_epoch_duration': epoching_section.getfloat('fixed_epoch_duration'),
@@ -311,23 +335,34 @@ def get_internal_config_params(config_file_name: str):
     return internal_qc_params
 
 
-def stim_data_to_df(raw: mne.io.Raw):
+def stim_data_to_df(raw: mne.io.Raw, epoching_params: dict = None):
     """
     Extract stimulus data from MEG data and put it into a pandas DataFrame.
+    Also compute per-channel event counts using ``mne.find_events`` for later
+    comparison with BIDS ``*_events.tsv``.
 
     Parameters
     ----------
     raw : mne.io.Raw
         MEG data.
+    epoching_params : dict, optional
+        Epoching parameters dict (used for ``event_dur``).  When *None*,
+        a default minimum duration of 0.002 s is used.
 
     Returns
     -------
     stim_deriv : list
-        List with QC_derivative object with stimulus data.
-
+        List with QC_derivative object with stimulus time-series data.
+    stim_channel_event_counts : dict
+        ``{channel_name: {event_id: count, ...}, ...}`` for every stim channel.
     """
 
+    event_dur = 0.002
+    if epoching_params is not None:
+        event_dur = epoching_params.get('event_dur', event_dur)
+
     stim_channels = mne.pick_types(raw.info, stim=True)
+    stim_channel_event_counts = {}
 
     if len(stim_channels) == 0:
         print('___MEGqc___: ', 'No stimulus channels found.')
@@ -340,15 +375,205 @@ def stim_data_to_df(raw: mne.io.Raw):
         stim_df = pd.DataFrame(stim_data.T, columns=stim_channel_names)
         stim_df['time'] = times
 
+        # Compute per-channel event counts (safe per channel)
+        for ch_name in stim_channel_names:
+            try:
+                ev = mne.find_events(
+                    raw, stim_channel=ch_name,
+                    min_duration=event_dur, uint_cast=True, verbose=False,
+                )
+                ids, counts = np.unique(ev[:, 2], return_counts=True)
+                stim_channel_event_counts[ch_name] = {
+                    int(eid): int(cnt) for eid, cnt in zip(ids, counts)
+                }
+            except Exception:
+                stim_channel_event_counts[ch_name] = {}
+
     # save df as QC_derivative object
     stim_deriv = [QC_derivative(stim_df, 'stimulus', 'df')]
 
-    return stim_deriv
+    return stim_deriv, stim_channel_event_counts
 
 
-def Epoch_meg(epoching_params, data: mne.io.Raw):
+
+def _read_bids_events_tsv(file_path: str, data: mne.io.Raw):
+    """
+    Look for a BIDS *_events.tsv file alongside the MEG file and convert it to
+    an MNE events array (shape N×3: [abs_sample, 0, event_id]).
+
+    Returns
+    -------
+    events : np.ndarray or None
+    tsv_path : str or None
+    id_to_trial_type : dict  {int event_id → str trial_type label} or {}
+    """
+    import re
+    tsv_path = re.sub(
+        r'(_meg)?\.(fif|fif\.gz|raw|raw\.gz|set|edf|bdf\.gz|bdf|mff|nxe|ds|sqd|con)$',
+        '_events.tsv',
+        file_path,
+        flags=re.IGNORECASE,
+    )
+    if tsv_path == file_path or not os.path.exists(tsv_path):
+        return None, None, {}
+
+    try:
+        df = pd.read_csv(tsv_path, sep='\t')
+        if 'onset' not in df.columns:
+            return None, None, {}
+
+        sfreq = data.info['sfreq']
+        first_samp = data.first_samp
+
+        id_to_trial_type = {}
+
+        # Event IDs: prefer numeric 'value', else encode 'trial_type' strings
+        if 'value' in df.columns:
+            event_vals = pd.to_numeric(df['value'], errors='coerce').fillna(0).astype(int).values
+            # Build id → trial_type from TSV if both columns present
+            if 'trial_type' in df.columns:
+                for val, tt in zip(event_vals, df['trial_type'].fillna('').values):
+                    if val not in id_to_trial_type and tt:
+                        id_to_trial_type[int(val)] = str(tt)
+        elif 'trial_type' in df.columns:
+            unique_types = {t: i + 1 for i, t in enumerate(df['trial_type'].dropna().unique())}
+            event_vals = df['trial_type'].map(unique_types).fillna(0).astype(int).values
+            id_to_trial_type = {v: k for k, v in unique_types.items()}
+            print('___MEGqc___: BIDS events TSV trial_type → id mapping:', unique_types)
+        else:
+            event_vals = np.ones(len(df), dtype=int)
+
+        onset_samples = (np.round(df['onset'].values * sfreq) + first_samp).astype(int)
+
+        valid = (onset_samples >= first_samp) & (onset_samples <= data.last_samp)
+        onset_samples = onset_samples[valid]
+        event_vals = event_vals[valid]
+
+        if len(onset_samples) == 0:
+            return None, None, {}
+
+        events = np.column_stack([
+            onset_samples,
+            np.zeros(len(onset_samples), dtype=int),
+            event_vals,
+        ]).astype(int)
+
+        print(f'___MEGqc___: BIDS events TSV: {tsv_path} → {len(events)} events, '
+              f'IDs={np.unique(events[:, 2]).tolist()}')
+        return events, tsv_path, id_to_trial_type
+
+    except Exception as exc:
+        print(f'___MEGqc___: Could not read BIDS events TSV ({tsv_path}): {exc}')
+        return None, None, {}
+
+
+def _build_epoch_summary_html(event_summary: dict) -> str:
+    """
+    Build an HTML summary of the epoching result from the event_summary dict
+    returned by Epoch_meg.
+
+    Parameters
+    ----------
+    event_summary : dict
+        As returned by Epoch_meg — keys: source, id_to_trial_type,
+        count_before_merge, count_after_merge, total_before_merge,
+        total_after_merge, dropped_count, all_ids.
+
+    Returns
+    -------
+    str
+        HTML string ready to embed in the subject report.
+    """
+    if not event_summary:
+        return ''
+
+    source = event_summary.get('source', 'unknown')
+    source_labels = {
+        'bids_tsv':     'BIDS <code>*_events.tsv</code> file',
+        'find_events':  'stimulus channel (mne.find_events)',
+        'fixed_length': 'fixed-length segmentation (no event channel)',
+    }
+    source_label = source_labels.get(source, source)
+
+    id_to_trial_type = event_summary.get('id_to_trial_type', {})
+    count_before = event_summary.get('count_before_merge', {})
+    count_after  = event_summary.get('count_after_merge',  {})
+    all_ids      = event_summary.get('all_ids', [])
+    total_before = event_summary.get('total_before_merge', 0)
+    total_after  = event_summary.get('total_after_merge',  0)
+    dropped      = event_summary.get('dropped_count', 0)
+
+    html = f'<p><b>Event source:</b> {source_label}</p>'
+    html += (
+        f'<p><b>Events detected:</b> {total_before} &nbsp;&#8594;&nbsp; '
+        f'<b>Epochs used:</b> {total_after}'
+    )
+    if dropped:
+        html += (
+            f' &nbsp; (<b>{dropped}</b> event(s) dropped or merged because of '
+            f'overlapping onset times — see <code>event_repeated</code> setting)'
+        )
+    html += '</p>'
+
+    # Per-ID table (skip for fixed-length where IDs are synthetic)
+    if all_ids and source != 'fixed_length':
+        table_style = (
+            'border-collapse:collapse;font-size:0.9em;'
+            'margin-top:4px;margin-bottom:8px;'
+        )
+        th_style = (
+            'background:#f0f0f0;padding:4px 10px;'
+            'border:1px solid #bbb;text-align:center;'
+        )
+        td_style = 'padding:3px 10px;border:1px solid #bbb;text-align:center;'
+
+        html += f'<table style="{table_style}">'
+        html += (
+            f'<thead><tr>'
+            f'<th style="{th_style}">Event ID</th>'
+            f'<th style="{th_style}">Trial type / label</th>'
+            f'<th style="{th_style}">Events detected</th>'
+            f'<th style="{th_style}">Epochs used (after merge)</th>'
+            f'</tr></thead><tbody>'
+        )
+        for eid in all_ids:
+            # id_to_trial_type keys may be int or str depending on the source
+            label = (id_to_trial_type.get(eid)
+                     or id_to_trial_type.get(str(eid), ''))
+            n_before = (count_before.get(eid)
+                        or count_before.get(str(eid), 0))
+            n_after  = (count_after.get(eid)
+                        or count_after.get(str(eid), 0))
+            html += (
+                f'<tr>'
+                f'<td style="{td_style}">{eid}</td>'
+                f'<td style="{td_style}">{label}</td>'
+                f'<td style="{td_style}">{n_before}</td>'
+                f'<td style="{td_style}">{n_after}</td>'
+                f'</tr>'
+            )
+        # Totals row
+        html += (
+            f'<tr style="font-weight:bold;background:#f7f7f7;">'
+            f'<td style="{td_style}" colspan="2">Total</td>'
+            f'<td style="{td_style}">{total_before}</td>'
+            f'<td style="{td_style}">{total_after}</td>'
+            f'</tr>'
+        )
+        html += '</tbody></table>'
+
+    return html
+
+
+def Epoch_meg(epoching_params, data: mne.io.Raw, file_path: str = None):
     """
     Epoch MEG data based on the parameters provided in the config file.
+
+    Event detection priority:
+    1. BIDS *_events.tsv alongside the MEG file (most reliable).
+    2. mne.find_events on the best available stim channel
+       (prefers combined channels like STI101; excludes known-noisy channels).
+    3. Fixed-length epochs (fallback when use_fixed_length_epochs=True).
 
     Parameters
     ----------
@@ -356,13 +581,15 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
         Dictionary with parameters for epoching.
     data : mne.io.Raw
         MEG data to be epoched.
+    file_path : str, optional
+        Path to the original MEG file, used to locate the BIDS events TSV.
 
     Returns
     -------
     dict_epochs_mg : dict
-        Dictionary with epochs for each channel type: mag, grad.
-
+        Keys: 'mag', 'grad', 'epoching_mode', 'epoch_onset_times_s', 'event_summary'
     """
+    from collections import Counter
 
     event_dur = epoching_params['event_dur']
     epoch_tmin = epoching_params['epoch_tmin']
@@ -373,89 +600,163 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
     fixed_epoch_overlap = epoching_params['fixed_epoch_overlap']
     min_event_count = 2 if use_fixed_length_epochs else 1
 
+    # Build case-insensitive sets from config lists (fall back to empty sets if keys are absent)
+    _preferred = {ch.upper() for ch in epoching_params.get('preferred_stim_channels', [])}
+    _noisy = {ch.upper() for ch in epoching_params.get('noisy_stim_channels', [])}
+
+    user_specified_stim = stim_channel is not None
+
     if stim_channel is None:
         picks_stim = mne.pick_types(data.info, stim=True)
-        stim_channel = []
-        for ch in picks_stim:
-            stim_channel.append(data.info['chs'][ch]['ch_name'])
-    print('___MEGqc___: ', 'Stimulus channels detected:', stim_channel)
+        stim_channel = [data.info['chs'][ch]['ch_name'] for ch in picks_stim]
+    print('___MEGqc___: ', 'Stimulus channels available:', stim_channel)
 
     picks_magn = data.copy().pick('mag').ch_names if 'mag' in data else None
     picks_grad = data.copy().pick('grad').ch_names if 'grad' in data else None
 
-    if not stim_channel:
-        print('___MEGqc___: ',
-              'No stimulus channel detected. Setting stimulus channel to None to allow mne to detect events autamtically.')
-        stim_channel = None
-        # here for info on how None is handled by mne: https://mne.tools/stable/generated/mne.find_events.html
-        # even if stim is None, mne will check once more when creating events.
-
     epochs_grad, epochs_mag = None, None
     epoching_mode = 'stim'
+    # Track raw events array (before Epochs applies event_repeated / boundary drop)
+    # so we can report "n events before merge" separately from "n epochs used".
+    _raw_events = None
+    _id_to_trial_type = {}
 
     def _make_fixed_length_epochs(picks, channel_type):
-        """Create fixed-length epochs for a channel type when no stim events are available."""
         if fixed_epoch_duration <= 0:
-            print('___MEGqc___: ',
-                  'Fixed-length epoch duration must be positive. No fixed-length epoching will be done.')
+            print('___MEGqc___: Fixed-length epoch duration must be positive.')
             return None
         if fixed_epoch_overlap < 0:
-            print('___MEGqc___: ',
-                  'Fixed-length epoch overlap must be >= 0. No fixed-length epoching will be done.')
+            print('___MEGqc___: Fixed-length epoch overlap must be >= 0.')
             return None
         if fixed_epoch_overlap >= fixed_epoch_duration:
-            print('___MEGqc___: ',
-                  'Fixed-length epoch overlap must be smaller than duration. No fixed-length epoching will be done.')
+            print('___MEGqc___: Fixed-length epoch overlap must be smaller than duration.')
             return None
-
         epochs = mne.make_fixed_length_epochs(
-            data,
-            duration=fixed_epoch_duration,
-            overlap=fixed_epoch_overlap,
-            preload=True)
+            data, duration=fixed_epoch_duration, overlap=fixed_epoch_overlap, preload=True)
         if picks:
             epochs.pick(picks)
-        print('___MEGqc___: ',
-              f'Fixed-length epochs created for {channel_type}: {len(epochs)} epochs.')
+        print(f'___MEGqc___: Fixed-length epochs created for {channel_type}: {len(epochs)} epochs.')
         return epochs
 
     def _apply_fixed_length_fallback(reason):
         if not use_fixed_length_epochs:
             print('___MEGqc___: ', reason)
             return
-        print('___MEGqc___: ', f'{reason} Falling back to fixed-length epoching.')
+        print(f'___MEGqc___: {reason} Falling back to fixed-length epoching.')
         nonlocal epoching_mode, epochs_mag, epochs_grad
         epoching_mode = 'fixed_length'
         epochs_mag = _make_fixed_length_epochs(picks_magn, 'magnetometers')
         epochs_grad = _make_fixed_length_epochs(picks_grad, 'gradiometers')
 
-    if stim_channel is None:
-        _apply_fixed_length_fallback('No stimulus channels detected.')
+    def _make_stim_epochs(events):
+        nonlocal epochs_mag, epochs_grad
+        epochs_mag = mne.Epochs(data, events, picks=picks_magn, tmin=epoch_tmin, tmax=epoch_tmax,
+                                preload=True, baseline=None,
+                                event_repeated=epoching_params['event_repeated'])
+        epochs_grad = mne.Epochs(data, events, picks=picks_grad, tmin=epoch_tmin, tmax=epoch_tmax,
+                                 preload=True, baseline=None,
+                                 event_repeated=epoching_params['event_repeated'])
+        print(f'___MEGqc___: Epochs created — mag: {len(epochs_mag)}, grad: {len(epochs_grad)}')
+
+    # ── 1. Try BIDS events TSV (most reliable) ────────────────────────────────
+    bids_events = None
+    if file_path is not None and not user_specified_stim:
+        bids_events, bids_tsv, _id_to_trial_type = _read_bids_events_tsv(file_path, data)
+
+    if bids_events is not None and len(bids_events) >= min_event_count:
+        print(f'___MEGqc___: Using BIDS events TSV ({len(bids_events)} events).')
+        _raw_events = bids_events
+        _make_stim_epochs(bids_events)
     else:
-        try:
-            events = mne.find_events(data, stim_channel=stim_channel, min_duration=event_dur)
+        # ── 2. mne.find_events fallback ───────────────────────────────────────
+        if not stim_channel:
+            _apply_fixed_length_fallback('No stimulus channels detected.')
+        else:
+            if not user_specified_stim:
+                clean = [ch for ch in stim_channel if ch.upper() not in _noisy]
+                preferred = [ch for ch in clean if ch.upper() in _preferred]
+                if preferred:
+                    stim_channel = preferred
+                    print(f'___MEGqc___: Using preferred stim channel(s): {stim_channel}')
+                elif clean:
+                    stim_channel = clean
+                    print(f'___MEGqc___: Using stim channel(s) (noise channels excluded): {stim_channel}')
+                else:
+                    print(f'___MEGqc___: Warning — only noisy stim channels found; trying anyway: {stim_channel}')
+            try:
+                events = mne.find_events(data, stim_channel=stim_channel,
+                                         min_duration=event_dur, uint_cast=True, verbose=False)
+                print(f'___MEGqc___: find_events → {len(events)} events, '
+                      f'IDs={np.unique(events[:, 2]).tolist() if len(events) else []}')
+                if len(events) < min_event_count:
+                    _apply_fixed_length_fallback(
+                        f'Only {len(events)} event(s) found (minimum required: {min_event_count}).')
+                else:
+                    _raw_events = events
+                    _make_stim_epochs(events)
+            except Exception as exc:
+                _apply_fixed_length_fallback(f'mne.find_events failed ({exc}).')
 
-            if len(events) < min_event_count:
-                _apply_fixed_length_fallback(
-                    f'Only {len(events)} event(s) were found using all stimulus channels '
-                    f'(minimum required: {min_event_count}).'
-                )
-            else:
-                print('___MEGqc___: ', 'Events found:', len(events))
-                epochs_mag = mne.Epochs(data, events, picks=picks_magn, tmin=epoch_tmin, tmax=epoch_tmax,
-                                        preload=True, baseline=None, event_repeated=epoching_params['event_repeated'])
-                epochs_grad = mne.Epochs(data, events, picks=picks_grad, tmin=epoch_tmin, tmax=epoch_tmax,
-                                         preload=True, baseline=None, event_repeated=epoching_params['event_repeated'])
+    # ── Build per-ID event summary ─────────────────────────────────────────────
+    # count_before_merge: from the raw events array before mne.Epochs drops anything
+    # count_after_merge: from epochs.events after boundary-drop + event_repeated handling
+    ep_ref = epochs_mag if epochs_mag is not None else epochs_grad
+    if _raw_events is not None and len(_raw_events):
+        count_before = dict(Counter(int(x) for x in _raw_events[:, 2]))
+    else:
+        count_before = {}
 
-        except Exception:
-            _apply_fixed_length_fallback('No stim channels detected, no events found.')
+    if ep_ref is not None and hasattr(ep_ref, 'events') and len(ep_ref.events):
+        count_after = dict(Counter(int(x) for x in ep_ref.events[:, 2]))
+    elif epoching_mode == 'fixed_length' and ep_ref is not None:
+        # Fixed-length epochs have one synthetic event ID (0 or 1); represent as total
+        n = len(ep_ref)
+        count_after = {0: n}
+        count_before = {0: n}
+    else:
+        count_after = {}
 
-    dict_epochs_mg = {
+    all_ids = sorted(set(list(count_before.keys()) + list(count_after.keys())))
+    total_before = sum(count_before.values())
+    total_after = sum(count_after.values())
+
+    event_summary = {
+        'source': 'bids_tsv' if (bids_events is not None and len(bids_events) >= min_event_count)
+                  else ('find_events' if _raw_events is not None else 'fixed_length'),
+        'id_to_trial_type': _id_to_trial_type,
+        'count_before_merge': count_before,
+        'count_after_merge': count_after,
+        'total_before_merge': total_before,
+        'total_after_merge': total_after,
+        'dropped_count': total_before - total_after,
+        'all_ids': all_ids,
+    }
+    if total_before != total_after:
+        print(f'___MEGqc___: Events before merge/drop: {total_before}, '
+              f'used in epochs: {total_after} '
+              f'(dropped/merged: {total_before - total_after})')
+    else:
+        print(f'___MEGqc___: Events: {total_before}, all used in epochs.')
+
+    # ── Assemble return dict ───────────────────────────────────────────────────
+    first_samp = getattr(data, 'first_samp', 0)
+    epoch_onset_times_s = None
+    for ep_obj in [epochs_mag, epochs_grad]:
+        if ep_obj is not None and len(ep_obj.events):
+            epoch_onset_times_s = (
+                (ep_obj.events[:, 0] - first_samp) / data.info['sfreq']
+            ).tolist()
+            break
+
+    return {
         'mag': epochs_mag,
         'grad': epochs_grad,
-        'epoching_mode': epoching_mode}
+        'epoching_mode': epoching_mode,
+        'epoch_onset_times_s': epoch_onset_times_s,
+        'event_summary': event_summary,
+    }
 
-    return dict_epochs_mg
+
 
 
 def check_chosen_ch_types(m_or_g_chosen: List, channels_objs: dict):
@@ -1257,7 +1558,7 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
     raw_cropped = raw.copy().crop(tmin=default_settings['crop_tmin'], tmax=tmax)
     # When resampling for plotting, cropping or anything else you don't need permanent in raw inside any functions - always do raw_new=raw.copy() not just raw_new=raw. The last command doesn't create a new object, the whole raw will be changed and this will also be passed to other functions even if you don't return the raw.
 
-    stim_deriv = stim_data_to_df(raw_cropped)
+    stim_deriv, stim_channel_event_counts = stim_data_to_df(raw_cropped, epoching_params)
 
     # Data filtering:
     raw_cropped_filtered = raw_cropped.copy()
@@ -1309,6 +1610,14 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
 
     else:
         print('___MEGqc___: ', 'Data not filtered.')
+        # Load data into memory before any saving or resampling
+        raw_cropped_filtered.load_data()
+        # Save the unfiltered cropped data; both CROPPED and FILTERED paths point
+        # to the same file because no filtering was applied.
+        raw_cropped_path = save_meg_with_suffix(file_path, derivatives_root,
+                                                raw_cropped_filtered, final_suffix="CROPPED")
+        raw_cropped_filtered_path = raw_cropped_path  # identical data — no filtering done
+
         # And downsample:
         if filtering_settings['downsample_to_hz'] is not False:
             raw_cropped_filtered_resampled = raw_cropped_filtered.resample(sfreq=filtering_settings['downsample_to_hz'])
@@ -1324,9 +1633,7 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
                 print('___MEGqc___: ', resample_str)
         else:
             raw_cropped_filtered_resampled = raw_cropped_filtered
-            raw_cropped_filtered_resampled_path = save_meg_with_suffix(file_path, derivatives_root,
-                                                                       raw_cropped_filtered_resampled,
-                                                                       final_suffix="FILTERED_RESAMPLED")
+            raw_cropped_filtered_resampled_path = raw_cropped_filtered_path  # same file, no resampling
             resample_str = 'Data not resampled. '
             print('___MEGqc___: ', resample_str)
 
@@ -1339,15 +1646,73 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
     # Apply epoching: USE NON RESAMPLED DATA. Or should we resample after epoching?
     # Since sampling freq is 1kHz and resampling is 500Hz, it s not that much of a win...
 
-    dict_epochs_mg = Epoch_meg(epoching_params, data=raw_cropped_filtered)
+    dict_epochs_mg = Epoch_meg(epoching_params, data=raw_cropped_filtered, file_path=file_path)
+    event_summary = dict_epochs_mg.get('event_summary', {})
+    epoch_onset_times_s = dict_epochs_mg.get('epoch_onset_times_s')
+
+    # ── Build BIDS events.tsv comparison data ──────────────────────────────
+    # Always attempt to read the BIDS events.tsv (even if Epoch_meg already
+    # used it) so we can store per-trial-type info for the plotting module.
+    bids_events_info = {}
+    try:
+        bids_events, bids_tsv_path, bids_id_to_tt = _read_bids_events_tsv(
+            file_path, raw_cropped_filtered
+        )
+        if bids_events is not None and bids_tsv_path is not None:
+            # Per-trial-type counts
+            from collections import Counter
+            bids_id_counts = dict(Counter(int(x) for x in bids_events[:, 2]))
+            bids_events_info = {
+                'tsv_path': bids_tsv_path,
+                'total_events': int(len(bids_events)),
+                'id_counts': {int(k): int(v) for k, v in bids_id_counts.items()},
+                'id_to_trial_type': {int(k): str(v) for k, v in bids_id_to_tt.items()},
+                # Store per-event onsets (seconds) and trial_type for timeline plot
+                # Limit to 2000 events to keep JSON manageable
+                'event_onsets_s': [
+                    float((s - raw_cropped_filtered.first_samp) / raw_cropped_filtered.info['sfreq'])
+                    for s in bids_events[:2000, 0]
+                ],
+                'event_ids': [int(x) for x in bids_events[:2000, 2]],
+            }
+    except Exception as exc:
+        print(f'___MEGqc___: Could not build BIDS events comparison: {exc}')
+
+    # ── Assemble EventSummary JSON derivative ──────────────────────────────
+    event_summary_payload = {
+        'event_summary': event_summary,
+        'epoch_onset_times_s': epoch_onset_times_s,
+        'sfreq': float(raw_cropped_filtered.info['sfreq']),
+        'stim_channel_event_counts': stim_channel_event_counts,
+        'bids_events_info': bids_events_info,
+    }
+    event_summary_deriv = [
+        QC_derivative(event_summary_payload, 'EventSummary', 'json')
+    ]
+
     epoching_str = ''
     if dict_epochs_mg.get('epoching_mode') == 'fixed_length':
         epoching_str = (
-            '<p>No stimulus channels were detected. The data was epoched into fixed-length segments with '
-            f'duration {epoching_params["fixed_epoch_duration"]} s and overlap '
-            f'{epoching_params["fixed_epoch_overlap"]} s.</p><br></br>')
+            '<p>No stimulus channels were detected or too few events found. '
+            f'The data was epoched into fixed-length segments with duration '
+            f'{epoching_params["fixed_epoch_duration"]} s and overlap '
+            f'{epoching_params["fixed_epoch_overlap"]} s.</p>'
+        )
+        epoching_str += _build_epoch_summary_html(event_summary)
+        epoching_str += '<br></br>'
     elif dict_epochs_mg['mag'] is None and dict_epochs_mg['grad'] is None:
-        epoching_str = ''' <p>No epoching could be done in this data set: no events found. Quality measurement were only performed on the entire time series. If this was not expected, try: 1) checking the presence of stimulus channel in the data set, 2) setting stimulus channel explicitly in config file, 3) setting different event duration in config file.</p><br></br>'''
+        epoching_str = (
+            '<p>No epoching could be done in this data set: no events found. '
+            'Quality measurements were only performed on the entire time series. '
+            'If this was not expected, try: 1) checking the presence of a stimulus '
+            'channel in the data set, 2) setting the stimulus channel explicitly in '
+            'the config file, 3) setting a different event duration in the config '
+            'file.</p><br></br>'
+        )
+    else:
+        # Successful event-based epoching — show full per-ID summary
+        epoching_str = _build_epoch_summary_html(event_summary)
+        epoching_str += '<br></br>'
 
     resample_str = '<p>' + resample_str + '</p>'
 
@@ -1356,7 +1721,12 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
 
     raw_path = file_path
 
-    return meg_system, dict_epochs_mg, chs_by_lobe, channels, raw_cropped_filtered_path, raw_cropped_filtered_resampled_path, raw_cropped_path, raw_path, info_derivs, stim_deriv, shielding_str, epoching_str, sensors_derivs, m_or_g_chosen, m_or_g_skipped_str, lobes_color_coding_str, resample_str
+    return (meg_system, dict_epochs_mg, chs_by_lobe, channels,
+            raw_cropped_filtered_path, raw_cropped_filtered_resampled_path,
+            raw_cropped_path, raw_path, info_derivs, stim_deriv,
+            event_summary_deriv,
+            shielding_str, epoching_str, sensors_derivs, m_or_g_chosen,
+            m_or_g_skipped_str, lobes_color_coding_str, resample_str)
 
 
 def chs_dict_to_csv(chs_by_lobe: dict, file_name_prefix: str):
