@@ -380,8 +380,8 @@ def make_simple_metric_std(std_params:  dict, big_std_with_value_all_data: List[
     else:
         metric_local_description = 'Not calculated. No epochs found'
 
-    metric_global_content={'mag': None, 'grad': None}
-    metric_local_content={'mag': None, 'grad': None}
+    metric_global_content={'mag': None, 'grad': None, 'eeg': None}
+    metric_local_content={'mag': None, 'grad': None, 'eeg': None}
     for m_or_g in m_or_g_chosen:
 
         metric_global_content[m_or_g]=make_dict_global_std_ptp(std_params, big_std_with_value_all_data[m_or_g], small_std_with_value_all_data[m_or_g], channels[m_or_g], 'std')
@@ -392,7 +392,7 @@ def make_simple_metric_std(std_params:  dict, big_std_with_value_all_data: List[
         else:
             metric_local_content[m_or_g]=None
     
-    simple_metric = simple_metric_basic(metric_global_name, metric_global_description, metric_global_content['mag'], metric_global_content['grad'], metric_local_name, metric_local_description, metric_local_content['mag'], metric_local_content['grad'])
+    simple_metric = simple_metric_basic(metric_global_name, metric_global_description, metric_global_content['mag'], metric_global_content['grad'], metric_local_name, metric_local_description, metric_local_content['mag'], metric_local_content['grad'], metric_global_content_eeg=metric_global_content.get('eeg'), metric_local_content_eeg=metric_local_content.get('eeg'))
 
     return simple_metric
 
@@ -432,7 +432,7 @@ def STD_meg_qc(std_params: dict, channels: dict, chs_by_lobe: dict, dict_epochs_
     
     """
     # Load data
-    data, shielding_str, meg_system = load_data(data_path)
+    data, shielding_str, meg_system, _modality = load_data(data_path)
 
     # data.load_data()
 
@@ -460,7 +460,7 @@ def STD_meg_qc(std_params: dict, channels: dict, chs_by_lobe: dict, dict_epochs_
 
         big_std_with_value_all_data[m_or_g], small_std_with_value_all_data[m_or_g] = get_big_small_std_ptp_all_data(std_all_data[m_or_g], channels[m_or_g], std_params['std_lvl'])
 
-    if dict_epochs_mg['mag'] is not None or dict_epochs_mg['grad'] is not None: #If epochs are present
+    if dict_epochs_mg['mag'] is not None or dict_epochs_mg['grad'] is not None or dict_epochs_mg.get('eeg') is not None: #If epochs are present
         for m_or_g in m_or_g_chosen:
             df_std = get_std_epochs(channels[m_or_g], dict_epochs_mg[m_or_g])
 

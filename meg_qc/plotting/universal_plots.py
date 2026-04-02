@@ -185,6 +185,12 @@ def get_tit_and_unit(m_or_g: str, psd: bool = False):
             unit='Tesla/m'
         elif psd is True:
             unit='Tesla/m / Hz'
+    elif m_or_g=='eeg':
+        m_or_g_tit='EEG channels'
+        if psd is False:
+            unit='Volts'
+        elif psd is True:
+            unit='Volts/Hz'
     elif m_or_g == 'ECG':
         m_or_g_tit = 'ECG channel'
         unit = 'V'
@@ -3027,8 +3033,17 @@ def make_head_annots_plot(raw: mne.io.Raw, head_pos: np.ndarray):
 def plot_ECG_EOG_channel_csv(f_path):
 
     """
-    Plot the ECG channel data and detected peaks
-    
+    Plot the ECG channel data and detected peaks.
+
+    When the TSV contains ``n_events`` and ``events_rate_per_min`` metadata
+    (written by the calculation module even when the averaged waveform shape
+    check fails), these values are displayed as an annotation on the figure so
+    the user can see how many events were detected and at what rate.
+
+    If the ``mean_rwave`` column is entirely NaN (indicating that the mean
+    waveform shape check failed or the data was too noisy), an informative note
+    is added to the plot.
+
     Parameters
     ----------
     f_path : str
@@ -3047,7 +3062,14 @@ def plot_ECG_EOG_channel_csv(f_path):
     if 'ecgchannel' not in base_name.lower() and 'eogchannel' not in base_name.lower():
         return []
 
-    df = pd.read_csv(f_path, sep='\t', dtype={6: str})
+    # Read with explicit string dtype for the text column only.
+    # Using positional dtype={6: str} breaks when columns shift after adding
+    # n_events / events_rate_per_min — read everything as default types and
+    # let pandas infer numerics correctly.
+    df = pd.read_csv(f_path, sep='\t')
+    # Ensure text column stays as string
+    if 'recorded_or_reconstructed' in df.columns:
+        df['recorded_or_reconstructed'] = df['recorded_or_reconstructed'].astype(str)
 
     # Find the column containing the ECG/EOG data. Depending on how the TSV was
     # written, the first column may be an unnamed index column.  Hence, search
@@ -3060,12 +3082,40 @@ def plot_ECG_EOG_channel_csv(f_path):
     ch_name = channel_cols[0] if channel_cols else df.columns[0]
     ch_data = df[ch_name].values
 
-    if not ch_data.any():  # Check if all values are falsy (0, False, or empty)
+    if len(ch_data) == 0:  # Only skip if truly empty
         return []
     
     peaks = df['event_indexes'].dropna()
-    peaks = [int(x) for x in peaks]
-    fs = int(df['fs'].dropna().iloc[0])
+    peaks = [int(float(x)) for x in peaks]
+    fs = int(float(df['fs'].dropna().iloc[0]))
+
+    # ── Extract event metadata when available ────────────────────────────
+    n_events = None
+    events_rate = None
+    if 'n_events' in df.columns:
+        n_events_vals = df['n_events'].dropna()
+        if len(n_events_vals) > 0:
+            n_events = int(float(n_events_vals.iloc[0]))
+    if 'events_rate_per_min' in df.columns:
+        rate_vals = df['events_rate_per_min'].dropna()
+        if len(rate_vals) > 0:
+            events_rate = float(rate_vals.iloc[0])
+
+    # Determine whether this is ECG or EOG from the channel name / filename
+    is_ecg = 'ecg' in ch_name.lower() or 'ecgchannel' in base_name.lower()
+    event_kind = 'heartbeat' if is_ecg else 'blink'
+
+    # Check whether the mean waveform shape check failed (mean_rwave all NaN
+    # but events were still detected) — this gives us context for the annotation
+    mean_rwave_ok = True
+    if 'mean_rwave' in df.columns:
+        if df['mean_rwave'].isna().all():
+            mean_rwave_ok = False
+    # Also check the shifted column for ECG
+    shifted_ok = True
+    if is_ecg and 'mean_rwave_shifted' in df.columns:
+        if df['mean_rwave_shifted'].isna().all():
+            shifted_ok = False
 
     time = np.arange(len(ch_data))/fs
     fig = go.Figure()
@@ -3073,13 +3123,22 @@ def plot_ECG_EOG_channel_csv(f_path):
                              hovertemplate='Time: %{x} s<br>Amplitude: %{y} V<br>'))
     fig.add_trace(go.Scatter(x=time[peaks], y=ch_data[peaks], mode='markers', name='peak',
                              hovertemplate='Time: %{x} s<br>Amplitude: %{y} V<br>'))
-    fig.update_layout(xaxis_title='time, s', 
+
+    # ── Build informative title ─────────────────────────────────────────
+    title_parts = [ch_name]
+    if n_events is not None:
+        title_parts.append(f"{n_events} {event_kind} events detected")
+    if events_rate is not None:
+        title_parts.append(f"{events_rate} per min")
+
+    fig.update_layout(
+                xaxis_title='Time, s',
                 yaxis = dict(
                 showexponent = 'all',
                 exponentformat = 'e'),
                 yaxis_title='Amplitude, V',
                 title={
-                'text': ch_name,
+                'text': ' -- '.join(title_parts),
                 'y':0.85,
                 'x':0.5,
                 'xanchor': 'center',
@@ -3289,8 +3348,15 @@ def plot_affected_channels_csv(df, artifact_lvl: float, t: np.ndarray, m_or_g: s
 def plot_mean_rwave_csv(f_path: str, ecg_or_eog: str):
 
     """
-    Plon mean rwave(ECG) or mean blink (EOG) from data in CSV file.
+    Plot mean R-wave (ECG) or mean blink (EOG) from data in CSV file.
 
+    When the averaged waveform failed the expected shape check (``mean_good is
+    False`` in the calculation module), ``mean_rwave_shifted`` will be entirely
+    NaN.  In that case the function still plots the *unshifted* mean waveform
+    with a prominent annotation explaining that the shape check failed.
+
+    Event count and rate metadata (``n_events``, ``events_rate_per_min``) are
+    shown on the plot when available.
 
     Parameters
     ----------
@@ -3313,34 +3379,88 @@ def plot_mean_rwave_csv(f_path: str, ecg_or_eog: str):
         return []
 
     # Load the data from the .tsv file into a DataFrame
-    df = pd.read_csv(f_path, sep='\t', dtype={6: str})
+    df = pd.read_csv(f_path, sep='\t')
+    if 'recorded_or_reconstructed' in df.columns:
+        df['recorded_or_reconstructed'] = df['recorded_or_reconstructed'].astype(str)
 
     if df['mean_rwave'].empty or df['mean_rwave'].isna().all():
+        # No valid mean waveform — do not produce a plot figure.
+        # The informative message about this is already in the ReportStrings
+        # JSON and will be displayed as a Metric Status header banner in the
+        # HTML report.
         return []
 
+    # ── Extract event metadata ───────────────────────────────────────────
+    n_events = None
+    events_rate = None
+    if 'n_events' in df.columns:
+        n_events_vals = df['n_events'].dropna()
+        if len(n_events_vals) > 0:
+            n_events = int(float(n_events_vals.iloc[0]))
+    if 'events_rate_per_min' in df.columns:
+        rate_vals = df['events_rate_per_min'].dropna()
+        if len(rate_vals) > 0:
+            events_rate = float(rate_vals.iloc[0])
+
     # Set the plot's title and labels
-    if 'recorded' in df['recorded_or_reconstructed'][0].lower():
+    rec_val = str(df['recorded_or_reconstructed'].dropna().iloc[0]) if 'recorded_or_reconstructed' in df.columns and not df['recorded_or_reconstructed'].dropna().empty else ''
+    if 'recorded' in rec_val.lower():
         which = ' recorded'
-    elif 'reconstructed' in df['recorded_or_reconstructed'][0].lower():
+    elif 'reconstructed' in rec_val.lower():
         which = ' reconstructed'
     else:
         which = ''
-    
-    #TODO: can there be the case that no shift was done and column is empty? should not be...
-    # Create a scatter plot
+
+    # ── Detect whether the shifted waveform is available ─────────────────
+    has_shifted = (
+        ecg_or_eog.lower() == 'ecg'
+        and 'mean_rwave_shifted' in df.columns
+        and not df['mean_rwave_shifted'].isna().all()
+    )
+    # shape_check_failed when mean_rwave exists but shifted doesn't (ECG) or
+    # when the waveform is present but the caller flags it as bad
+    shape_check_failed = (
+        ecg_or_eog.lower() == 'ecg' and not has_shifted
+    )
+
+    # Create the figure
     fig = go.Figure()
-    fig.add_trace(go.Scatter (x=df['mean_rwave_time'], y=df['mean_rwave'], mode='lines', name='Original '+ ecg_or_eog.upper(),
-        hovertemplate='Time: %{x} s<br>Amplitude: %{y} V<br>'))
-    if ecg_or_eog.lower() == 'ecg':
-        fig.add_trace(go.Scatter (x=df['mean_rwave_time'], y=df['mean_rwave_shifted'], mode='lines', name='Shifted ' + ecg_or_eog.upper(),
+    fig.add_trace(go.Scatter(
+        x=df['mean_rwave_time'], y=df['mean_rwave'],
+        mode='lines', name='Original ' + ecg_or_eog.upper(),
         hovertemplate='Time: %{x} s<br>Amplitude: %{y} V<br>'))
 
+    if has_shifted:
+        fig.add_trace(go.Scatter(
+            x=df['mean_rwave_time'], y=df['mean_rwave_shifted'],
+            mode='lines', name='Shifted ' + ecg_or_eog.upper(),
+            hovertemplate='Time: %{x} s<br>Amplitude: %{y} V<br>'))
+
+    # ── Build title ──────────────────────────────────────────────────────
+    annot_text = ""
     if ecg_or_eog.lower() == 'ecg':
-        plot_tit = 'Mean' + which + ' R wave was shifted to align with the ' + ecg_or_eog.upper() + ' signal found on MEG channels.'
-        annot_text = "The alignment is necessary for performing Pearson correlation between ECG signal found in each channel and reference mean signal of the ECG recording."
+        if shape_check_failed:
+            plot_tit = (
+                'Mean' + which + ' R wave (shape check FAILED -- '
+                'shifted alignment unavailable)'
+            )
+        else:
+            plot_tit = (
+                'Mean' + which + ' R wave was shifted to align with the '
+                + ecg_or_eog.upper() + ' signal found on MEG channels.'
+            )
+            annot_text = (
+                "The alignment is necessary for performing Pearson correlation "
+                "between ECG signal found in each channel and reference mean "
+                "signal of the ECG recording."
+            )
     elif ecg_or_eog.lower() == 'eog':
         plot_tit = 'Mean' + which + ' blink signal'
-        annot_text = ""
+        if n_events is not None:
+            plot_tit += f' ({n_events} events'
+            if events_rate is not None:
+                plot_tit += f', {events_rate} per min'
+            plot_tit += ')'
 
     fig.update_layout(
             xaxis_title='Time, s',
@@ -3364,7 +3484,7 @@ def plot_mean_rwave_csv(f_path: str, ecg_or_eog: str):
                 yref="paper",
                 font=dict(size=12),
                 align="center"
-        )])
+        )] if annot_text else [])
 
     mean_ecg_eog_ch_deriv = [QC_derivative(fig, ecg_or_eog+'mean_ch_data', 'plotly', fig_order = 2)]
 

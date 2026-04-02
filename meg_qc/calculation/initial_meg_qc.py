@@ -11,7 +11,10 @@ import random
 import copy
 import warnings
 from typing import List
-from meg_qc.calculation.objects import QC_derivative, MEG_channel
+from meg_qc.calculation.objects import QC_derivative, MEG_channel, QC_channel
+
+# Canonical set of channel types the package can process.
+SUPPORTED_CH_TYPES = {'mag', 'grad', 'eeg'}
 
 
 def get_all_config_params(config_file_path: str):
@@ -47,8 +50,9 @@ def get_all_config_params(config_file_path: str):
 
     m_or_g_chosen = default_section['ch_types']
     m_or_g_chosen = [chosen.strip() for chosen in m_or_g_chosen.split(",")]
-    if 'mag' not in m_or_g_chosen and 'grad' not in m_or_g_chosen:
-        print('___MEGqc___: ', 'No channels to analyze. Check parameter ch_types in config file.')
+    if not any(ch in SUPPORTED_CH_TYPES for ch in m_or_g_chosen):
+        print('___MEGqc___: ', f'No valid channel types to analyze. '
+              f'Supported: {SUPPORTED_CH_TYPES}. Got: {m_or_g_chosen}')
         return None
 
     # TODO: save list of mags and grads here and use later everywhere? because for CTF types are messed up.
@@ -190,6 +194,8 @@ def get_all_config_params(config_file_path: str):
             'flat_m': ptp_mne_section.getfloat('flat_m'),
             'peak_g': ptp_mne_section.getfloat('peak_g'),
             'flat_g': ptp_mne_section.getfloat('flat_g'),
+            'peak_eeg': ptp_mne_section.getfloat('peak_eeg', fallback=200e-6),
+            'flat_eeg': ptp_mne_section.getfloat('flat_eeg', fallback=1e-6),
             'bad_percent': ptp_mne_section.getint('bad_percent'),
             'min_duration': ptp_mne_section.getfloat('min_duration')})
 
@@ -225,13 +231,23 @@ def get_all_config_params(config_file_path: str):
         # separate values in list_thresholds based on coma, remove spaces and convert them to floats:
         list_thresholds = [float(i) for i in list_thresholds.split(',')]
         muscle_freqs = [float(i) for i in muscle_section['muscle_freqs'].split(',')]
+        muscle_freqs_eeg = [float(i) for i in muscle_section.get('muscle_freqs_eeg', '20, 100').split(',')]
 
         all_qc_params['Muscle'] = dict({
             'threshold_muscle': list_thresholds,
             'min_distance_between_different_muscle_events': muscle_section.getfloat(
                 'min_distance_between_different_muscle_events'),
             'muscle_freqs': muscle_freqs,
+            'muscle_freqs_eeg': muscle_freqs_eeg,
             'min_length_good': muscle_section.getfloat('min_length_good')})
+
+        # ── EEG-specific settings (optional section) ───────────────────────
+        eeg_settings = {'reference_method': 'average', 'montage': 'auto'}
+        if 'EEG' in config:
+            eeg_sec = config['EEG']
+            eeg_settings['reference_method'] = eeg_sec.get('reference_method', 'average').strip()
+            eeg_settings['montage'] = eeg_sec.get('montage', 'auto').strip()
+        all_qc_params['EEG_settings'] = eeg_settings
 
         gqi_section = config['GlobalQualityIndex']
 
@@ -409,7 +425,7 @@ def _read_bids_events_tsv(file_path: str, data: mne.io.Raw):
     """
     import re
     tsv_path = re.sub(
-        r'(_meg)?\.(fif|fif\.gz|raw|raw\.gz|set|edf|bdf\.gz|bdf|mff|nxe|ds|sqd|con)$',
+        r'(_(meg|eeg))?\.(fif|fif\.gz|raw|raw\.gz|set|edf|bdf\.gz|bdf|mff|nxe|ds|sqd|con|vhdr|cnt)$',
         '_events.tsv',
         file_path,
         flags=re.IGNORECASE,
@@ -613,8 +629,9 @@ def Epoch_meg(epoching_params, data: mne.io.Raw, file_path: str = None):
 
     picks_magn = data.copy().pick('mag').ch_names if 'mag' in data else None
     picks_grad = data.copy().pick('grad').ch_names if 'grad' in data else None
+    picks_eeg = data.copy().pick('eeg').ch_names if 'eeg' in data else None
 
-    epochs_grad, epochs_mag = None, None
+    epochs_grad, epochs_mag, epochs_eeg = None, None, None
     epoching_mode = 'stim'
     # Track raw events array (before Epochs applies event_repeated / boundary drop)
     # so we can report "n events before merge" separately from "n epochs used".
@@ -643,20 +660,34 @@ def Epoch_meg(epoching_params, data: mne.io.Raw, file_path: str = None):
             print('___MEGqc___: ', reason)
             return
         print(f'___MEGqc___: {reason} Falling back to fixed-length epoching.')
-        nonlocal epoching_mode, epochs_mag, epochs_grad
+        nonlocal epoching_mode, epochs_mag, epochs_grad, epochs_eeg
         epoching_mode = 'fixed_length'
-        epochs_mag = _make_fixed_length_epochs(picks_magn, 'magnetometers')
-        epochs_grad = _make_fixed_length_epochs(picks_grad, 'gradiometers')
+        if picks_magn:
+            epochs_mag = _make_fixed_length_epochs(picks_magn, 'magnetometers')
+        if picks_grad:
+            epochs_grad = _make_fixed_length_epochs(picks_grad, 'gradiometers')
+        if picks_eeg:
+            epochs_eeg = _make_fixed_length_epochs(picks_eeg, 'EEG')
 
     def _make_stim_epochs(events):
-        nonlocal epochs_mag, epochs_grad
-        epochs_mag = mne.Epochs(data, events, picks=picks_magn, tmin=epoch_tmin, tmax=epoch_tmax,
-                                preload=True, baseline=None,
-                                event_repeated=epoching_params['event_repeated'])
-        epochs_grad = mne.Epochs(data, events, picks=picks_grad, tmin=epoch_tmin, tmax=epoch_tmax,
-                                 preload=True, baseline=None,
-                                 event_repeated=epoching_params['event_repeated'])
-        print(f'___MEGqc___: Epochs created — mag: {len(epochs_mag)}, grad: {len(epochs_grad)}')
+        nonlocal epochs_mag, epochs_grad, epochs_eeg
+        if picks_magn:
+            epochs_mag = mne.Epochs(data, events, picks=picks_magn, tmin=epoch_tmin, tmax=epoch_tmax,
+                                    preload=True, baseline=None,
+                                    event_repeated=epoching_params['event_repeated'])
+        if picks_grad:
+            epochs_grad = mne.Epochs(data, events, picks=picks_grad, tmin=epoch_tmin, tmax=epoch_tmax,
+                                     preload=True, baseline=None,
+                                     event_repeated=epoching_params['event_repeated'])
+        if picks_eeg:
+            epochs_eeg = mne.Epochs(data, events, picks=picks_eeg, tmin=epoch_tmin, tmax=epoch_tmax,
+                                    preload=True, baseline=None,
+                                    event_repeated=epoching_params['event_repeated'])
+        parts = []
+        if epochs_mag is not None: parts.append(f'mag: {len(epochs_mag)}')
+        if epochs_grad is not None: parts.append(f'grad: {len(epochs_grad)}')
+        if epochs_eeg is not None: parts.append(f'eeg: {len(epochs_eeg)}')
+        print(f'___MEGqc___: Epochs created — {", ".join(parts)}')
 
     # ── 1. Try BIDS events TSV (most reliable) ────────────────────────────────
     bids_events = None
@@ -700,7 +731,7 @@ def Epoch_meg(epoching_params, data: mne.io.Raw, file_path: str = None):
     # ── Build per-ID event summary ─────────────────────────────────────────────
     # count_before_merge: from the raw events array before mne.Epochs drops anything
     # count_after_merge: from epochs.events after boundary-drop + event_repeated handling
-    ep_ref = epochs_mag if epochs_mag is not None else epochs_grad
+    ep_ref = epochs_mag if epochs_mag is not None else (epochs_grad if epochs_grad is not None else epochs_eeg)
     if _raw_events is not None and len(_raw_events):
         count_before = dict(Counter(int(x) for x in _raw_events[:, 2]))
     else:
@@ -741,7 +772,7 @@ def Epoch_meg(epoching_params, data: mne.io.Raw, file_path: str = None):
     # ── Assemble return dict ───────────────────────────────────────────────────
     first_samp = getattr(data, 'first_samp', 0)
     epoch_onset_times_s = None
-    for ep_obj in [epochs_mag, epochs_grad]:
+    for ep_obj in [epochs_mag, epochs_grad, epochs_eeg]:
         if ep_obj is not None and len(ep_obj.events):
             epoch_onset_times_s = (
                 (ep_obj.events[:, 0] - first_samp) / data.info['sfreq']
@@ -751,6 +782,7 @@ def Epoch_meg(epoching_params, data: mne.io.Raw, file_path: str = None):
     return {
         'mag': epochs_mag,
         'grad': epochs_grad,
+        'eeg': epochs_eeg,
         'epoching_mode': epoching_mode,
         'epoch_onset_times_s': epoch_onset_times_s,
         'event_summary': event_summary,
@@ -763,41 +795,54 @@ def check_chosen_ch_types(m_or_g_chosen: List, channels_objs: dict):
     """
     Check if the channels which the user gave in config file to analize actually present in the data set.
 
+    IMPORTANT: This function works on a **copy** of ``m_or_g_chosen`` so
+    that the caller's original list (e.g. the config dict) is never mutated.
+    This is critical when the pipeline processes both MEG and EEG files in the
+    same subject loop — mutating the shared config list would permanently
+    remove channel types discovered absent in one file but present in another.
+
     Parameters
     ----------
     m_or_g_chosen : list
-        List with channel types to analize: mag, grad. These are theones the user chose.
+        List with channel types to analize: mag, grad, eeg. These are the ones the user chose.
     channels_objs : dict
-        Dictionary with channel names for each channel type: mag, grad. These are the ones present in the data set.
+        Dictionary with channel names for each channel type: mag, grad, eeg. These are the ones present in the data set.
 
     Returns
     -------
     m_or_g_chosen : list
-        List with channel types to analize: mag, grad.
+        **New** list with only those channel types that are both requested
+        and present in the data.
     m_or_g_skipped_str : str
         String with information about which channel types were skipped.
 
     """
 
+    # Work on a copy so the caller's list is never mutated.
+    m_or_g_chosen = list(m_or_g_chosen)
+
     skipped_str = ''
 
-    if not any(ch in m_or_g_chosen for ch in ['mag', 'grad']):
-        skipped_str = "No channels to analyze. Check parameter ch_types in config file."
+    if not any(ch in m_or_g_chosen for ch in SUPPORTED_CH_TYPES):
+        skipped_str = "No valid channel types to analyze. Check parameter ch_types in config file."
         raise ValueError(skipped_str)
 
-    skipped_msgs = {
-        'mag': "There are no magnetometers in this data set: check parameter ch_types in config file. Analysis will be done only for gradiometers.",
-        'grad': "There are no gradiometers in this data set: check parameter ch_types in config file. Analysis will be done only for magnetometers."
-    }
+    type_labels = {'mag': 'magnetometers', 'grad': 'gradiometers', 'eeg': 'EEG channels'}
 
-    for ch in ['mag', 'grad']:
-        if len(channels_objs[ch]) == 0 and ch in m_or_g_chosen:
-            skipped_str = skipped_msgs[ch]
+    for ch in list(m_or_g_chosen):  # iterate copy since we may modify the list
+        if ch in channels_objs and len(channels_objs[ch]) == 0:
+            remaining = [t for t in m_or_g_chosen if t != ch and t in channels_objs and len(channels_objs[t]) > 0]
+            label = type_labels.get(ch, ch)
+            if remaining:
+                skipped_str = (f"There are no {label} in this data set: check parameter ch_types in config file. "
+                               f"Analysis will be done for: {', '.join(type_labels.get(r, r) for r in remaining)}.")
+            else:
+                skipped_str = f"There are no {label} in this data set."
             print(f'___MEGqc___: {skipped_str}')
             m_or_g_chosen.remove(ch)
 
-    if not any(channels_objs[ch] for ch in ['mag', 'grad']):
-        skipped_str = "There are no magnetometers nor gradiometers in this data set. Analysis will not be done."
+    if not any(channels_objs.get(ch) for ch in SUPPORTED_CH_TYPES):
+        skipped_str = "There are no magnetometers, gradiometers, nor EEG channels in this data set. Analysis will not be done."
         raise ValueError(skipped_str)
 
     # Now m_or_g_chosen contain only those channel types which are present in the data set and were chosen by the user.
@@ -807,22 +852,22 @@ def check_chosen_ch_types(m_or_g_chosen: List, channels_objs: dict):
 
 def choose_channels(raw: mne.io.Raw):
     """
-    Separate channels by 'mag' and 'grad'.
+    Separate channels by 'mag', 'grad', and 'eeg'.
     Done this way, because pick() or pick_types() sometimes gets wrong results, especialy for CTF data.
 
     Parameters
     ----------
     raw : mne.io.Raw
-        MEG data
+        MEG or EEG data
 
     Returns
     -------
     channels : dict
-        dict with ch names separated by mag and grad
+        dict with ch names separated by mag, grad, and eeg
 
     """
 
-    channels = {'mag': [], 'grad': []}
+    channels = {'mag': [], 'grad': [], 'eeg': []}
 
     # Loop over all channel indexes
     for ch_idx, ch_name in enumerate(raw.info['ch_names']):
@@ -867,25 +912,29 @@ def change_ch_type_CTF(raw, channels):
 
 def load_data(file_path):
     """
-    Load MEG data from a file. It can be a CTF data or a FIF file.
+    Load MEG or EEG data from a file.
 
     Parameters
     ----------
     file_path : str
-        Path to the fif file with MEG data.
+        Path to the data file (FIF, CTF .ds, EDF, BDF, BrainVision, EEGLAB, EGI, Neuroscan).
 
     Returns
     -------
     raw : mne.io.Raw
-        MEG data.
+        Loaded data.
     shielding_str : str
-        String with information about active shielding.
+        String with information about active shielding (empty for EEG).
+    meg_system : str
+        Identifier: 'Triux', 'CTF', 'EEG', or 'OTHER'.
+    modality : str
+        'meg' or 'eeg'.
 
     """
 
     shielding_str = ''
-
     meg_system = None
+    modality = 'meg'
 
     def _resolve_split_fif_path(path: str) -> str:
         """Return the first available FIF split created by MNE.
@@ -925,16 +974,55 @@ def load_data(file_path):
 
         return path
 
+    # Normalise for extension checks
+    fp_lower = file_path.lower()
+
     if os.path.isdir(file_path) and file_path.endswith('.ds'):
-        # It's a CTF data directory
+        # It's a CTF data directory.
+        # BIDS suffix is the primary modality classifier (same logic as FIF):
+        # files named *_eeg.ds are independent EEG recordings; *_meg.ds are MEG.
+        _bids_suffix_is_eeg_ctf = '_eeg.' in os.path.basename(file_path).lower()
+        if _bids_suffix_is_eeg_ctf:
+            meg_system = 'EEG'
+            modality = 'eeg'
+        else:
+            meg_system = 'CTF'
+            modality = 'meg'
+
         print("___MEGqc___: ", "Loading CTF data...")
         raw = mne.io.read_raw_ctf(file_path, preload=True, verbose='ERROR')
-        meg_system = 'CTF'
         print(f"___MEGqc___: Recording duration: {raw.times[-1] / 60:.2f} min")
 
+        # ── Safeguard: reclassify CTF .ds with BIDS suffix _meg but 0 MEG chs ─
+        # Same logic as the FIF safeguard: only fires when a *_meg.ds file has
+        # literally zero mag/grad channels. Normal CTF MEG files that carry a
+        # few EEG electrodes alongside the MEG sensors stay as MEG.
+        if modality == 'meg':
+            _has_any_meg_ch = any(
+                mne.channel_type(raw.info, idx) in ('mag', 'grad')
+                for idx in range(len(raw.info['ch_names']))
+            )
+            if not _has_any_meg_ch:
+                meg_system = 'EEG'
+                modality = 'eeg'
+                print('___MEGqc___: CTF .ds file has suffix _meg but contains no MEG channels — '
+                      'reclassifying as independent EEG recording (safeguard).')
+
+        if _bids_suffix_is_eeg_ctf:
+            print(f'___MEGqc___: CTF .ds file classified as independent EEG recording (BIDS suffix _eeg).')
+
     elif file_path.endswith('.fif'):
-        # It's a FIF file
-        meg_system = 'Triux'
+        # It's a FIF file.  The BIDS suffix in the filename is the primary
+        # modality classifier: files named ``*_meg.fif`` are MEG recordings
+        # (even if they contain a few EEG electrodes), while files named
+        # ``*_eeg.fif`` are independent EEG recordings stored in FIF format.
+        _bids_suffix_is_eeg = '_eeg.' in os.path.basename(file_path).lower()
+        if _bids_suffix_is_eeg:
+            meg_system = 'EEG'
+            modality = 'eeg'
+        else:
+            meg_system = 'Triux'
+            modality = 'meg'
 
         print("___MEGqc___: ", "Loading FIF data...")
         try:
@@ -965,11 +1053,72 @@ def load_data(file_path):
                 print(f"___MEGqc___: Recording duration: {recording_duration_min:.2f} min")
             shielding_str = ''' <p>This fif file contains Internal Active Shielding data. Quality measurements calculated on this data should not be compared to the measuremnts calculated on the data without active shileding, since in the current case environmental noise reduction was already partially performed by shileding, which normally should not be done before assesing the quality.</p>'''
 
+        # ── Safeguard: reclassify FIF with BIDS suffix _meg but no MEG chs ─
+        # Extremely rare edge case: a file named *_meg.fif that has zero
+        # mag/grad channels.  We fall back to EEG only when there are truly
+        # no MEG channels.  This never fires for normal MEG files that
+        # happen to carry a few EEG electrodes alongside the MEG sensors.
+        if modality == 'meg':
+            _has_any_meg_ch = any(
+                mne.channel_type(raw.info, idx) in ('mag', 'grad')
+                for idx in range(len(raw.info['ch_names']))
+            )
+            if not _has_any_meg_ch:
+                meg_system = 'EEG'
+                modality = 'eeg'
+                print('___MEGqc___: FIF file has suffix _meg but contains no MEG channels — '
+                      'reclassifying as independent EEG recording (safeguard).')
+
+        if _bids_suffix_is_eeg:
+            print(f'___MEGqc___: FIF file classified as independent EEG recording (BIDS suffix _eeg).')
+
+    # ──── EEG FORMATS ──────────────────────────────────────────────────────
+    elif fp_lower.endswith('.edf'):
+        print("___MEGqc___: Loading EDF data...")
+        raw = mne.io.read_raw_edf(file_path, preload=True, verbose='ERROR')
+        meg_system = 'EEG'
+        modality = 'eeg'
+
+    elif fp_lower.endswith('.bdf'):
+        print("___MEGqc___: Loading BDF data...")
+        raw = mne.io.read_raw_bdf(file_path, preload=True, verbose='ERROR')
+        meg_system = 'EEG'
+        modality = 'eeg'
+
+    elif fp_lower.endswith('.vhdr'):
+        print("___MEGqc___: Loading BrainVision data...")
+        raw = mne.io.read_raw_brainvision(file_path, preload=True, verbose='ERROR')
+        meg_system = 'EEG'
+        modality = 'eeg'
+
+    elif fp_lower.endswith('.set'):
+        print("___MEGqc___: Loading EEGLAB data...")
+        raw = mne.io.read_raw_eeglab(file_path, preload=True, verbose='ERROR')
+        meg_system = 'EEG'
+        modality = 'eeg'
+
+    elif os.path.isdir(file_path) and fp_lower.endswith('.mff'):
+        print("___MEGqc___: Loading EGI/MFF data...")
+        raw = mne.io.read_raw_egi(file_path, preload=True, verbose='ERROR')
+        meg_system = 'EEG'
+        modality = 'eeg'
+
+    elif fp_lower.endswith('.cnt'):
+        print("___MEGqc___: Loading Neuroscan CNT data...")
+        raw = mne.io.read_raw_cnt(file_path, preload=True, verbose='ERROR')
+        meg_system = 'EEG'
+        modality = 'eeg'
+    # ──── END EEG FORMATS ──────────────────────────────────────────────────
+
     else:
         raise ValueError(
-            "Unsupported file format or file does not exist. The pipeline works with CTF data directories and FIF files.")
+            f"Unsupported file format or file does not exist: {file_path}. "
+            "Supported formats: .fif, .ds (CTF), .edf, .bdf, .vhdr, .set, .mff, .cnt")
 
-    return raw, shielding_str, meg_system
+    if modality == 'eeg':
+        print(f"___MEGqc___: Recording duration: {raw.times[-1] / 60:.2f} min")
+
+    return raw, shielding_str, meg_system, modality
 
 
 def add_3d_ch_locations(raw, channels_objs):
@@ -1219,6 +1368,430 @@ def add_Triux_lobes(channels_objs):
     return channels_objs, lobes_color_coding_str
 
 
+# ──── EEG-specific helpers ─────────────────────────────────────────────────
+
+def _apply_bids_channel_types(raw, file_path):
+    """Read the companion BIDS ``*_channels.tsv`` and correct channel types.
+
+    Many EEG recordings contain non-EEG channels (EOG, EMG, ECG, MISC) that
+    MNE may auto-detect as EEG.  The BIDS ``channels.tsv`` sidecar explicitly
+    labels each channel, so we use it to set the correct types in the raw
+    object *before* any downstream channel separation.
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Loaded raw data (modified in-place).
+    file_path : str
+        Path to the data file.  The function derives the ``*_channels.tsv``
+        path by replacing the file extension and suffix.
+
+    Returns
+    -------
+    raw : mne.io.Raw
+        Data with corrected channel types.
+    correction_str : str
+        Description of corrections applied (empty if none).
+    """
+    import re as _re
+
+    correction_str = ''
+
+    # Derive channels.tsv path from data file path
+    # BIDS pattern: sub-XX_task-YY_..._eeg.edf  →  sub-XX_task-YY_..._channels.tsv
+    base_dir = os.path.dirname(file_path)
+    base_name = os.path.basename(file_path)
+
+    # Remove extension
+    name_no_ext = os.path.splitext(base_name)[0]
+    # Remove suffix (_eeg, _meg, etc.) — last _word segment
+    name_no_suffix = _re.sub(r'_[a-zA-Z]+$', '', name_no_ext)
+    channels_tsv_path = os.path.join(base_dir, name_no_suffix + '_channels.tsv')
+
+    if not os.path.isfile(channels_tsv_path):
+        print(f'___MEGqc___: No channels.tsv found at {channels_tsv_path} — skipping channel type correction.')
+        return raw, correction_str
+
+    try:
+        channels_df = pd.read_csv(channels_tsv_path, sep='\t')
+    except Exception as exc:
+        print(f'___MEGqc___: Could not read channels.tsv: {exc}')
+        return raw, correction_str
+
+    if 'name' not in channels_df.columns or 'type' not in channels_df.columns:
+        print('___MEGqc___: channels.tsv missing required columns (name, type) — skipping.')
+        return raw, correction_str
+
+    # BIDS type → MNE type mapping
+    bids_to_mne = {
+        'EEG': 'eeg',
+        'EOG': 'eog',
+        'VEOG': 'eog',
+        'HEOG': 'eog',
+        'EMG': 'emg',
+        'ECG': 'ecg',
+        'MISC': 'misc',
+        'STIM': 'stim',
+        'REF': 'eeg',      # Reference EEG channels stay as EEG
+        'TRIG': 'stim',
+        'BIO': 'bio',
+        'RESP': 'resp',
+    }
+
+    corrections = {}
+    raw_ch_names = set(raw.ch_names)
+
+    for _, row in channels_df.iterrows():
+        ch_name = str(row['name']).strip()
+        bids_type = str(row['type']).strip().upper()
+
+        if ch_name not in raw_ch_names:
+            continue
+
+        mne_target_type = bids_to_mne.get(bids_type)
+        if mne_target_type is None:
+            continue
+
+        # Get current MNE type
+        ch_idx = raw.ch_names.index(ch_name)
+        current_type = mne.channel_type(raw.info, ch_idx)
+
+        if current_type != mne_target_type:
+            corrections[ch_name] = mne_target_type
+
+    if corrections:
+        try:
+            raw.set_channel_types(corrections)
+            correction_str = (
+                f'Corrected channel types from BIDS channels.tsv for '
+                f'{len(corrections)} channel(s): '
+                f'{", ".join(f"{k}→{v}" for k, v in list(corrections.items())[:10])}'
+                + ('...' if len(corrections) > 10 else ''))
+            print(f'___MEGqc___: {correction_str}')
+        except RuntimeError:
+            # Likely a projector conflict — remove projectors containing the
+            # channels we want to retype, then retry.
+            projs_to_keep = []
+            correction_ch_set = set(corrections.keys())
+            for proj in raw.info['projs']:
+                col_names = set(proj['data'].get('col_names', []))
+                if col_names & correction_ch_set:
+                    print(f'___MEGqc___: Removing projector "{proj["desc"]}" '
+                          f'that conflicts with channel type correction.')
+                else:
+                    projs_to_keep.append(proj)
+            raw.info['projs'] = projs_to_keep
+            try:
+                raw.set_channel_types(corrections)
+                correction_str = (
+                    f'Corrected channel types from BIDS channels.tsv for '
+                    f'{len(corrections)} channel(s) (after removing conflicting projectors): '
+                    f'{", ".join(f"{k}→{v}" for k, v in list(corrections.items())[:10])}'
+                    + ('...' if len(corrections) > 10 else ''))
+                print(f'___MEGqc___: {correction_str}')
+            except Exception as exc:
+                correction_str = f'Failed to apply BIDS channel type corrections: {exc}'
+                print(f'___MEGqc___: WARNING: {correction_str}')
+        except Exception as exc:
+            correction_str = f'Failed to apply BIDS channel type corrections: {exc}'
+            print(f'___MEGqc___: WARNING: {correction_str}')
+    else:
+        print('___MEGqc___: BIDS channels.tsv found — all channel types already match MNE detection.')
+
+    return raw, correction_str
+
+
+def _strip_eeg_reference_suffix(name):
+    """Strip common EEG reference suffixes from a channel name.
+
+    Referential montage recordings often name channels as ``Fp1-M2``,
+    ``F3-A1``, ``C3-Ref`` etc.  Standard montages only contain the
+    electrode name (``Fp1``, ``F3``, ``C3``).  This helper removes the
+    reference part so that montage matching succeeds.
+
+    Returns the stripped name, or the original if no known suffix is found.
+    """
+    import re
+    return re.sub(r'[-_](?:M[12]|A[12]|Ref|LE|RE|AVG|REF|ref|le|re|avg)$', '', name, flags=re.IGNORECASE)
+
+
+def apply_eeg_montage(raw, eeg_settings):
+    """
+    Detect and apply a standard EEG montage for topomap plotting.
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Raw EEG data.
+    eeg_settings : dict
+        Settings from config: {'montage': 'auto'|'standard_1020'|..., ...}
+
+    Returns
+    -------
+    raw : mne.io.Raw
+        Data with montage applied (in-place).
+    montage_str : str
+        Description of montage applied.
+    """
+    montage_name = eeg_settings.get('montage', 'auto')
+    montage_str = ''
+
+    # Collect EEG channel names
+    eeg_ch_names = [ch for idx, ch in enumerate(raw.ch_names)
+                    if mne.channel_type(raw.info, idx) == 'eeg']
+
+    if not eeg_ch_names:
+        return raw, 'No EEG channels found — montage not applied.'
+
+    if montage_name == 'auto':
+        # --- Pass 1: try matching raw channel names directly ---
+        for candidate in ['standard_1005', 'standard_1010', 'standard_1020']:
+            try:
+                montage = mne.channels.make_standard_montage(candidate)
+                montage_ch_names = set(montage.ch_names)
+                overlap = set(eeg_ch_names) & montage_ch_names
+                if len(overlap) >= len(eeg_ch_names) * 0.5:  # 50% match threshold
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        raw.set_montage(montage, on_missing='warn')
+                    montage_str = (f'Auto-detected montage: {candidate} '
+                                   f'({len(overlap)}/{len(eeg_ch_names)} channels matched)')
+                    print(f'___MEGqc___: {montage_str}')
+                    return raw, montage_str
+            except Exception:
+                continue
+
+        # --- Pass 2: strip reference suffixes (e.g. Fp1-M2 → Fp1) and retry ---
+        stripped_map = {}  # old_name → new_name  (only if actually changed)
+        for ch in eeg_ch_names:
+            stripped = _strip_eeg_reference_suffix(ch)
+            if stripped != ch:
+                stripped_map[ch] = stripped
+
+        if stripped_map:
+            print(f'___MEGqc___: Attempting montage match after stripping '
+                  f'reference suffixes from {len(stripped_map)} channel(s): '
+                  f'{list(stripped_map.items())[:5]}...')
+            stripped_names = [stripped_map.get(ch, ch) for ch in eeg_ch_names]
+
+            for candidate in ['standard_1005', 'standard_1010', 'standard_1020']:
+                try:
+                    montage = mne.channels.make_standard_montage(candidate)
+                    montage_ch_names = set(montage.ch_names)
+                    overlap = set(stripped_names) & montage_ch_names
+                    if len(overlap) >= len(eeg_ch_names) * 0.5:
+                        # Rename channels in the raw object
+                        raw.rename_channels(stripped_map)
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            raw.set_montage(montage, on_missing='warn')
+                        montage_str = (
+                            f'Auto-detected montage: {candidate} '
+                            f'({len(overlap)}/{len(eeg_ch_names)} channels matched '
+                            f'after stripping reference suffixes from '
+                            f'{len(stripped_map)} channel(s))')
+                        print(f'___MEGqc___: {montage_str}')
+                        return raw, montage_str
+                except Exception:
+                    continue
+
+        montage_str = ('Could not auto-detect EEG montage from channel names. '
+                       'Topomaps may not be available.')
+        print(f'___MEGqc___: WARNING: {montage_str}')
+    else:
+        try:
+            montage = mne.channels.make_standard_montage(montage_name)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                raw.set_montage(montage, on_missing='warn')
+            montage_str = f'Applied montage: {montage_name}'
+            print(f'___MEGqc___: {montage_str}')
+        except Exception as e:
+            # If explicit montage fails, try stripping reference suffixes
+            eeg_ch_stripped = {}
+            for ch in eeg_ch_names:
+                stripped = _strip_eeg_reference_suffix(ch)
+                if stripped != ch:
+                    eeg_ch_stripped[ch] = stripped
+            if eeg_ch_stripped:
+                try:
+                    raw.rename_channels(eeg_ch_stripped)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        raw.set_montage(montage, on_missing='warn')
+                    montage_str = (f'Applied montage: {montage_name} '
+                                   f'(after stripping reference suffixes from '
+                                   f'{len(eeg_ch_stripped)} channel(s))')
+                    print(f'___MEGqc___: {montage_str}')
+                    return raw, montage_str
+                except Exception as e2:
+                    montage_str = f'Failed to apply montage {montage_name}: {e2}'
+                    print(f'___MEGqc___: WARNING: {montage_str}')
+            else:
+                montage_str = f'Failed to apply montage {montage_name}: {e}'
+                print(f'___MEGqc___: WARNING: {montage_str}')
+
+    return raw, montage_str
+
+
+def apply_eeg_reference(raw, eeg_settings):
+    """
+    Apply EEG re-referencing.
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Raw EEG data.
+    eeg_settings : dict
+        Settings with 'reference_method'.
+
+    Returns
+    -------
+    raw : mne.io.Raw
+        Re-referenced data (in-place).
+    ref_str : str
+        Description.
+    """
+    ref_method = eeg_settings.get('reference_method', 'average')
+    ref_str = ''
+
+    if ref_method == 'none':
+        ref_str = 'EEG reference: original (no re-referencing applied).'
+    elif ref_method == 'average':
+        try:
+            raw.set_eeg_reference('average', projection=True)
+            ref_str = 'EEG reference: common average reference applied.'
+        except Exception as e:
+            ref_str = f'EEG average reference failed ({e}), keeping original reference.'
+    elif ref_method.upper() == 'REST':
+        try:
+            raw.set_eeg_reference('REST')
+            ref_str = 'EEG reference: REST (Reference Electrode Standardization Technique) applied.'
+        except Exception as e:
+            try:
+                raw.set_eeg_reference('average', projection=True)
+                ref_str = f'REST reference failed ({e}), fell back to average reference.'
+            except Exception as e2:
+                ref_str = f'EEG reference failed ({e2}), keeping original reference.'
+    else:
+        ref_str = f'Unknown reference method: {ref_method}, skipping re-referencing.'
+
+    print(f'___MEGqc___: {ref_str}')
+    return raw, ref_str
+
+
+def add_EEG_lobes(channels_objs):
+    """
+    Assign brain region (lobe) labels to EEG channels based on standard
+    10-20 / 10-10 / 10-05 naming conventions.
+
+    Electrode naming rules:
+    - First 1-3 letters = region prefix (Fp, AF, F, FC, FT, C, CP, T, TP, P, PO, O, I)
+    - Trailing digit: odd = left hemisphere, even = right hemisphere
+    - Trailing 'z' or 'Z' = midline
+
+    Parameters
+    ----------
+    channels_objs : dict
+        Dictionary with channel objects for each channel type.
+
+    Returns
+    -------
+    channels_objs : dict
+        Updated with lobe and lobe_color set on each channel.
+    lobes_color_coding_str : str
+        Description string.
+    """
+    # Prefix → sub-region mapping (longest prefixes first for matching)
+    _prefix_to_region = [
+        ('Fp', 'Frontal'),
+        ('AF', 'Frontal'),
+        ('FC', 'Frontal'),
+        ('FT', 'Temporal'),
+        ('F',  'Frontal'),
+        ('CP', 'Parietal'),
+        ('C',  'Central'),
+        ('TP', 'Temporal'),
+        ('T',  'Temporal'),
+        ('PO', 'Occipital'),
+        ('P',  'Parietal'),
+        ('O',  'Occipital'),
+        ('I',  'Occipital'),
+    ]
+
+    # Explicit named channels
+    _explicit = {
+        'Cz': ('Central', ''), 'Fz': ('Frontal', ''), 'Pz': ('Parietal', ''),
+        'Oz': ('Occipital', ''), 'Fpz': ('Frontal', ''), 'FCz': ('Frontal', ''),
+        'CPz': ('Parietal', ''), 'POz': ('Occipital', ''), 'Iz': ('Occipital', ''),
+        'A1': ('Reference', 'Left'), 'A2': ('Reference', 'Right'),
+        'M1': ('Reference', 'Left'), 'M2': ('Reference', 'Right'),
+        'Nz': ('Reference', ''),
+        # Old 10-20 naming: T3/T4 = temporal, T5/T6 = temporal
+        'T3': ('Temporal', 'Left'), 'T4': ('Temporal', 'Right'),
+        'T5': ('Temporal', 'Left'), 'T6': ('Temporal', 'Right'),
+        'T7': ('Temporal', 'Left'), 'T8': ('Temporal', 'Right'),
+    }
+
+    lobe_colors = {
+        'Left Frontal': '#1f77b4',
+        'Right Frontal': '#ff7f0e',
+        'Left Temporal': '#2ca02c',
+        'Right Temporal': '#9467bd',
+        'Left Parietal': '#e377c2',
+        'Right Parietal': '#d62728',
+        'Left Occipital': '#bcbd22',
+        'Right Occipital': '#17becf',
+        'Central': '#8c564b',
+        'Frontal': '#1f77b4',
+        'Temporal': '#2ca02c',
+        'Parietal': '#e377c2',
+        'Occipital': '#bcbd22',
+        'Reference': '#7f7f7f',
+        'Extra': '#d3d3d3',
+    }
+
+    def _classify(name):
+        """Return (region, laterality) for a channel name."""
+        if name in _explicit:
+            return _explicit[name]
+
+        # Try prefix match (longest first, handled by ordering)
+        region = None
+        for prefix, reg in _prefix_to_region:
+            if name.startswith(prefix):
+                region = reg
+                break
+        if region is None:
+            return ('Extra', '')
+
+        # Determine laterality from trailing characters
+        suffix = name.lstrip('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz')
+        if suffix:
+            try:
+                num = int(suffix)
+                return (region, 'Left' if num % 2 == 1 else 'Right')
+            except ValueError:
+                pass
+        if name.endswith('z') or name.endswith('Z'):
+            return (region, '')
+        return (region, '')
+
+    for key, value in channels_objs.items():
+        for ch in value:
+            region, laterality = _classify(ch.name)
+            if laterality and region not in ('Central', 'Reference', 'Extra'):
+                full_lobe = f'{laterality} {region}'
+            else:
+                full_lobe = region
+            ch.lobe = full_lobe
+            ch.lobe_color = lobe_colors.get(full_lobe, lobe_colors.get(region, '#d3d3d3'))
+
+    lobes_color_coding_str = ('Color coding by brain region based on standard '
+                              '10-20/10-10 EEG electrode nomenclature.')
+    return channels_objs, lobes_color_coding_str
+
+
 def assign_channels_properties(channels_short: dict, meg_system: str):
     """
     Assign lobe area to each channel according to the lobe area dictionary + the color for plotting + channel location.
@@ -1267,6 +1840,14 @@ def assign_channels_properties(channels_short: dict, meg_system: str):
         for key, value in channels_full.items():
             for ch in value:
                 ch.system = 'CTF'
+
+    elif meg_system.upper() == 'EEG':
+        channels_full, lobes_color_coding_str = add_EEG_lobes(channels_full)
+
+        # assign 'EEG' to all channels:
+        for key, value in channels_full.items():
+            for ch in value:
+                ch.system = 'EEG'
 
     else:
         lobes_color_coding_str = 'For MEG systems other than MEGIN Triux or CTF color coding by lobe is not applied.'
@@ -1357,6 +1938,12 @@ def save_meg_with_suffix(
     name, ext = os.path.splitext(filename)
 
     if ext.lower() == '.ds':
+        ext = '.fif'
+
+    # EEG formats cannot be saved back in their original format via MNE;
+    # convert to FIF for intermediate storage.
+    _eeg_extensions = {'.edf', '.bdf', '.vhdr', '.set', '.cnt', '.mff'}
+    if ext.lower() in _eeg_extensions:
         ext = '.fif'
 
     # Drop BIDS split tags so derivatives use the base recording name. When
@@ -1463,12 +2050,13 @@ def delete_temp_folder(derivatives_root: str) -> str:
 
 
 def initial_processing(default_settings: dict, filtering_settings: dict, epoching_params: dict, file_path: str,
-                       derivatives_root: str):
+                       derivatives_root: str, eeg_settings: dict = None):
     """
-    Here all the initial actions needed to analyse MEG data are done:
+    Here all the initial actions needed to analyse MEG or EEG data are done:
 
-    - read fif file,
-    - separate mags and grads names into 2 lists,
+    - read data file,
+    - separate channel types (mag / grad / eeg),
+    - apply EEG montage and reference if applicable,
     - crop the data if needed,
     - filter and downsample the data,
     - epoch the data.
@@ -1482,47 +2070,31 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
     epoching_params : dict
         Dictionary with parameters for epoching.
     file_path : str
-        Path to the fif file with MEG data.
+        Path to the data file.
+    derivatives_root : str
+        Path to the derivatives directory.
+    eeg_settings : dict, optional
+        EEG-specific settings (montage, reference_method). Only used when modality is EEG.
 
     Returns
     -------
-    dict_epochs_mg : dict
-        Dictionary with epochs for each channel type: mag, grad.
-    chs_by_lobe : dict
-        Dictionary with channel objects for each channel type: mag, grad. And by lobe. Each obj hold info about the channel name,
-        lobe area and color code, locations and (in the future) pther info, like: if it has noise of any sort.
-    channels : dict
-        Dictionary with channel names for each channel type: mag, grad.
-    raw_crop_filtered : mne.io.Raw
-        Filtered and cropped MEG data.
-    raw_crop_filtered_resampled : mne.io.Raw
-        Filtered, cropped and resampled MEG data.
-    raw_cropped : mne.io.Raw
-        Cropped MEG data.
-    raw : mne.io.Raw
-        MEG data.
-    info_derivs : list
-        List with QC_derivative objects with MNE info object.
-    shielding_str : str
-        String with information about active shielding.
-    epoching_str : str
-        String with information about epoching.
-    sensors_derivs : list
-        List with data frames with sensors info.
-    m_or_g_chosen : list
-        List with channel types to analize: mag, grad.
-    m_or_g_skipped_str : str
-        String with information about which channel types were skipped.
-    lobes_color_coding_str : str
-        String with information about color coding for lobes.
-    resample_str : str
-        String with information about resampling.
-
+    tuple
+        (meg_system, dict_epochs_mg, chs_by_lobe, channels,
+         raw_cropped_filtered_path, raw_cropped_filtered_resampled_path,
+         raw_cropped_path, raw_path, info_derivs, stim_deriv,
+         event_summary_deriv,
+         shielding_str, epoching_str, sensors_derivs, m_or_g_chosen,
+         m_or_g_skipped_str, lobes_color_coding_str, resample_str)
     """
 
     print('___MEGqc___: ', 'Reading data from file:', file_path)
 
-    raw, shielding_str, meg_system = load_data(file_path)
+    raw, shielding_str, meg_system, modality = load_data(file_path)
+
+    # ── Correct channel types from BIDS channels.tsv (if available) ─────
+    # This must happen before choose_channels() so that non-EEG channels
+    # (EOG, EMG, ECG, MISC) are not misclassified as EEG by MNE.
+    raw, bids_correction_str = _apply_bids_channel_types(raw, file_path)
 
     # Working with channels:
     channels = choose_channels(raw)
@@ -1530,8 +2102,18 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
     if meg_system == 'CTF':  # ONLY FOR CTF we do this! Return raw with changed channel types.
         channels, raw = change_ch_type_CTF(raw, channels)
 
+    # EEG-specific: apply montage and reference
+    if meg_system == 'EEG' and eeg_settings:
+        raw, montage_str = apply_eeg_montage(raw, eeg_settings)
+        raw, ref_str = apply_eeg_reference(raw, eeg_settings)
+        shielding_str = '<p>' + montage_str + '</p><p>' + ref_str + '</p>'
+        if bids_correction_str:
+            shielding_str += '<p>' + bids_correction_str + '</p>'
+        # Re-run choose_channels in case montage renamed channels
+        channels = choose_channels(raw)
+
     # Turn channel names into objects:
-    channels_objs = {key: [MEG_channel(name=ch_name, type=key) for ch_name in value] for key, value in channels.items()}
+    channels_objs = {key: [QC_channel(name=ch_name, type=key) for ch_name in value] for key, value in channels.items()}
 
     # Assign channels properties:
     channels_objs, lobes_color_coding_str = assign_channels_properties(channels_objs, meg_system)
@@ -1577,7 +2159,8 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
                   filtering_settings['h_freq'])
 
         raw_cropped_filtered.filter(l_freq=filtering_settings['l_freq'], h_freq=filtering_settings['h_freq'],
-                                    picks='meg', method=filtering_settings['method'], iir_params=None)
+                                    picks='eeg' if meg_system == 'EEG' else 'meg',
+                                    method=filtering_settings['method'], iir_params=None)
         print('___MEGqc___: ', 'Data filtered from', filtering_settings['l_freq'], 'to', filtering_settings['h_freq'],
               'Hz.')
 
@@ -1641,7 +2224,7 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
     gc.collect()
 
     # Load data
-    raw_cropped_filtered, shielding_str, meg_system = load_data(raw_cropped_filtered_path)
+    raw_cropped_filtered, shielding_str, meg_system, _modality = load_data(raw_cropped_filtered_path)
 
     # Apply epoching: USE NON RESAMPLED DATA. Or should we resample after epoching?
     # Since sampling freq is 1kHz and resampling is 500Hz, it s not that much of a win...
@@ -1700,7 +2283,7 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
         )
         epoching_str += _build_epoch_summary_html(event_summary)
         epoching_str += '<br></br>'
-    elif dict_epochs_mg['mag'] is None and dict_epochs_mg['grad'] is None:
+    elif dict_epochs_mg['mag'] is None and dict_epochs_mg['grad'] is None and dict_epochs_mg.get('eeg') is None:
         epoching_str = (
             '<p>No epoching could be done in this data set: no events found. '
             'Quality measurements were only performed on the entire time series. '
