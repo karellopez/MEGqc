@@ -82,9 +82,35 @@ PKG_ROOT = GUI_DIR.parent.parent
 
 SETTINGS_PATH = PKG_ROOT / "settings" / "settings.ini"
 INTERNAL_PATH = PKG_ROOT / "settings" / "settings_internal.ini"
-# Logo e icon se quedan en la carpeta GUI
+# Logo shown in the header of the Run tab
 LOGO_PATH = GUI_DIR / "logo.png"
-ICON_PATH = LOGO_PATH
+
+# Window / taskbar icon — platform-specific bundled assets
+_ASSETS = GUI_DIR / "assets"
+_WIN_ICON  = _ASSETS / "windows" / "AppIcon.ico"
+_MAC_ICON  = _ASSETS / "macos"   / "AppIcon.icns"
+# PNG sizes available for Linux (and as fallback on any platform)
+_PNG_SIZES = [16, 32, 64, 128, 256, 512]
+
+
+def _build_app_icon() -> "QIcon":
+    """Return the best available QIcon for the current platform."""
+    import sys as _sys
+    if _sys.platform == "win32" and _WIN_ICON.exists():
+        return QIcon(str(_WIN_ICON))
+    if _sys.platform == "darwin" and _MAC_ICON.exists():
+        return QIcon(str(_MAC_ICON))
+    # Linux (or fallback): compose a multi-resolution icon from the PNG set
+    icon = QIcon()
+    macos_dir = _ASSETS / "macos"
+    for size in _PNG_SIZES:
+        p = macos_dir / f"AppIcon{size}.png"
+        if p.exists():
+            icon.addPixmap(QPixmap(str(p)))
+    if icon.isNull() and LOGO_PATH.exists():
+        icon = QIcon(str(LOGO_PATH))
+    return icon
+
 
 
 # megqcGUI.py
@@ -967,8 +993,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("MEGqc")
         self.resize(700, 780)
-        if ICON_PATH and ICON_PATH.exists():
-            self.setWindowIcon(QIcon(str(ICON_PATH)))
+        self.setWindowIcon(_build_app_icon())
 
         # Runtime config manager state.
         # Package defaults are read-only; GUI edits always go to runtime copies.
