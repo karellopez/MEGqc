@@ -15,6 +15,39 @@ import hashlib
 from typing import List, Union
 from joblib import Parallel, delayed
 
+# ---------------------------------------------------------------------------
+# ancpbids bugfix: guard against empty / null JSON sidecar files
+# ---------------------------------------------------------------------------
+# Some BIDS datasets ship empty JSON files (0 bytes) or files containing
+# a bare JSON ``null``.  ``json.load()`` returns ``None`` for both cases.
+# ancpbids' ``_map_object`` then crashes on ``None.keys()``.
+# This only manifests on Windows (case-insensitive FS matches files that
+# Linux/macOS would skip due to case mismatch).  We monkey-patch the two
+# affected methods so the fix lives inside MEGqc — no ancpbids edit needed.
+try:
+    from ancpbids.plugins.plugin_dsloader import DatasetPopulationPlugin as _DSP
+
+    _orig_contents_loader = _DSP._contents_loader
+    _orig_map_object = _DSP._map_object
+
+    def _safe_contents_loader(self, json_file, original_file, model_type):
+        json_object = original_file.load_contents()
+        if json_object is None:
+            return json_object
+        self._map_object(model_type, json_object, json_file)
+        return json_object
+
+    def _safe_map_object(self, model_type, json_object, target=None):
+        if target is None:
+            target = model_type()
+        if json_object is None:
+            return target
+        return _orig_map_object(self, model_type, json_object, target)
+
+    _DSP._contents_loader = _safe_contents_loader
+    _DSP._map_object = _safe_map_object
+except Exception:
+    pass  # Never crash MEGqc over a defensive patch
 
 # ---------------------------------------------------------------------------
 # Windows console encoding fix
