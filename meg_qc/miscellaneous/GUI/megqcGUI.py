@@ -18,6 +18,25 @@ import configparser
 import hashlib
 import shutil
 import ssl
+
+# ── WebEngine env-vars (must be set before QApplication is created) ───────
+os.environ.setdefault(
+    "QTWEBENGINE_CHROMIUM_FLAGS",
+    "--no-sandbox --allow-file-access-from-files",
+)
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+
+# ── WebEngine import ──────────────────────────────────────────────────────
+# Importing here (before QApplication) is required on macOS for Chromium to
+# initialise correctly.  The broad except catches any crash on platforms
+# where the binary is missing or incompatible; in that case HTML files fall
+# back to the system browser.
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    HAS_WEBENGINE = True
+except Exception:
+    QWebEngineView = None  # type: ignore[assignment,misc]
+    HAS_WEBENGINE = False
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from pathlib import Path
@@ -62,15 +81,9 @@ from meg_qc.test import (
 )
 from meg_qc.calculation.meg_qc_pipeline import list_analysis_profiles
 from meg_qc import __version__ as MEGQC_VERSION
-try:
-    from PyQt6.QtWebEngineWidgets import QWebEngineView
-    from PyQt6.QtWebEngineCore import QWebEngineSettings
-    HAS_WEBENGINE = True
-except ImportError:
-    HAS_WEBENGINE = False
 # Output monitoring: live terminal streaming + CLI launcher
 from .output_monitoring import LiveTerminalDialog, open_cli_terminal
-# Use Qt5 widget integration and not the OS integrations (This will prevent incompatibilities)
+# Use Qt built-in dialogs (consistent cross-platform behaviour)
 QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
 
 # Locate bundled settings and logo files within the package
@@ -3078,6 +3091,15 @@ class MainWindow(QMainWindow):
 def run_megqc_gui():
     """Entry point called by the ``megqc`` console script."""
     from PyQt6.QtWidgets import QApplication
+    # AA_ShareOpenGLContexts must be set *before* QApplication is created.
+    # Wrapped in try/except because the attribute was made implicit in Qt6
+    # and may not exist in all platform builds.
+    if QApplication.instance() is None:
+        try:
+            QCoreApplication.setAttribute(
+                Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+        except Exception:
+            pass  # not fatal on Qt6 — context sharing is on by default
     app = QApplication.instance() or QApplication(sys.argv)
     # Fusion style is mandatory: it is the only Qt built-in style that fully
     # respects custom QPalette colours on macOS and Windows.  Without it,

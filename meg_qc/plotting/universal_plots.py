@@ -3755,7 +3755,7 @@ def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_
     ``universal_plots.py`` so orchestration modules can stay lean and focused on
     I/O and report assembly.
     """
-    time_series_derivs, sensors_derivs, ptp_manual_derivs, pp_auto_derivs, ecg_derivs, eog_derivs, std_derivs, psd_derivs, muscle_derivs, head_derivs = [], [], [], [], [], [], [], [], [], []
+    time_series_derivs, sensors_derivs, ptp_manual_derivs, ecg_derivs, eog_derivs, std_derivs, psd_derivs, muscle_derivs, head_derivs = [], [], [], [], [], [], [], [], []
     stim_derivs = []
 
     for tsv_path in tsv_paths:
@@ -3841,7 +3841,6 @@ def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_
         'STD': std_derivs,
         'PSD': psd_derivs,
         'PTP_MANUAL': ptp_manual_derivs,
-        'PTP_AUTO': pp_auto_derivs,
         'ECG': ecg_derivs,
         'EOG': eog_derivs,
         'HEAD': head_derivs,
