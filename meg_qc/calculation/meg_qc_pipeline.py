@@ -104,7 +104,12 @@ from meg_qc.plotting.universal_plots import QC_derivative
 from meg_qc.calculation.metrics.STD_meg_qc import STD_meg_qc
 from meg_qc.calculation.metrics.PSD_meg_qc import PSD_meg_qc
 from meg_qc.calculation.metrics.Peaks_manual_meg_qc import PP_manual_meg_qc
-from meg_qc.calculation.metrics.Peaks_manual_meg_qc_numba import PP_manual_meg_qc_numba
+try:
+    from meg_qc.calculation.metrics.Peaks_manual_meg_qc_numba import PP_manual_meg_qc_numba
+    HAS_NUMBA = True
+except ImportError:
+    PP_manual_meg_qc_numba = None  # type: ignore[assignment,misc]
+    HAS_NUMBA = False
 # PTP auto (MNE's annotate_amplitude) has been removed from the pipeline —
 # the manual PTP implementation is more reliable and better integrated.
 from meg_qc.calculation.metrics.ECG_EOG_meg_qc import ECG_meg_qc, EOG_meg_qc
@@ -1345,10 +1350,12 @@ def process_one_subject(
             start_time = time.time()
 
             # choose the implementation ----------------------------------
-            if all_qc_params['PTP_manual']['numba_version'] is True:
+            if all_qc_params['PTP_manual']['numba_version'] is True and HAS_NUMBA:
                 print('___MEGqc___: ', 'Starting Peak-to-Peak manual (Numba)...')
                 func = PP_manual_meg_qc_numba  #  accelerated version
             else:
+                if all_qc_params['PTP_manual']['numba_version'] is True and not HAS_NUMBA:
+                    print('___MEGqc___: ', 'Numba not installed – falling back to standard PtP.')
                 print('___MEGqc___: ', 'Starting Peak-to-Peak manual...')
                 func = PP_manual_meg_qc  # standard version
             # -------------------------------------------------------------

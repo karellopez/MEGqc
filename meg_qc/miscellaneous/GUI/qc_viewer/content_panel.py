@@ -36,10 +36,69 @@ from .timeseries_widget import TimeSeriesWidget, _LoadWorker, _LoadingOverlay
 # is required on macOS for Chromium to initialise correctly.
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import QWebEngineSettings
     HAS_WEBENGINE = True
-except Exception:
+except Exception as _webengine_exc:
+    import sys as _sys
+    print(f"[MEGqc] WebEngine unavailable: {_webengine_exc}", file=_sys.stderr)
     QWebEngineView = None  # type: ignore[assignment,misc]
+    QWebEngineSettings = None  # type: ignore[assignment,misc]
     HAS_WEBENGINE = False
+
+
+# ── Localhost HTTP server for large Plotly reports ────────────────────────
+# Chromium in PyQt6 imposes strict CSP restrictions on file:// URLs that can
+# prevent large Plotly reports from rendering.  Serving over http://127.0.0.1
+# bypasses all those restrictions (same approach used by Jupyter & Electron).
+_LARGE_FILE_THRESHOLD = 5 * 1024 * 1024  # 5 MB
+
+
+class _LocalHTTPServer:
+    """Background HTTP server for large local HTML files."""
+    _instance = None
+    _thread = None
+
+    @classmethod
+    def serve(cls, filepath: str) -> str:
+        """Return an ``http://127.0.0.1:<port>/filename`` URL."""
+        import threading
+        from http.server import HTTPServer, SimpleHTTPRequestHandler
+
+        p = Path(filepath).resolve()
+        directory = str(p.parent)
+        filename = p.name
+
+        # Shut down any previous server instance
+        if cls._instance is not None:
+            try:
+                cls._instance.shutdown()
+            except Exception:
+                pass
+            cls._instance = None
+
+        handler = lambda *args, **kw: SimpleHTTPRequestHandler(
+            *args, directory=directory, **kw
+        )
+        server = HTTPServer(("127.0.0.1", 0), handler)
+        port = server.server_address[1]
+
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cls._instance = server
+        cls._thread = thread
+
+        return f"http://127.0.0.1:{port}/{filename}"
+
+    @classmethod
+    def shutdown(cls):
+        """Shut down the background server if running."""
+        if cls._instance is not None:
+            try:
+                cls._instance.shutdown()
+            except Exception:
+                pass
+            cls._instance = None
+            cls._thread = None
 
 
 # MEG file extensions recognised by MNE
@@ -200,7 +259,31 @@ class ContentPanel(QWidget):
         self._destroy_web_view()
 
         view = QWebEngineView()
-        view.setUrl(QUrl.fromLocalFile(str(Path(filepath).resolve())))
+
+        # Enable local file access — PyQt6's Chromium disables these by
+        # default, unlike PyQt5 where they were enabled.
+        if QWebEngineSettings is not None:
+            settings = view.settings()
+            settings.setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+            settings.setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            settings.setAttribute(
+                QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+
+        # For large files, serve via localhost to bypass Chromium's file:// CSP
+        resolved = str(Path(filepath).resolve())
+        try:
+            file_size = Path(filepath).stat().st_size
+        except OSError:
+            file_size = 0
+
+        if file_size > _LARGE_FILE_THRESHOLD:
+            url = QUrl(_LocalHTTPServer.serve(resolved))
+        else:
+            url = QUrl.fromLocalFile(resolved)
+
+        view.setUrl(url)
         self._web_view = view
         self._html_container_layout.addWidget(view)
 
@@ -490,6 +573,7 @@ class ContentPanel(QWidget):
     def cleanup(self):
         self._release_previous_data()
         self._destroy_web_view()
+        _LocalHTTPServer.shutdown()
 
     def refresh_theme(self):
         self._ts_widget.refresh_theme()
